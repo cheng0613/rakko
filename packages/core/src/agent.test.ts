@@ -94,7 +94,7 @@ test('高风险工具被拒：不执行、如实告诉模型、运行照样收�
     onToolResult: (_call, result) => void results.push(result.output),
     approve: async () => {
       approaches.push('asked');
-      return 'deny';
+      return { decision: 'deny' as const };
     },
   });
 
@@ -113,7 +113,7 @@ test('高风险工具被允许：真的写盘', async () => {
     onChunk: () => {},
     onToolCall: () => {},
     onToolResult: () => {},
-    approve: async () => 'allow',
+    approve: async () => ({ decision: 'allow' as const }),
   });
 
   assert.equal(await readFile(path.join(workspace, 'out/note.txt'), 'utf8'), '海獭');
@@ -128,7 +128,7 @@ test('模型瞎编工具名，也要回一条结果，别让它干等', async ()
     onChunk: () => {},
     onToolCall: () => {},
     onToolResult: () => {},
-    approve: async () => 'allow',
+    approve: async () => ({ decision: 'allow' as const }),
   });
 
   assert.equal(outcome.stopped, 'done');
@@ -146,7 +146,7 @@ test('模型一直要工具不会无限自转，到上限就停', async () => {
     onChunk: () => {},
     onToolCall: () => {},
     onToolResult: () => {},
-    approve: async () => 'allow',
+    approve: async () => ({ decision: 'allow' as const }),
   });
 
   assert.equal(outcome.stopped, 'max_steps');
@@ -176,7 +176,7 @@ test('主档挂掉降级后，后面几轮待在快档', async () => {
     onChunk: (chunk) => void chunks.push(chunk.kind),
     onToolCall: () => {},
     onToolResult: () => {},
-    approve: async () => 'allow',
+    approve: async () => ({ decision: 'allow' as const }),
   });
 
   assert.deepEqual(chunks, ['fallback', 'delta']);

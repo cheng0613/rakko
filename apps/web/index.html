@@ -676,6 +676,12 @@
 /* ==DESIGN-CSS-END== */
 
   /* ---- 以下是事件流专用的几块，沿用设计稿的令牌与几何，不另起一套语言 ---- */
+  .msg table{border-collapse:collapse;margin:10px 0;width:100%;font-size:12.3px}
+  .msg th,.msg td{border:1px solid var(--line);padding:6px 9px;text-align:left;vertical-align:top;line-height:1.55}
+  .msg th{background:var(--surface-2);font-weight:560;color:var(--text-2)}
+  .msg td{color:var(--text-2)}
+  .msg h3,.msg h4,.msg h5,.msg h6{margin:14px 0 6px;font-size:13.5px;font-weight:600;color:var(--text)}
+  .msg hr{border:0;border-top:1px solid var(--line);margin:14px 0}
   [hidden]{display:none!important}
 
   /* 设计稿的 .msg 入场动画是 opacity:0 → 1（fill both）。
@@ -928,6 +934,10 @@
             <h3 style="margin:0 0 2px;font-size:14px;font-weight:560">工具</h3>
             <p style="margin:0 0 12px;font-size:11.8px;color:var(--muted)">模型只能调用这些；标「需审批」的会先停下来问你</p>
             <div id="setTools" style="display:flex;flex-direction:column;gap:2px"></div>
+            <div class="set-row" style="margin-top:6px">
+              <div class="txt"><b>已授权不再询问</b><span id="setGrantsHint">还没有授权过任何工具</span></div>
+            </div>
+            <div id="setGrants" style="display:flex;flex-direction:column;gap:2px"></div>
           </article>
 
           <article class="card">
@@ -1008,6 +1018,7 @@
     toolCalls: 0,
     pending: 0,
     pendingCallId: null,
+    settings: null,
   };
 
   /** 历史里最后一条助手消息，恢复运行时把新事件接在它后面 */
@@ -1038,26 +1049,58 @@
   });
 
   /* ---------------- 轻量 markdown：只留设计稿里出现的元素 ---------------- */
-  const md = (text) => esc(text).split(/\n{2,}/).map((block) => {
+  const md = (text) => esc(text).split(/\n{2,}/).map(renderBlock).join('');
+
+  function renderBlock(block) {
     const lines = block.split('\n');
     const inline = (line) => line
       .replace(/`([^`]+)`/g, '<code>$1</code>')
       .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
       .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
+
     if (block.trim().startsWith('```')) {
       return '<pre style="margin:10px 0;padding:10px 12px;border:1px solid var(--line);border-radius:12px;background:var(--surface-2);font-family:var(--mono);font-size:11.5px;line-height:1.6;overflow:auto">'
         + block.replace(/^```[a-z]*\n?/, '').replace(/```$/, '') + '</pre>';
     }
+
+    const isTable = lines.length >= 2 && lines[0].trim().startsWith('|') && /^\|[\s:|-]+\|$/.test(lines[1].trim());
+    if (isTable) {
+      const cells = (row) => row.trim()
+        .replace(/^\||\|$/g, '')
+        .replace(/\\\|/g, '\u0001')
+        .split('|')
+        .map((cell) => cell.trim().replace(/\u0001/g, '|'));
+      const head = cells(lines[0]);
+      const body = lines.slice(2).filter((row) => row.trim().startsWith('|'));
+      return '<table><thead><tr>'
+        + head.map((cell) => '<th>' + inline(cell) + '</th>').join('')
+        + '</tr></thead><tbody>'
+        + body.map((row) => '<tr>' + cells(row).map((cell) => '<td>' + inline(cell) + '</td>').join('') + '</tr>').join('')
+        + '</tbody></table>';
+    }
+
+    const heading = /^(#{1,4})\s+(.*)$/.exec(lines[0].trim());
+    if (heading) {
+      const level = Math.min(4, heading[1].length + 2);
+      const head = '<h' + level + '>' + inline(heading[2]) + '</h' + level + '>';
+      const rest = lines.slice(1).join('\n').trim();
+      return rest ? head + rest.split(/\n{2,}/).map(renderBlock).join('') : head;
+    }
+
+    if (/^-{3,}$/.test(block.trim())) return '<hr>';
+
     if (lines.every((line) => !line.trim() || line.trim().startsWith('- '))) {
       return '<ul style="margin:0 0 10px;padding-left:18px">' + lines.filter((line) => line.trim())
         .map((line) => '<li style="margin:2px 0">' + inline(line.replace(/^\s*-\s/, '')) + '</li>').join('') + '</ul>';
     }
+
     if (lines.every((line) => !line.trim() || /^\d+\.\s/.test(line.trim()))) {
       return '<ol style="margin:0 0 10px;padding-left:18px">' + lines.filter((line) => line.trim())
         .map((line) => '<li style="margin:2px 0">' + inline(line.replace(/^\s*\d+\.\s/, '')) + '</li>').join('') + '</ol>';
     }
+
     return '<p>' + lines.map(inline).join('<br>') + '</p>';
-  }).join('');
+  }
 
   /* ---------------- 侧栏 ---------------- */
   const renderRecents = () => {
@@ -1187,7 +1230,7 @@
           { callId: payload.callId, name: payload.name, args: payload.args || {} },
           payload.risk || 'high',
           isPending ? null : new Date(message.createdAt).getTime() + 10 * 60 * 1000,
-          isPending ? (decision) => decideApproval(payload.callId, decision) : () => {},
+          isPending ? (decision, scope) => decideApproval(payload.callId, decision, scope) : () => {},
           { interactive: isPending },
         ));
       } else if (message.kind === 'approval_decision') {
@@ -1350,14 +1393,17 @@
 
     const acts = make('div', 'gate-acts');
     const allow = make('button', 'btn primary', '允许这次');
+    const always = make('button', 'btn', '允许这类');
+    always.title = call.name + ' 之后不再询问，可在设置里撤销';
     const deny = make('button', 'btn danger', '拒绝');
     if (!interactive) {
       allow.disabled = true;
+      always.disabled = true;
       deny.disabled = true;
       countdown.textContent = '已结束';
     }
-    acts.append(allow, deny);
-    const tip = make('div', 'gate-tip', '允许只对这一次生效；拒绝不会让任务失败，我会读到理由并换个做法。');
+    acts.append(allow, always, deny);
+    const tip = make('div', 'gate-tip', '「允许这次」只生效一次；「允许这类」之后同名工具不再问（设置里可撤销）；拒绝不会让任务失败。');
 
     card.append(head, summary, targetRow, tip, acts);
     turn.body.append(card);
@@ -1394,8 +1440,9 @@
       }
     };
 
-    allow.addEventListener('click', () => { settle('allow'); onDecide('allow'); });
-    deny.addEventListener('click', () => { settle('deny'); onDecide('deny'); });
+    allow.addEventListener('click', () => { settle('allow'); onDecide('allow', 'once'); });
+    always.addEventListener('click', () => { settle('allow', '已允许这类调用，之后不再询问'); onDecide('allow', 'always'); });
+    deny.addEventListener('click', () => { settle('deny'); onDecide('deny', 'once'); });
 
     if (interactive) {
       state.pending += 1;
@@ -1445,8 +1492,8 @@
         state.pendingCallId = event.callId;
         const tool = toolMeta(event.name);
         const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
-        const pendingCard = addApproval(turn, event, event.risk || (tool && tool.risk) || 'high', expiresAt, (decision) => {
-          decideApproval(event.callId, decision);
+        const pendingCard = addApproval(turn, event, event.risk || (tool && tool.risk) || 'high', expiresAt, (decision, scope) => {
+          decideApproval(event.callId, decision, scope);
         });
         approvalCards.set(event.callId, pendingCard);
         toolCards.get(event.callId)?.waiting();
@@ -1496,7 +1543,7 @@
     return body;
   };
 
-  const decideApproval = async (callId, decision) => {
+  const decideApproval = async (callId, decision, scope) => {
     if (state.mode === 'demo') {
       if (state.demoResolve) state.demoResolve(decision);
       return;
@@ -1504,7 +1551,7 @@
     try {
       await api('/v1/runs/' + state.running.id + '/approvals/' + callId, {
         method: 'POST',
-        body: JSON.stringify({ decision }),
+        body: JSON.stringify({ decision, ...(scope && scope !== 'once' ? { scope } : {}) }),
       });
     } catch (error) {
       toast('审批没有送出去：' + error.message);
@@ -1862,6 +1909,33 @@
       }
     }
 
+    const grantsBox = $('#setGrants');
+    grantsBox.innerHTML = '';
+    const approved = (state.settings && state.settings.approvedTools) || [];
+    $('#setGrantsHint').textContent = approved.length === 0
+      ? '还没有授权过任何工具'
+      : '这些工具不会再弹审批';
+    for (const name of approved) {
+      const row = make('div', 'set-row');
+      const txt = make('div', 'txt');
+      txt.append(make('b', undefined, name));
+      txt.append(make('span', undefined, '再来一次就直接执行'));
+      const revoke = make('button', 'btn quiet', '撤销');
+      revoke.addEventListener('click', async () => {
+        try {
+          const next = approved.filter((item) => item !== name);
+          await api('/v1/settings', { method: 'PATCH', body: JSON.stringify({ approvedTools: next }) });
+          state.settings = { ...(state.settings || {}), approvedTools: next };
+          renderSettings();
+          toast('已撤销 ' + name);
+        } catch (error) {
+          toast('撤销失败：' + error.message);
+        }
+      });
+      row.append(txt, revoke);
+      grantsBox.append(row);
+    }
+
     $('#setStore').textContent = health ? (health.store === 'postgres' ? 'Postgres' : '内存（重启清空）') : '—';
     $('#setWorkspace').textContent = health ? health.workspace : '—';
   };
@@ -1942,6 +2016,7 @@
       renderCtx();
       await loadThreads();
       await loadUsage();
+      try { state.settings = await api('/v1/settings'); } catch { state.settings = null; }
       if (state.threads[0]) await openThread(state.threads[0].id);
 
       if (params.get('view') === 'settings') setView('settings');

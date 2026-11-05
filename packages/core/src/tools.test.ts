@@ -15,8 +15,8 @@ const makeRegistry = async (): Promise<{ registry: ToolRegistry; workspace: stri
   return { registry, workspace };
 };
 
-const allow = async (): Promise<'allow'> => 'allow';
-const deny = async (): Promise<'deny'> => 'deny';
+const allow = async () => ({ decision: 'allow' as const });
+const deny = async () => ({ decision: 'deny' as const });
 
 test('read_file 读得到工作区里的文件', async () => {
   const { registry, workspace } = await makeRegistry();

@@ -25,6 +25,15 @@ export interface ToolSpec {
   run: (args: never, context: ToolContext) => Promise<string>;
 }
 
+/**
+ * 人点的那一下：允许一次，还是「这类工具以后别再问我」。
+ * scope 只在 allow 时有意义；grant 是持久化的，存在用户设置里。
+ */
+export interface ApprovalOutcome {
+  decision: 'allow' | 'deny';
+  scope?: 'once' | 'always';
+}
+
 export interface ToolResult {
   ok: boolean;
   output: string;
@@ -65,7 +74,10 @@ export class ToolRegistry {
     }));
   }
 
-  async execute(call: ToolCallRequest, options: { approve: () => Promise<'allow' | 'deny'> }): Promise<ToolResult> {
+  async execute(
+    call: ToolCallRequest,
+    options: { approve: () => Promise<ApprovalOutcome>; isGranted?: (name: string) => boolean },
+  ): Promise<ToolResult> {
     const tool = this.tools.get(call.name);
     if (!tool) {
       return { ok: false, output: `没有名为 ${call.name} 的工具。可用工具：${[...this.tools.keys()].join('、')}`, durationMs: 0 };
@@ -77,10 +89,11 @@ export class ToolRegistry {
       return { ok: false, output: `参数不合法：${detail}`, durationMs: 0 };
     }
 
-    if (tool.requiresApproval) {
-      const decision = await options.approve();
-      if (decision !== 'allow') {
-        return { ok: false, denied: true, output: '用户没有允许这次调用，工具未执行。请换一个不需要审批的做法。', durationMs: 0 };
+    if (tool.requiresApproval && !options.isGranted?.(tool.name)) {
+      const outcome = await options.approve();
+      if (outcome.decision !== 'allow') {
+        const why = outcome.decision === 'deny' ? '用户没有允许这次调用' : '审批没有通过';
+        return { ok: false, denied: true, output: `${why}，工具未执行。请换一个不需要审批的做法。`, durationMs: 0 };
       }
     }
 

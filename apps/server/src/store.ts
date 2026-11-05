@@ -89,12 +89,15 @@ export interface MemoryStoreOptions {
 export class MemoryStore implements RunStore {
   readonly kind = 'memory' as const;
   private quota: QuotaState;
+  private settings: Settings;
 
   constructor(options: MemoryStoreOptions = {}) {
+    const degradeOnExceed = options.degradeOnExceed ?? true;
+    this.settings = { degradeOnExceed, approvedTools: [] };
     this.quota = {
       limit: options.limit ?? planLimit('pro'),
       used: options.used ?? 0,
-      degradeOnExceed: options.degradeOnExceed ?? true,
+      degradeOnExceed,
     };
   }
   private readonly threads = new Map<string, Thread>();
@@ -116,12 +119,16 @@ export class MemoryStore implements RunStore {
   }
 
   async getSettings(): Promise<Settings> {
-    return { degradeOnExceed: this.quota.degradeOnExceed };
+    return { ...this.settings, approvedTools: [...this.settings.approvedTools] };
   }
 
   async updateSettings(patch: Partial<Settings>): Promise<Settings> {
     if (typeof patch.degradeOnExceed === 'boolean') {
+      this.settings = { ...this.settings, degradeOnExceed: patch.degradeOnExceed };
       this.quota = { ...this.quota, degradeOnExceed: patch.degradeOnExceed };
+    }
+    if (Array.isArray(patch.approvedTools)) {
+      this.settings = { ...this.settings, approvedTools: [...new Set(patch.approvedTools)] };
     }
     return this.getSettings();
   }

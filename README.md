@@ -88,6 +88,9 @@ docker compose up -d --build                     # db + api 全容器化，api �
 | `list_dir` | low | 否 | 列目录，最多 200 项 |
 | `write_file` | high | **是** | 写文件，自动建目录 |
 | `shell` | high | **是** | 跑命令，默认 20s 超时，输出截断 8KB |
+| `grep` | low | 否 | 正则搜内容，跳过 node_modules/.git/dist 与二进制，输出到上限即停 |
+| `apply_patch` | high | **是** | 按「原文 → 新文」精确替换；原文必须唯一命中，改不了歧义处 |
+| `http` | medium | **是** | 发请求，返回状态码与响应体（截断 200KB）；默认**不许打内网** |
 
 三条纪律：
 
@@ -100,10 +103,14 @@ docker compose up -d --build                     # db + api 全容器化，api �
 ```
 运行 ──▶ 模型要求 write_file
           └─▶ 状态变 waiting_approval，推 run.approval_requested
-                ├─ 人点允许 ──▶ 执行 → run.tool_result → 模型继续
-                ├─ 人点拒绝 ──▶ 不执行，告诉模型「用户没允许」→ 模型换个做法
+                ├─ 允许这次 ──▶ 执行 → run.tool_result → 模型继续
+                ├─ 允许这类 ──▶ 执行，并把这个工具写进设置，之后同名工具不再问
+                ├─ 拒绝 ──▶ 不执行，告诉模型「用户没允许」→ 模型换个做法
                 └─ 10 分钟无人理 ──▶ 自动拒绝，运行照样收尾，不会烂在那里
 ```
+
+「允许这类」落在 `users.settings.approvedTools`，重启后仍然有效；
+设置页能看见授权了哪些工具，也能一键撤销。
 
 `waiting_approval` 只是等一次点击，不是失败；**被拒也不算失败**——模型会读到拒绝理由并换路子。
 
@@ -237,6 +244,7 @@ POST /v1/runs/:id/cancel                       取消运行（会把等待中的
 - **思考内容不许拼进回答**，它有自己的事件类型。
 - **key 只从环境变量读**，代码与仓库里不出现任何凭据；`.env` 已在 `.gitignore` 里。
 - **文件工具的路径必须落在工作区内**，越界一律拒；自毁命令连审批都不给。
+- **http 默认不许打内网**（localhost / 10. / 192.168. / 169.254 等），要放开得显式打开 `RAKKO_HTTP_ALLOW_PRIVATE`。
 - **审批只能 allow / deny**，不允许在审批时改参数 —— 那等于让人替模型写代码。
 
 ## 下一步

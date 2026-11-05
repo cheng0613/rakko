@@ -42,8 +42,9 @@ export {
   type ModelTier,
   type ProviderGatewayOptions,
 } from './gateway.js';
-export { ToolRegistry, type ToolContext, type ToolResult, type ToolSpec } from './tools.js';
+export { ToolRegistry, type ApprovalOutcome, type ToolContext, type ToolResult, type ToolSpec } from './tools.js';
 export { createBuiltinTools, type BuiltinToolsOptions } from './tools/builtin.js';
+export { createSecondToolset, type HttpToolOptions, type SecondToolsetOptions } from './tools/network.js';
 export {
   ApprovalGate,
   type ApprovalDecision,

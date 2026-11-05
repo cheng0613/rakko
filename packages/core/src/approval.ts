@@ -18,6 +18,8 @@ export interface ApprovalRequestInput {
 
 export interface ApprovalDecision {
   decision: 'allow' | 'deny';
+  /** once = 只这一次；always = 这类工具以后不再问 */
+  scope?: 'once' | 'always';
   reason?: string;
 }
 

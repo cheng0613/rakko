@@ -1,5 +1,5 @@
 import { createDb, migrateDb } from '@rakko/db';
-import { createBuiltinTools, FakeProvider, OpenAICompatibleProvider, ProviderGateway, ToolRegistry } from '@rakko/core';
+import { createBuiltinTools, createSecondToolset, FakeProvider, OpenAICompatibleProvider, ProviderGateway, ToolRegistry } from '@rakko/core';
 
 import { createApp, FAKE_MODELS } from './app.js';
 import { loadAgentSettings, loadProviderSettings } from './config.js';
@@ -49,6 +49,12 @@ if (hasKey) {
 const agentSettings = loadAgentSettings();
 const tools = new ToolRegistry({ workspace: agentSettings.workspace });
 for (const tool of createBuiltinTools({ workspace: agentSettings.workspace, shellTimeoutMs: agentSettings.shellTimeoutMs })) {
+  tools.register(tool);
+}
+for (const tool of createSecondToolset({
+  workspace: agentSettings.workspace,
+  http: { allowPrivate: agentSettings.httpAllowPrivate },
+})) {
   tools.register(tool);
 }
 

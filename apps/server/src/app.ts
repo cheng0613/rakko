@@ -61,6 +61,8 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
   }
 
   const gate = new ApprovalGate({ timeoutMs: options.approvalTimeoutMs ?? 10 * 60_000 });
+  /** 用户点过「允许这类」的工具；启动时从设置里读回来 */
+  const grants = new Set<string>();
   const loop = new AgentLoop(gateway, tools, { maxSteps: options.maxSteps ?? 6 });
 
   const timers = new Set<ReturnType<typeof setInterval>>();
@@ -166,6 +168,7 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
 
     const decided = gate.decide(id, callId, {
       decision: parsed.data.decision,
+      ...(parsed.data.scope ? { scope: parsed.data.scope } : {}),
       ...(parsed.data.reason ? { reason: parsed.data.reason } : {}),
     });
     if (!decided) {
@@ -364,6 +367,8 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
         });
       },
 
+      isGranted: (toolName: string): boolean => grants.has(toolName),
+
       approve: async (call, tool) => {
         await flushSegment();
         await store.patchRun(run.id, { state: 'waiting_approval' });
@@ -405,8 +410,15 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
           ...(decision.reason ? { reason: decision.reason } : {}),
         });
 
+        // 「允许这类」：记进设置，之后这个工具不再问
+        if (decision.decision === 'allow' && decision.scope === 'always') {
+          grants.add(call.name);
+          await store.updateSettings({ approvedTools: [...grants] });
+          await record('notice', 'system', { reason: 'grant', tool: call.name }, `已允许「${call.name}」这类调用，之后不再询问`);
+        }
+
         if (!canceled.has(run.id)) await store.patchRun(run.id, { state: 'running' });
-        return decision.decision;
+        return { decision: decision.decision, ...(decision.scope ? { scope: decision.scope } : {}) };
       },
     };
 
@@ -441,10 +453,18 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
 
         const tool = tools.get(pending.name);
         await store.patchRun(run.id, { state: 'running' });
+        if (decision.decision === 'allow' && decision.scope === 'always') {
+          grants.add(pending.name);
+          await store.updateSettings({ approvedTools: [...grants] });
+        }
+
         const result = tool
           ? await tools.execute(
               { id: pending.callId, name: pending.name, args: pending.args },
-              { approve: async () => decision.decision },
+              {
+                approve: async () => ({ decision: decision.decision, ...(decision.scope ? { scope: decision.scope } : {}) }),
+                isGranted: (toolName: string) => grants.has(toolName),
+              },
             )
           : { ok: false, output: `没有名为 ${pending.name} 的工具`, durationMs: 0 };
 
@@ -520,6 +540,9 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
   }
 
   app.addHook('onReady', async () => {
+    const settings = await store.getSettings();
+    for (const name of settings.approvedTools) grants.add(name);
+
     const resumable = await store.resumableRuns();
     for (const item of resumable) {
       void resumeRun(item.run, item.pending).catch((error: unknown) => {

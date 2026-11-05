@@ -446,3 +446,32 @@ test('设置可读可改：用超了到底降级还是拦下，用户自己定',
   assert.equal(empty.statusCode, 400);
   await app.close();
 });
+
+test('「允许这类」之后同名工具不再弹审批，而且记进设置', async () => {
+  const { app, store } = await approvalApp();
+
+  const runId = await startRun(app);
+  const paused = await waitFor(app, runId, (body) => body.state === 'waiting_approval');
+  const callId = (paused.pendingApprovals?.[0] as { callId: string }).callId;
+
+  const decided = await app.inject({
+    method: 'POST',
+    url: `/v1/runs/${runId}/approvals/${callId}`,
+    payload: { decision: 'allow', scope: 'always' },
+  });
+  assert.equal(decided.statusCode, 200);
+  await waitFor(app, runId, (body) => body.state === 'succeeded');
+
+  const settings = (await app.inject({ method: 'GET', url: '/v1/settings' })).json();
+  assert.deepEqual(settings.approvedTools, ['write_file']);
+
+  // 第二次跑同样的活：不该再停下来等人
+  const second = await startRun(app);
+  const secondBody = await waitFor(app, second, (body) => body.state === 'succeeded' || body.state === 'waiting_approval');
+  assert.equal(secondBody.state, 'succeeded');
+
+  const types = (await store.eventsOf(second)).map((event) => event.type);
+  assert.ok(!types.includes('run.approval_requested'), '不该再弹审批');
+  assert.ok(types.includes('run.tool_result'));
+  await app.close();
+});

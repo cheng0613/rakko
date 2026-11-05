@@ -278,18 +278,27 @@ export class PostgresStore implements RunStore {
   async getSettings(): Promise<Settings> {
     const [user] = await this.db.select().from(users).where(eq(users.id, this.requireUserId())).limit(1);
     const raw = (user?.settings ?? {}) as Partial<Settings>;
-    return { degradeOnExceed: typeof raw.degradeOnExceed === 'boolean' ? raw.degradeOnExceed : this.degradeOnExceed };
+    return {
+      degradeOnExceed: typeof raw.degradeOnExceed === 'boolean' ? raw.degradeOnExceed : this.degradeOnExceed,
+      approvedTools: Array.isArray(raw.approvedTools) ? raw.approvedTools.filter((name) => typeof name === 'string') : [],
+    };
   }
 
   async updateSettings(patch: Partial<Settings>): Promise<Settings> {
     const current = await this.getSettings();
     const next: Settings = {
       degradeOnExceed: typeof patch.degradeOnExceed === 'boolean' ? patch.degradeOnExceed : current.degradeOnExceed,
+      approvedTools: Array.isArray(patch.approvedTools) ? [...new Set(patch.approvedTools)] : current.approvedTools,
     };
     // 只认白名单里的键，别的脏数据不写进去
     await this.db
       .update(users)
-      .set({ settings: sql`coalesce(${users.settings}, '{}'::jsonb) || ${JSON.stringify({ degradeOnExceed: next.degradeOnExceed })}::jsonb` })
+      .set({
+        settings: sql`coalesce(${users.settings}, '{}'::jsonb) || ${JSON.stringify({
+          degradeOnExceed: next.degradeOnExceed,
+          approvedTools: next.approvedTools,
+        })}::jsonb`,
+      })
       .where(eq(users.id, this.requireUserId()));
     return next;
   }

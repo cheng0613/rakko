@@ -167,6 +167,8 @@ export type ApiError = z.infer<typeof apiErrorSchema>;
 /** 审批：人只能给 allow / deny，不能顺手改参数。 */
 export const approvalDecisionSchema = z.object({
   decision: z.enum(['allow', 'deny']),
+  /** once = 只这一次；always = 这类工具以后不再问 */
+  scope: z.enum(['once', 'always']).optional(),
   reason: z.string().max(500).optional(),
 });
 export type ApprovalDecisionInput = z.infer<typeof approvalDecisionSchema>;
@@ -177,11 +179,14 @@ export type RiskLevel = z.infer<typeof riskLevelSchema>;
 /** 用户设置：目前只有「用超了怎么办」，以后加别的都进这个对象 */
 export const settingsSchema = z.object({
   degradeOnExceed: z.boolean(),
+  /** 用户点过「允许这类」的工具，之后不再问 */
+  approvedTools: z.array(z.string()).default([]),
 });
 export type Settings = z.infer<typeof settingsSchema>;
 
 export const updateSettingsInput = z.object({
   degradeOnExceed: z.boolean().optional(),
+  approvedTools: z.array(z.string()).optional(),
 });
 export type UpdateSettingsInput = z.infer<typeof updateSettingsInput>;
 

@@ -9,7 +9,7 @@
 
 import type { GatewayChunk, ModelTier, ProviderGateway } from './gateway.js';
 import type { ChatMessage, ToolCallRequest } from './provider.js';
-import type { ToolRegistry, ToolResult, ToolSpec } from './tools.js';
+import type { ApprovalOutcome, ToolRegistry, ToolResult, ToolSpec } from './tools.js';
 
 export interface AgentHooks {
   /** 流里的增量（回答、思考、降级说明） */
@@ -18,7 +18,9 @@ export interface AgentHooks {
   onToolCall: (call: ToolCallRequest, tool: ToolSpec) => Promise<void> | void;
   onToolResult: (call: ToolCallRequest, result: ToolResult) => Promise<void> | void;
   /** 需要人来点一下；返回 allow 才会执行 */
-  approve: (call: ToolCallRequest, tool: ToolSpec) => Promise<'allow' | 'deny'>;
+  approve: (call: ToolCallRequest, tool: ToolSpec) => Promise<ApprovalOutcome>;
+  /** 用户以前点过「允许这类」，就不再问 */
+  isGranted?: (toolName: string) => boolean;
 }
 
 export interface AgentRequest {
@@ -99,7 +101,10 @@ export class AgentLoop {
         }
 
         await hooks.onToolCall(call, tool);
-        const result = await this.tools.execute(call, { approve: () => hooks.approve(call, tool) });
+        const result = await this.tools.execute(call, {
+          approve: () => hooks.approve(call, tool),
+          ...(hooks.isGranted ? { isGranted: hooks.isGranted } : {}),
+        });
         await hooks.onToolResult(call, result);
         messages.push({ role: 'tool', toolCallId: call.id, name: call.name, content: JSON.stringify(result) });
       }

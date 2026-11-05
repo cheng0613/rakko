@@ -44,6 +44,8 @@ export interface AgentSettings {
   shellTimeoutMs: number;
   /** 配额用超了：true 降级到快模型继续跑，false 直接拦下 */
   degradeOnExceed: boolean;
+  /** http 工具是否允许打内网地址（默认不许） */
+  httpAllowPrivate: boolean;
   /** 审批等多久自动拒绝 */
   approvalTimeoutMs: number;
   /** 一个运行最多几轮「模型 → 工具」 */
@@ -55,6 +57,7 @@ export function loadAgentSettings(env: NodeJS.ProcessEnv = process.env): AgentSe
     workspace: env.RAKKO_WORKSPACE ?? process.cwd(),
     shellTimeoutMs: num(env.RAKKO_SHELL_TIMEOUT_MS, 20_000),
     degradeOnExceed: bool(env.RAKKO_DEGRADE_ON_EXCEED, true),
+    httpAllowPrivate: bool(env.RAKKO_HTTP_ALLOW_PRIVATE, false),
     approvalTimeoutMs: num(env.RAKKO_APPROVAL_TIMEOUT_MS, 10 * 60_000),
     maxSteps: num(env.RAKKO_MAX_STEPS, 6),
   };
