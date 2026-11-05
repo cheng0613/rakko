@@ -120,8 +120,11 @@ docker compose up -d --build                     # db + api 全容器化，api �
 node scripts/sync-design.mjs <design.html 路径>   # 只替换 ==DESIGN-CSS-START/END== 之间的内容
 ```
 
-所以在设计稿里改颜色、改圆角、改间距，跑一次同步，界面跟着变；界面里只额外加了事件流专用的几块
-（思考折叠、审批卡、降级提示、工具状态标签），全部复用同一套 `--line` / `--surface` / `--radius` 令牌。
+所以在设计稿里改颜色、改圆角、改间距，跑一次同步，界面跟着变。
+
+**审批卡已经画进设计稿**（`.gate` / `.gate-head` / `.gate-row` / `.gate-tip` / `.gate-acts` / `.gate-res`，
+两个状态：等你确认、已拒绝），界面直接用这组类，不再自己发明。剩下三块（思考折叠、降级提示、
+工具状态标签）还在应用层，属于纯展示，暂不进设计稿。
 
 三种打开方式：
 

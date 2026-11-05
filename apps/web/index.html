@@ -195,6 +195,24 @@
   .spark{width:52px;height:20px;flex:none;opacity:.9}
   .art-actions{display:flex;gap:8px;padding-top:11px}
 
+  /* 审批闸门：高风险工具在动手前停下来问一句，只对这一次生效 */
+  .gate{border:1px solid color-mix(in srgb,var(--accent) 40%,var(--line));border-radius:18px;background:var(--surface);padding:13px;margin:12px 0;box-shadow:var(--shadow)}
+  .gate.done{border-color:var(--line)}
+  .gate-head{display:flex;align-items:center;gap:9px;margin-bottom:10px}
+  .gate-head > svg{width:15px;height:15px;flex:none;color:var(--accent)}
+  .gate-head b{font-size:13px;font-weight:560}
+  .gate-head .tag{margin-left:auto}
+  .gate-left{font-family:var(--mono);font-size:11px;color:var(--faint);font-variant-numeric:tabular-nums;margin-left:8px}
+  .gate-row{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted);padding:5px 0;border-top:1px solid var(--line)}
+  .gate-row b{color:var(--text);font-weight:500;font-family:var(--mono);font-size:11.5px;margin-left:auto;max-width:62%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .gate-tip{font-size:11px;color:var(--faint);line-height:1.55;padding:9px 0 0;border-top:1px solid var(--line)}
+  .gate-acts{display:flex;align-items:center;gap:8px;padding-top:11px}
+  .gate-res{display:flex;align-items:center;gap:7px;font-size:12px;padding-top:11px;border-top:1px solid var(--line);margin-top:9px}
+  .gate-res.allow{color:var(--mint)}
+  .gate-res.deny{color:var(--orange)}
+  .gate-res svg{width:13px;height:13px;flex:none}
+  .tag.danger{color:var(--danger);background:color-mix(in srgb,var(--danger) 12%,transparent);border-color:color-mix(in srgb,var(--danger) 32%,transparent)}
+
   .chips{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
   .qchip{
     padding:6px 12px;border-radius:99px;border:1px solid var(--line-strong);background:var(--surface);
@@ -664,7 +682,6 @@
      只要动画被环境暂停（无头截图、后台标签、部分 webview），历史消息就一直是透明的。
      内容可见性不能挂在动画上：这里直接关掉入场动画，其余令牌与几何照旧。 */
   .msg{animation:none}
-  .tag.danger{color:var(--danger);background:color-mix(in srgb,var(--danger) 12%,transparent);border-color:color-mix(in srgb,var(--danger) 32%,transparent)}
   .tag.orange{color:var(--orange);background:color-mix(in srgb,var(--orange) 13%,transparent);border-color:color-mix(in srgb,var(--orange) 32%,transparent)}
 
   .think{border:1px solid var(--line);border-radius:14px;background:var(--surface);margin:12px 0;overflow:hidden}
@@ -680,21 +697,6 @@
   .think .pulse i:nth-child(3){animation-delay:.36s}
 
   .tool-out{font-family:var(--mono);font-size:11px;line-height:1.6;color:var(--text-2);white-space:pre-wrap;word-break:break-word;border-top:1px solid var(--line);padding-top:7px;margin-top:4px;max-height:132px;overflow:auto}
-
-  .approve{border:1px solid color-mix(in srgb,var(--accent) 38%,var(--line));border-radius:18px;background:var(--surface);padding:13px;margin:12px 0;box-shadow:var(--shadow)}
-  .approve.done{border-color:var(--line)}
-  .approve-head{display:flex;align-items:center;gap:9px;margin-bottom:10px}
-  .approve-head > svg{width:15px;height:15px;flex:none;color:var(--accent)}
-  .approve-head b{font-size:13px;font-weight:560}
-  .approve-head .tag{margin-left:auto}
-  .approve-row{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted);padding:5px 0;border-top:1px solid var(--line)}
-  .approve-row b{color:var(--text);font-weight:500;font-family:var(--mono);font-size:11.5px;margin-left:auto;max-width:62%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .approve-acts{display:flex;align-items:center;gap:8px;padding-top:11px}
-  .approve-acts .hint{margin-left:auto;font-size:10.5px;color:var(--faint);text-align:right}
-  .approve-res{display:flex;align-items:center;gap:7px;font-size:12px;padding-top:11px;border-top:1px solid var(--line);margin-top:9px}
-  .approve-res.allow{color:var(--mint)}
-  .approve-res.deny{color:var(--orange)}
-  .approve-res svg{width:13px;height:13px;flex:none}
 
   .note{display:flex;align-items:center;gap:8px;font-size:11.8px;line-height:1.5;color:var(--muted);border:1px solid var(--line);border-radius:14px;background:var(--surface-2);padding:8px 11px;margin:12px 0}
   .note .tag{flex:none}
@@ -1205,37 +1207,35 @@
     };
   };
 
-  /* 审批卡：沿用 .artifact 的几何，只是把边框换成强调色 */
+  /* 审批卡：设计稿里的 .gate 一族（与 design.html 同源，改稿要同步） */
   const addApproval = (turn, call, risk, expiresAt, onDecide) => {
-    const card = make('div', 'approve');
-    const head = make('div', 'approve-head');
+    const card = make('div', 'gate');
+    const head = make('div', 'gate-head');
     head.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><rect x="4" y="10" width="16" height="10" rx="3"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>';
     head.append(make('b', undefined, '需要你确认'));
     const riskTag = make('span', 'tag ' + (risk === 'high' ? 'danger' : risk === 'medium' ? 'orange' : 'accent'), risk === 'high' ? '高风险' : risk === 'medium' ? '中等风险' : '低风险');
     head.append(riskTag);
+    const countdown = make('span', 'gate-left');
+    head.append(countdown);
 
-    const summary = make('div', 'approve-row');
+    const summary = make('div', 'gate-row');
     summary.append(make('span', undefined, '操作'));
     summary.append(make('b', undefined, call.name));
 
     const target = call.args && (call.args.path || call.args.command);
-    const targetRow = make('div', 'approve-row');
+    const targetRow = make('div', 'gate-row');
     targetRow.append(make('span', undefined, call.args && call.args.command ? '命令' : '目标'));
     const targetVal = make('b', undefined, target ? short(String(target), 52) : JSON.stringify(call.args));
     targetVal.title = String(target || JSON.stringify(call.args));
     targetRow.append(targetVal);
 
-    const meta = make('div', 'approve-row');
-    meta.append(make('span', undefined, '剩余'));
-    const countdown = make('b', undefined, '—');
-    meta.append(countdown);
-
-    const acts = make('div', 'approve-acts');
+    const acts = make('div', 'gate-acts');
     const allow = make('button', 'btn primary', '允许这次');
     const deny = make('button', 'btn danger', '拒绝');
-    acts.append(allow, deny, make('span', 'hint', '拒绝不会让任务失败，我会换个做法'));
+    acts.append(allow, deny);
+    const tip = make('div', 'gate-tip', '允许只对这一次生效；拒绝不会让任务失败，我会读到理由并换个做法。');
 
-    card.append(head, summary, targetRow, meta, acts);
+    card.append(head, summary, targetRow, tip, acts);
     turn.body.append(card);
     closePart(turn);
     scrollBottom();
@@ -1244,7 +1244,7 @@
     const timer = setInterval(() => {
       const left = new Date(expiresAt).getTime() - Date.now();
       if (!isFinite(left)) { countdown.textContent = '—'; return; }
-      if (left <= 0) { countdown.textContent = '已到时'; return; }
+      if (left <= 0) { countdown.textContent = '到点'; return; }
       const m = Math.floor(left / 60000);
       const s = Math.floor((left % 60000) / 1000);
       countdown.textContent = m > 0 ? m + ':' + String(s).padStart(2, '0') : s + 's';
@@ -1255,15 +1255,15 @@
       settled = true;
       clearInterval(timer);
       acts.remove();
-      meta.remove();
+      tip.remove();
       card.classList.add('done');
-      const res = make('div', 'approve-res ' + (decision === 'allow' ? 'allow' : 'deny'));
+      const res = make('div', 'gate-res ' + (decision === 'allow' ? 'allow' : 'deny'));
       res.innerHTML = decision === 'allow'
         ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"><path d="m5 13 4 4L19 7"/></svg>'
         : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg>';
       res.append(make('span', undefined, note || (decision === 'allow' ? '你允许了这次调用' : '你拒绝了这次调用')));
       card.append(res);
-      countdown.textContent = '—';
+      countdown.textContent = '';
       state.pending = Math.max(0, state.pending - 1);
       renderCtx();
     };
