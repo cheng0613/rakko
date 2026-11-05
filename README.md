@@ -180,12 +180,16 @@ node --env-file=.env apps/server/dist/index.js   # 然后开 http://127.0.0.1:87
 ```bash
 pnpm --filter @rakko/desktop build
 pnpm --filter @rakko/desktop start     # 窗口 1440×900，最小 1080×720
-pnpm --filter @rakko/desktop smoke     # 无人值守冒烟：加载页面，打印标题，退出
+pnpm --filter @rakko/desktop smoke     # 无人值守冒烟：加载、截图、打印标题、退出
 ```
 
 启动顺序：先探 `/health`，服务没起就用 Electron 自带的 node
 （`ELECTRON_RUN_AS_NODE=1`）把 `apps/server` 拉起来，等健康检查通过再开窗口；
 关窗顺手杀掉子进程。外链一律交给系统浏览器，窗口里只有自己的界面。
+
+双击打开的 app 没有 shell 环境变量，所以壳会自己读 `.env`（`apps/desktop/.env` 或仓库根），
+显式传入的环境变量优先。冒烟会把窗口真实渲染的内容截一张图（`RAKKO_SMOKE_SHOT` 可指定路径），
+所以「页面加载成功」和「真的画出东西了」是两件事，这里验的是后者。
 
 **还没做**：打包成安装包、签名、自动更新。这一轮只是「能双击开」。
 
