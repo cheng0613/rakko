@@ -20,7 +20,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --test \"dist/**/*.test.js\"",
+    "test": "pnpm build && node --test \"dist/**/*.test.js\"",
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
     "migrate": "node --input-type=module -e \"import('@rakko/db').then(async (m) => { const h = m.createDb(process.env.DATABASE_URL); await m.migrateDb(h); console.log('迁移已应用'); await h.close(); })\""

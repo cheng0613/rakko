@@ -8,6 +8,7 @@
  */
 
 import { exec } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
@@ -40,6 +41,23 @@ const resolveInside = (workspace: string, candidate: string): string => {
 
 const truncate = (text: string, limit = MAX_OUTPUT): string =>
   text.length <= limit ? text : `${text.slice(0, limit)}\n…（已截断，原长 ${text.length} 字符）`;
+
+/**
+ * 模型常见的两个误写：cd 到不存在的路径（拿 Linux 路径套 Windows），
+ * 以及把「工作区」当成还需要自己 cd 进去。真的能 cd 就照原样跑，cd 不进去就忽略它。
+ */
+const normalizeCommand = (command: string, workspace: string): { command: string; note: string | null } => {
+  const match = /^\s*cd\s+("[^"]+"|'[^']+'|\S+)\s*&&\s*([\s\S]+)$/.exec(command);
+  if (!match) return { command, note: null };
+
+  const target = (match[1] ?? '').replace(/^["']|["']$/g, '');
+  const resolved = path.resolve(workspace, target);
+  if (existsSync(target) || existsSync(resolved)) return { command, note: null };
+  return {
+    command: match[2] ?? '',
+    note: `（忽略了 cd ${target}：那个路径不存在，命令已经在工作区执行）`,
+  };
+};
 
 const runShell = (command: string, cwd: string, timeoutMs: number): Promise<string> =>
   new Promise((resolve, reject) => {
@@ -131,9 +149,12 @@ export function createBuiltinTools(options: BuiltinToolsOptions): ToolSpec[] {
         timeoutMs: z.number().int().min(1_000).max(300_000).optional().describe('超时毫秒数，默认 20000'),
       }),
       run: async (args: { command: string; timeoutMs?: number }) => {
-        const denied = DENIED_PATTERNS.find((pattern) => pattern.test(args.command));
-        if (denied) throw new Error(`这条命令被硬规则拦下：${args.command}`);
-        return runShell(args.command, path.resolve(workspace), args.timeoutMs ?? shellTimeoutMs);
+        const normalized = normalizeCommand(args.command, path.resolve(workspace));
+        const denied = DENIED_PATTERNS.find((pattern) => pattern.test(normalized.command));
+        if (denied) throw new Error(`这条命令被硬规则拦下：${normalized.command}`);
+        const output = await runShell(normalized.command, path.resolve(workspace), args.timeoutMs ?? shellTimeoutMs);
+        return normalized.note ? `${normalized.note}
+${output}` : output;
       },
     },
   ];

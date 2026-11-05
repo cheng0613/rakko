@@ -59,6 +59,6 @@ export function loadAgentSettings(env: NodeJS.ProcessEnv = process.env): AgentSe
     degradeOnExceed: bool(env.RAKKO_DEGRADE_ON_EXCEED, true),
     httpAllowPrivate: bool(env.RAKKO_HTTP_ALLOW_PRIVATE, false),
     approvalTimeoutMs: num(env.RAKKO_APPROVAL_TIMEOUT_MS, 10 * 60_000),
-    maxSteps: num(env.RAKKO_MAX_STEPS, 6),
+    maxSteps: num(env.RAKKO_MAX_STEPS, 12),
   };
 }

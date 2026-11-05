@@ -63,7 +63,7 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
   const gate = new ApprovalGate({ timeoutMs: options.approvalTimeoutMs ?? 10 * 60_000 });
   /** 用户点过「允许这类」的工具；启动时从设置里读回来 */
   const grants = new Set<string>();
-  const loop = new AgentLoop(gateway, tools, { maxSteps: options.maxSteps ?? 6 });
+  const loop = new AgentLoop(gateway, tools, { maxSteps: options.maxSteps ?? 12 });
 
   const timers = new Set<ReturnType<typeof setInterval>>();
   const controllers = new Map<string, AbortController>();
@@ -234,6 +234,44 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
 
     return reply;
   });
+
+
+  /** 系统提示：把环境事实与干活纪律一次说清，别让模型拿 Linux 路径套 Windows */
+  function buildSystemPrompt(): string {
+    const platformHint =
+      process.platform === 'win32'
+        ? 'Windows（shell 走 cmd；路径写盘符路径或相对路径，不要用 /home/xxx 这种）'
+        : process.platform === 'darwin'
+          ? 'macOS（shell 走 /bin/sh）'
+          : 'Linux（shell 走 /bin/sh）';
+
+    return [
+      '你是 Rakko，跑在用户自己电脑上的个人 agent。用户给的是任务，不是闲聊。',
+      '',
+      '## 运行环境',
+      `- 系统：${platformHint}`,
+      `- 工作区：${workspace}`,
+      '- 文件工具的路径都相对工作区，越界会被拒。',
+      '- shell 的工作目录就是工作区，命令直接跑，不要再 cd 到别处。',
+      '',
+      '## 工具',
+      '- read_file / list_dir / grep：只读，直接执行。改文件前先读一遍。',
+      '- apply_patch：old 必须在文件里唯一命中，0 次或多次都会失败；失败后补上下文再试。',
+      '- write_file：整文件覆盖，仅在新建文件时用。',
+      '- shell：跑测试、构建、看命令输出。',
+      '- http：发请求，默认不许打内网。',
+      '高风险工具会停下来等用户审批；用户点过「允许这类」后不再问。',
+      '',
+      '## 干活纪律',
+      '1. 先看清现状再动手：读文件、grep 确认位置，再改。',
+      '2. 改完必须验证：跑相关测试或命令；失败就读输出找原因再改，不要靠猜。',
+      '3. 没验证就不要说「完成了」。做不到就直说卡在哪一步。',
+      '4. 不要假装执行过工具：只有工具结果里出现的东西才算做过。',
+      '',
+      '## 回答',
+      '- 用中文，简洁，先说结论。代码、命令、路径、标识符保持原样。',
+    ].join('\n');
+  }
 
   /** 把落库的消息还原成模型能读的历史（tool 消息必须带 toolCallId） */
   function buildHistory(items: Message[]): ChatMessage[] {
@@ -499,12 +537,9 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
         return;
       }
       if (outcome.stopped === 'max_steps') {
-        await emit({
-          type: 'run.delta',
-          runId: run.id,
-          at: at(),
-          text: `（到步数上限 ${outcome.steps} 先停一下，等你发下一步指令）\n`,
-        });
+        const reason = `到步数上限（${outcome.steps} 轮）先停一下，任务可能没做完`;
+        await store.patchRun(run.id, { error: reason });
+        await emit({ type: 'run.delta', runId: run.id, at: at(), text: `（${reason}）\n` });
       }
 
       await store.chargeRun(run);
@@ -528,13 +563,13 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
     await store.patchRun(run.id, { state: 'running' });
     await store.publish({ type: 'run.started', runId: run.id, at: at() });
     await store.publish({ type: 'run.state', runId: run.id, at: at(), state: 'running' });
-    await executeRun(run, tier, [{ role: 'user', content: run.prompt }], null, notice);
+    await executeRun(run, tier, [{ role: 'system', content: buildSystemPrompt() }, { role: 'user', content: run.prompt }], null, notice);
   }
 
   /** 重启后恢复：拿库里的历史 + 还挂着的审批，接着跑 */
   async function resumeRun(run: Run, pending: PendingCall | null): Promise<void> {
     const items = await store.listMessages(run.threadId);
-    const messages = buildHistory(items);
+    const messages: ChatMessage[] = [{ role: 'system', content: buildSystemPrompt() }, ...buildHistory(items)];
     const tier: ModelTier = run.model === gateway.models.fast ? 'fast' : 'standard';
     await executeRun(run, tier, messages, pending, null);
   }
