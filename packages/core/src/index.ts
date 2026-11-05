@@ -8,9 +8,14 @@ export {
 } from './run-machine.js';
 export { CircuitBreaker, type BreakerOptions, type BreakerState } from './circuit-breaker.js';
 export {
+  currentPeriod,
   decideQuota,
+  planLimit,
+  PLAN_LIMITS,
+  periodStart,
   remainingQuota,
   shouldChargeRun,
+  type PlanId,
   type QuotaDecision,
   type QuotaState,
 } from './quota.js';

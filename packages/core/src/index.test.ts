@@ -2,7 +2,14 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { CircuitBreaker } from './circuit-breaker.js';
-import { decideQuota, remainingQuota, shouldChargeRun } from './quota.js';
+import {
+  currentPeriod,
+  decideQuota,
+  periodStart,
+  planLimit,
+  remainingQuota,
+  shouldChargeRun,
+} from './quota.js';
 import { assertTransition, canTransition, IllegalTransition, isTerminal } from './run-machine.js';
 import { FakeProvider } from './provider.js';
 
@@ -47,6 +54,19 @@ test('配额按次数计，用超了按设置降级或拦截', () => {
 
   assert.equal(decideQuota({ limit: 120, used: 120, degradeOnExceed: true }).kind, 'degrade');
   assert.equal(decideQuota({ limit: 120, used: 130, degradeOnExceed: false }).kind, 'block');
+});
+
+test('计划上限只认三档，未知计划落到 free', () => {
+  assert.equal(planLimit('pro'), 120);
+  assert.equal(planLimit('free'), 30);
+  assert.equal(planLimit('team'), 600);
+  assert.equal(planLimit('enterprise-whatever'), 30);
+});
+
+test('周期用 UTC，跨年不错月', () => {
+  assert.equal(currentPeriod(new Date('2026-11-05T01:00:00Z')), '2026-11');
+  assert.equal(currentPeriod(new Date('2026-01-01T00:00:00Z')), '2026-01');
+  assert.equal(periodStart(new Date('2026-11-05T01:00:00Z')), '2026-11-01T00:00:00.000Z');
 });
 
 test('取消的运行不扣次数', () => {

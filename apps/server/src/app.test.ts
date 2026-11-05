@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
+import { MemoryStore } from './store.js';
 import { createApp } from './app.js';
 
 test('健康检查带上 provider 标识，运维一眼能看出接的谁', async () => {
@@ -10,6 +11,7 @@ test('健康检查带上 provider 标识，运维一眼能看出接的谁', asyn
   const body = response.json();
   assert.equal(body.ok, true);
   assert.equal(body.service, 'rakko-api');
+  assert.equal(body.store, 'memory');
   await app.close();
 });
 
@@ -50,6 +52,24 @@ test('会话不存在时返回 404，并给中文说明', async () => {
 });
 
 test('配额用完后按设置降级：仍接受运行，但模型换成 fast 并说明原因', async () => {
+  const store = new MemoryStore();
+  store.setUsage(120);
+  const app = createApp({ store });
+
+  const thread = (await app.inject({ method: 'POST', url: '/v1/threads', payload: {} })).json();
+
+  const blocked = await app.inject({
+    method: 'POST',
+    url: '/v1/runs',
+    payload: { threadId: thread.id, prompt: '跑一下测试', model: 'standard' },
+  });
+  assert.equal(blocked.statusCode, 202);
+  assert.equal(blocked.json().degraded, true);
+  assert.equal(blocked.json().model, 'fast');
+  await app.close();
+});
+
+test('会话与用量走同一份存储，接口形状不变', async () => {
   const app = createApp();
   const thread = (await app.inject({ method: 'POST', url: '/v1/threads', payload: {} })).json();
 

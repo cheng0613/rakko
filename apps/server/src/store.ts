@@ -1,38 +1,81 @@
+/**
+ * 存储接口 —— 服务端只认这个接口，不认具体实现。
+ *
+ * MemoryStore 给测试和「没配 DATABASE_URL 时也能起」用；
+ * PostgresStore 是 M0 之后的事实源实现。两者行为必须一致，否则测试就没意义了。
+ */
+
 import { randomUUID } from 'node:crypto';
 
-import { decideQuota, type QuotaDecision, type QuotaState } from '@rakko/core';
+import { currentPeriod, decideQuota, periodStart, planLimit, type QuotaDecision } from '@rakko/core';
 import type { Message, MessageRole, Run, RunEvent, Thread, Usage } from '@rakko/protocol';
 
-type Listener = (event: RunEvent) => void;
+export interface AppendMessageInput {
+  threadId: string;
+  role: MessageRole;
+  text: string;
+  runId?: string | null;
+}
+
+export interface CreateRunInput {
+  threadId: string;
+  prompt: string;
+  model: string;
+}
+
+export type RunPatch = Partial<Pick<Run, 'state' | 'error' | 'finishedAt'>>;
+
+export type Listener = (event: RunEvent) => void;
+
+export interface RunStore {
+  /** 供 /health 区分实现，运维一眼能看出接的哪个 */
+  readonly kind: 'memory' | 'postgres';
+  /** 建连接、迁移、准备默认用户 */
+  ready(): Promise<void>;
+  listThreads(): Promise<Thread[]>;
+  getThread(id: string): Promise<Thread | undefined>;
+  createThread(title?: string): Promise<Thread>;
+  listMessages(threadId: string): Promise<Message[]>;
+  appendMessage(input: AppendMessageInput): Promise<Message>;
+  createRun(input: CreateRunInput): Promise<Run>;
+  getRun(id: string): Promise<Run | undefined>;
+  patchRun(id: string, patch: RunPatch): Promise<Run | undefined>;
+  /** SSE 重放用，按 seq 升序 */
+  eventsOf(runId: string): Promise<RunEvent[]>;
+  /** 落库 + 推给订阅者。顺序不能反。 */
+  publish(event: RunEvent): Promise<void>;
+  subscribe(runId: string, listener: Listener): () => void;
+  quotaDecision(): Promise<QuotaDecision>;
+  chargeRun(run: Run): Promise<void>;
+  usage(): Promise<Usage>;
+  close(): Promise<void>;
+}
 
 const now = (): string => new Date().toISOString();
 
-const periodStart = (): string => {
-  const date = new Date();
-  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1)).toISOString();
-};
-
-/**
- * M0 的内存实现：形状与 Postgres 版一致，M1 只换实现不换接口。
- * 进程重启即清空 —— 这是脚手架，不是事实源。
- */
-export class Store {
+/** 进程内实现：形状与 Postgres 版一致，进程重启即清空。 */
+export class MemoryStore implements RunStore {
+  readonly kind = 'memory' as const;
   private readonly threads = new Map<string, Thread>();
   private readonly runs = new Map<string, Run>();
   private readonly messages = new Map<string, Message[]>();
   private readonly events = new Map<string, RunEvent[]>();
   private readonly listeners = new Map<string, Set<Listener>>();
-  private quota: QuotaState = { limit: 120, used: 62, degradeOnExceed: true };
+  private quota = { limit: planLimit('pro'), used: 62, degradeOnExceed: true };
 
-  listThreads(): Thread[] {
+  async ready(): Promise<void> {}
+
+  async close(): Promise<void> {}
+
+  async listThreads(): Promise<Thread[]> {
     return [...this.threads.values()].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
 
-  getThread(id: string): Thread | undefined {
+  async getThread(id: string): Promise<Thread | undefined> {
     return this.threads.get(id);
   }
 
-  createThread(title?: string): Thread {
+  async createThread(title?: string): Promise<Thread> {
     const at = now();
     const thread: Thread = { id: randomUUID(), title: title ?? '新对话', createdAt: at, updatedAt: at };
     this.threads.set(thread.id, thread);
@@ -40,11 +83,11 @@ export class Store {
     return thread;
   }
 
-  listMessages(threadId: string): Message[] {
+  async listMessages(threadId: string): Promise<Message[]> {
     return this.messages.get(threadId) ?? [];
   }
 
-  appendMessage(input: { threadId: string; role: MessageRole; text: string; runId?: string | null }): Message {
+  async appendMessage(input: AppendMessageInput): Promise<Message> {
     const message: Message = {
       id: randomUUID(),
       threadId: input.threadId,
@@ -63,7 +106,7 @@ export class Store {
     return message;
   }
 
-  createRun(input: { threadId: string; prompt: string; model: string }): Run {
+  async createRun(input: CreateRunInput): Promise<Run> {
     const run: Run = {
       id: randomUUID(),
       threadId: input.threadId,
@@ -79,11 +122,11 @@ export class Store {
     return run;
   }
 
-  getRun(id: string): Run | undefined {
+  async getRun(id: string): Promise<Run | undefined> {
     return this.runs.get(id);
   }
 
-  patchRun(id: string, patch: Partial<Pick<Run, 'state' | 'error' | 'finishedAt'>>): Run | undefined {
+  async patchRun(id: string, patch: RunPatch): Promise<Run | undefined> {
     const run = this.runs.get(id);
     if (!run) return undefined;
     const next: Run = { ...run, ...patch };
@@ -91,11 +134,11 @@ export class Store {
     return next;
   }
 
-  eventsOf(runId: string): RunEvent[] {
+  async eventsOf(runId: string): Promise<RunEvent[]> {
     return this.events.get(runId) ?? [];
   }
 
-  publish(event: RunEvent): void {
+  async publish(event: RunEvent): Promise<void> {
     const list = this.events.get(event.runId) ?? [];
     list.push(event);
     this.events.set(event.runId, list);
@@ -111,15 +154,15 @@ export class Store {
     };
   }
 
-  quotaDecision(): QuotaDecision {
+  async quotaDecision(): Promise<QuotaDecision> {
     return decideQuota(this.quota);
   }
 
-  chargeRun(): void {
+  async chargeRun(): Promise<void> {
     this.quota.used += 1;
   }
 
-  usage(): Usage {
+  async usage(): Promise<Usage> {
     return {
       plan: 'Pro',
       limit: this.quota.limit,
@@ -128,5 +171,15 @@ export class Store {
       periodStart: periodStart(),
       degradeOnExceed: this.quota.degradeOnExceed,
     };
+  }
+
+  /** 测试用：把用量推到上限，验证降级分支。 */
+  setUsage(used: number): void {
+    this.quota = { ...this.quota, used };
+  }
+
+  /** 测试用：当前周期，和 Postgres 版对账。 */
+  period(): string {
+    return currentPeriod();
   }
 }

@@ -12,7 +12,9 @@
   },
   "dependencies": {
     "@rakko/core": "workspace:^",
+    "@rakko/db": "workspace:^",
     "@rakko/protocol": "workspace:^",
+    "drizzle-orm": "^0.44.7",
     "fastify": "^5.6.1"
   },
   "scripts": {
@@ -20,6 +22,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --test \"dist/**/*.test.js\"",
     "dev": "tsx watch src/index.ts",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "migrate": "node --input-type=module -e \"import('@rakko/db').then(async (m) => { const h = m.createDb(process.env.DATABASE_URL); await m.migrateDb(h); console.log('迁移已应用'); await h.close(); })\""
   }
 }

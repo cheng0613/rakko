@@ -37,3 +37,4 @@ export async function ping(handle: DbHandle): Promise<boolean> {
 }
 
 export * from './schema.js';
+export { defaultMigrationsFolder, migrateDb } from './migrate.js';
