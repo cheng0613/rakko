@@ -186,13 +186,15 @@ export const kgNodes = pgTable(
       .references(() => users.id, { onDelete: 'cascade' }),
     /** 人类可读的名字，例如「Rakko」「Postgres」 */
     name: text('name').notNull(),
+    /** 归一化后的键：小写 + 压空白 + 去首尾符号，用来合并「Postgres / postgres」 */
+    key: text('key').notNull(),
     /** 类型：person / project / tool / concept / place 等 */
     kind: text('kind').notNull().default('concept'),
     /** 来自哪条记忆（可空：也可以从对话里直接冒出来） */
     memoryId: uuid('memory_id').references(() => memories.id, { onDelete: 'set null' }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
-  (table) => [uniqueIndex('kg_nodes_user_name_uq').on(table.userId, table.name)],
+  (table) => [uniqueIndex('kg_nodes_user_key_uq').on(table.userId, table.key)],
 );
 
 /** 实体之间的关系 */

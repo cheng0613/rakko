@@ -943,7 +943,8 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
       }
     }
 
-    const direct = await store.searchMemories({ query, embedding, limit: 8 });
+    const minScore = Number(process.env.RAKKO_MEMORY_MIN_SCORE ?? 0.25);
+    const direct = await store.searchMemories({ query, embedding, limit: 8, minScore: Number.isFinite(minScore) ? minScore : 0.25 });
     if (direct.length === 0) return '';
 
     // 图谱扩展：沿实体关系再捞一跳，补上语义没召回但相关的记忆

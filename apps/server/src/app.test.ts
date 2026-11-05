@@ -901,9 +901,8 @@ test('语义检索：查询命中的记忆排在最前，最多带 8 条', async
     await store.createMemory({ kind: 'user', title: `无关记忆 ${i}`, body: '跟数据库没关系', embedding: [0, 1, 0] });
   }
 
-  const hits = await store.searchMemories({ query: '数据库用什么', embedding: [1, 0, 0], limit: 8 });
-  assert.equal(hits.length, 8);
-  assert.equal(hits[0]?.title, 'Postgres 独占事实源');
+  const hits = await store.searchMemories({ query: '数据库用什么', embedding: [1, 0, 0], limit: 8, minScore: 0.25 });
+  assert.deepEqual(hits.map((memory) => memory.title), ['Postgres 独占事实源'], '只留过阈值的');
 
   const keywordOnly = await store.searchMemories({ query: '本地缓存', embedding: null, limit: 3 });
   assert.ok(keywordOnly.some((memory) => memory.title === 'Postgres 独占事实源'), '没有向量时按关键词兜底');
@@ -960,10 +959,8 @@ test('记忆段会按查询挑：相关的进系统提示，不相关的排在�
 
   const system = seen[0] ?? '';
   assert.match(system, /用户的记忆（跨会话）/);
-  const first = system.indexOf('Postgres 独占事实源');
-  const second = system.indexOf('回答先给结论');
-  assert.ok(first > -1, '相关的记忆要在');
-  assert.ok(first < second, '相关的应该排在前面');
+  assert.ok(system.includes('Postgres 独占事实源'), '相关的记忆要在');
+  assert.ok(!system.includes('回答先给结论'), '余弦 0 的不该塞进来');
   await app.close();
 });
 
@@ -1019,4 +1016,78 @@ test('图谱扩展后的记忆会带「关联记忆」标记进系统提示', as
   assert.match(system, /迁移必须先备份/, '相邻记忆要被带进来');
   assert.ok(system.includes('[feedback]（关联记忆）'), '要标出来源');
   await app.close();
+});
+
+test('实体名归一化：Postgres 与 postgres 是同一个节点', async () => {
+  const store = new MemoryStore();
+  const a = await store.createMemory({ kind: 'project', title: 'Rakko 用 Postgres', body: '.' });
+  const b = await store.createMemory({ kind: 'project', title: 'postgres 版本', body: '.' });
+
+  await store.saveTriples(a.id, [{ from: 'Rakko', relation: '使用', to: 'Postgres' }]);
+  await store.saveTriples(b.id, [{ from: 'Rakko', relation: '使用', to: ' postgres ' }]);
+
+  const graph = await store.listGraph();
+  const names = graph.nodes.map((node) => node.name).sort();
+  assert.deepEqual(names, ['Postgres', 'Rakko'], '大小写与空格不同的实体要合并');
+  assert.equal(graph.edges.length, 1, '三元组重复，只留一条边');
+});
+
+test('低于余弦阈值的记忆不会被注入，关键词命中仍然算', async () => {
+  const seen: string[] = [];
+  const provider: ModelProvider = {
+    id: 'peek-threshold',
+    async *stream(request) {
+      seen.push(request.messages[0]?.content ?? '');
+      yield { kind: 'delta', text: '好。' };
+      yield { kind: 'done', finishReason: 'stop' };
+    },
+  };
+
+  const store = new MemoryStore();
+  // 与查询正交（余弦 0）：不该进提示
+  await store.createMemory({ kind: 'user', title: '无关偏好', body: '喜欢蓝色。', embedding: [0, 1] });
+  // 与查询同向（余弦 1）：必须进
+  await store.createMemory({ kind: 'project', title: '数据库选型', body: '用 Postgres。', embedding: [1, 0] });
+
+  const embeddings = { model: 'stub', dims: 2, embed: async () => [[1, 0]] };
+  const gateway = new ProviderGateway({ provider, models: FAKE_MODELS, firstChunkTimeoutMs: 2_000 });
+  const app = createApp({ store, gateway, embeddings });
+
+  const thread = (await app.inject({ method: 'POST', url: '/v1/threads', payload: {} })).json();
+  const run = (await app.inject({ method: 'POST', url: '/v1/runs', payload: { threadId: thread.id, prompt: '数据库选型怎么定' } })).json();
+  await waitFor(app, run.id, (body) => body.state === 'succeeded');
+
+  const system = seen[0] ?? '';
+  assert.ok(system.includes('数据库选型'), '过阈值的要在');
+  const section = system.split('## 用户的记忆（跨会话）')[1] ?? '';
+  assert.ok(!section.includes('无关偏好'), '低相关度的不该塞进来');
+  await app.close();
+});
+
+test('孤立实体被剪掉，不留垃圾节点', { skip: !process.env.DATABASE_URL }, async () => {
+  const handle = createDb(process.env.DATABASE_URL!, { max: 2 });
+  await migrateDb(handle);
+
+  const email = `prune-${Date.now()}@rakko.app`;
+  const store = new PostgresStore(handle, { email, plan: 'pro' });
+  await store.ready();
+
+  try {
+    const userId = (await handle.sql<{ id: string }[]>`select id from users where email = ${email}`)[0]?.id;
+    assert.ok(userId);
+
+    // 直接塞一个没有任何边的节点
+    await handle.sql`insert into kg_nodes (user_id, name, key, kind) values (${userId}, '孤儿节点', '孤儿节点', 'concept')`;
+
+    const removed = await store.pruneOrphanNodes();
+    assert.ok(removed >= 1);
+
+    const left = await handle.sql<{ count: number }[]>`
+      select count(*)::int as count from kg_nodes where user_id = ${userId} and key = '孤儿节点'
+    `;
+    assert.equal(left[0]?.count, 0);
+  } finally {
+    await handle.sql`delete from users where email = ${email}`;
+    await store.close();
+  }
 });

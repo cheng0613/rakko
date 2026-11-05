@@ -14,7 +14,7 @@ import { automations, kgEdges, kgNodes, memories, messages, runEvents, runs, ski
 import { currentPeriod, decideQuota, periodStart, planLimit, type QuotaDecision } from '@rakko/core';
 import type { Automation, Graph, KgEdge, KgNode, Memory, MemoryKind, MemoryStatus, Message, MessageKind, RiskLevel, Run, RunEvent, RunState, Settings, Skill, Thread, Usage } from '@rakko/protocol';
 
-import { toVectorLiteral } from '@rakko/core';
+import { entityKey, normalizeEntityName, toVectorLiteral } from '@rakko/core';
 
 import { BUILTIN_SKILLS } from './store.js';
 import type {
@@ -480,11 +480,21 @@ export class PostgresStore implements RunStore {
 
     if (options.embedding && options.embedding.length > 0) {
       const literal = toVectorLiteral(options.embedding);
+      const minScore = options.minScore ?? 0.25;
+      const distance = sql`${memories.embedding} <=> ${sql.raw(`'${literal}'::vector`)}`;
       const rows = await this.db
         .select()
         .from(memories)
-        .where(and(eq(memories.userId, userId), eq(memories.status, 'active'), isNotNull(memories.embedding)))
-        .orderBy(sql`${memories.embedding} <=> ${sql.raw(`'${literal}'::vector`)}`)
+        .where(
+          and(
+            eq(memories.userId, userId),
+            eq(memories.status, 'active'),
+            isNotNull(memories.embedding),
+            // 余弦相似度 = 1 - 距离；低于阈值的干脆不取
+            sql`1 - (${distance}) >= ${minScore}`,
+          ),
+        )
+        .orderBy(distance)
         .limit(options.limit);
       if (rows.length > 0) return rows.map(toMemory);
     }
@@ -583,30 +593,50 @@ export class PostgresStore implements RunStore {
         .values({ userId, fromId, toId, relation: triple.relation, memoryId })
         .onConflictDoNothing();
     }
+
+    await this.pruneOrphanNodes().catch(() => 0);
   }
 
   private async ensureNode(userId: string, name: string, kind: string, memoryId: string): Promise<string> {
+    const key = entityKey(name);
+    const display = normalizeEntityName(name);
+
     const [existing] = await this.db
       .select({ id: kgNodes.id })
       .from(kgNodes)
-      .where(and(eq(kgNodes.userId, userId), eq(kgNodes.name, name)))
+      .where(and(eq(kgNodes.userId, userId), eq(kgNodes.key, key)))
       .limit(1);
     if (existing) return existing.id;
 
     const [created] = await this.db
       .insert(kgNodes)
-      .values({ userId, name, kind, memoryId })
-      .onConflictDoNothing({ target: [kgNodes.userId, kgNodes.name] })
+      .values({ userId, name: display, key, kind, memoryId })
+      .onConflictDoNothing({ target: [kgNodes.userId, kgNodes.key] })
       .returning({ id: kgNodes.id });
     if (created) return created.id;
 
     const [again] = await this.db
       .select({ id: kgNodes.id })
       .from(kgNodes)
-      .where(and(eq(kgNodes.userId, userId), eq(kgNodes.name, name)))
+      .where(and(eq(kgNodes.userId, userId), eq(kgNodes.key, key)))
       .limit(1);
     if (!again) throw new Error(`建图谱节点失败：${name}`);
     return again.id;
+  }
+
+  /** 没有任何边连着的实体直接删掉，免得图谱越长越脏 */
+  async pruneOrphanNodes(): Promise<number> {
+    const userId = this.requireUserId();
+    const rows = await this.db
+      .delete(kgNodes)
+      .where(
+        and(
+          eq(kgNodes.userId, userId),
+          sql`not exists (select 1 from ${kgEdges} where ${kgEdges.fromId} = ${kgNodes.id} or ${kgEdges.toId} = ${kgNodes.id})`,
+        ),
+      )
+      .returning({ id: kgNodes.id });
+    return rows.length;
   }
 
   async updateMemory(

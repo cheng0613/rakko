@@ -7,7 +7,7 @@
 
 import { randomUUID } from 'node:crypto';
 
-import { currentPeriod, decideQuota, periodStart, planLimit, type QuotaDecision, type QuotaState } from '@rakko/core';
+import { currentPeriod, decideQuota, entityKey, normalizeEntityName, periodStart, planLimit, type QuotaDecision, type QuotaState } from '@rakko/core';
 import type { Automation, Graph, Memory, MemoryStatus, Message, MessageKind, MessageRole, RiskLevel, Run, RunEvent, Settings, Skill, Thread, Usage } from '@rakko/protocol';
 
 export interface AppendMessageInput {
@@ -46,6 +46,8 @@ export interface MemorySearchOptions {
   /** 查询向量；拿不到 embedding 时传 null */
   embedding: number[] | null;
   limit: number;
+  /** 余弦下限：低于它的语义结果不注入，避免「不相关也塞进去」。默认 0.25 */
+  minScore?: number;
 }
 
 export interface PendingCall {
@@ -96,6 +98,8 @@ export interface RunStore {
   listGraph(): Promise<Graph>;
   /** 把一条记忆抽出的三元组写进图谱 */
   saveTriples(memoryId: string, triples: TripleInput[]): Promise<void>;
+  /** 清掉孤立的实体节点（没有任何边连着），返回删了几个 */
+  pruneOrphanNodes(): Promise<number>;
   updateMemory(id: string, patch: Partial<Pick<Memory, 'kind' | 'title' | 'description' | 'body' | 'status'>>): Promise<Memory | undefined>;
   deleteMemory(id: string): Promise<boolean>;
 
@@ -219,7 +223,10 @@ export class MemoryStore implements RunStore {
   private readonly automations = new Map<string, Automation>();
   private readonly memories = new Map<string, Memory>();
   private readonly embeddings = new Map<string, number[]>();
-  private readonly graphNodes = new Map<string, { id: string; name: string; kind: string; memoryId: string | null; createdAt: string }>();
+  private readonly graphNodes = new Map<
+    string,
+    { id: string; name: string; key: string; kind: string; memoryId: string | null; createdAt: string }
+  >();
   private readonly graphEdges = new Map<string, { id: string; fromId: string; toId: string; relation: string; memoryId: string | null; createdAt: string }>();
   private readonly skills = new Map<string, Skill>();
 
@@ -268,17 +275,24 @@ export class MemoryStore implements RunStore {
     const active = [...this.memories.values()].filter((memory) => memory.status !== 'pending');
     const keyword = options.query.toLowerCase();
 
+    const minScore = options.minScore ?? 0.25;
     const scored = active.map((memory) => {
       const vector = this.embeddings.get(memory.id);
       const semantic = options.embedding && vector ? cosine(vector, options.embedding) : 0;
       const text = `${memory.title} ${memory.description} ${memory.body}`.toLowerCase();
       const lexical = keyword && text.includes(keyword) ? 1 : 0;
-      return { memory, score: semantic + lexical };
+      // 语义低于阈值就不算命中，除非关键词对上了
+      const score = lexical > 0 ? Math.max(semantic, minScore) : semantic >= minScore ? semantic : 0;
+      return { memory, score };
     });
 
     const matched = scored.filter((item) => item.score > 0).sort((a, b) => b.score - a.score);
-    const rest = scored.filter((item) => item.score === 0).sort((a, b) => b.memory.updatedAt.localeCompare(a.memory.updatedAt));
 
+    // 有向量时就不拿「不相关但最近」的来填空，宁少勿滥
+    const semanticReady = Boolean(options.embedding && options.embedding.length > 0);
+    if (semanticReady) return matched.slice(0, options.limit).map((item) => item.memory);
+
+    const rest = scored.filter((item) => item.score === 0).sort((a, b) => b.memory.updatedAt.localeCompare(a.memory.updatedAt));
     return [...matched, ...rest].slice(0, options.limit).map((item) => item.memory);
   }
 
@@ -330,10 +344,28 @@ export class MemoryStore implements RunStore {
     }
   }
 
+  async pruneOrphanNodes(): Promise<number> {
+    const linked = new Set<string>();
+    for (const edge of this.graphEdges.values()) {
+      linked.add(edge.fromId);
+      linked.add(edge.toId);
+    }
+    let removed = 0;
+    for (const [id] of this.graphNodes) {
+      if (linked.has(id)) continue;
+      this.graphNodes.delete(id);
+      removed += 1;
+    }
+    return removed;
+  }
+
+  /** 同名但大小写/空格不同的实体合并成一个 */
   private ensureNode(name: string, kind: string, memoryId: string, at: string) {
-    const existing = [...this.graphNodes.values()].find((node) => node.name === name);
+    const display = normalizeEntityName(name);
+    const key = entityKey(name);
+    const existing = [...this.graphNodes.values()].find((node) => node.key === key);
     if (existing) return existing;
-    const node = { id: randomUUID(), name, kind, memoryId, createdAt: at };
+    const node = { id: randomUUID(), name: display, key, kind, memoryId, createdAt: at };
     this.graphNodes.set(node.id, node);
     return node;
   }
