@@ -1,0 +1,17 @@
+{
+  "name": "@rakko/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Rakko 桌面壳：一个窗口 + 一个本地服务",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node -e \"console.log('desktop: 壳层没有单元测试，用 pnpm --filter @rakko/desktop smoke 验证')\"",
+    "start": "electron .",
+    "smoke": "electron . --smoke"
+  },
+  "devDependencies": {
+    "electron": "33.4.11"
+  }
+}

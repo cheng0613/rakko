@@ -28,6 +28,7 @@ packages/core       状态机 · 熔断 · 配额规则 · provider 抽象 · �
 packages/db         九张表的 drizzle schema、迁移、迁移执行器
 apps/server         Fastify：threads / runs / SSE / approvals / usage；内存与 Postgres 两套 Store
 apps/web            对话界面：自包含单文件，服务端直接在 / 吐出，同源无跨域
+apps/desktop        桌面壳：一个窗口 + 一个本地服务（Electron）
 ```
 
 ## 命令
@@ -164,6 +165,22 @@ node --env-file=.env apps/server/dist/index.js   # 然后开 http://127.0.0.1:87
 
 **这一轮只做桌面**（1440 基准，设计稿也是按桌面画的）。不为手机做布局、不写移动端覆盖；
 设计稿样式表里的断点（≤1180 收右栏、≤980 抽屉）随样式表免费带着，能兜住但不打磨。
+
+## 桌面壳
+
+`apps/desktop` 是个壳，不是第二套界面：它只负责开窗口，界面还是 `/` 那份单文件。
+
+```bash
+pnpm --filter @rakko/desktop build
+pnpm --filter @rakko/desktop start     # 窗口 1440×900，最小 1080×720
+pnpm --filter @rakko/desktop smoke     # 无人值守冒烟：加载页面，打印标题，退出
+```
+
+启动顺序：先探 `/health`，服务没起就用 Electron 自带的 node
+（`ELECTRON_RUN_AS_NODE=1`）把 `apps/server` 拉起来，等健康检查通过再开窗口；
+关窗顺手杀掉子进程。外链一律交给系统浏览器，窗口里只有自己的界面。
+
+**还没做**：打包成安装包、签名、自动更新。这一轮只是「能双击开」。
 
 ## 存储
 

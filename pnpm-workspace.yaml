@@ -4,4 +4,5 @@ packages:
 
 # 只放行确实需要编译的依赖；其余一律不跑脚本。
 allowBuilds:
+  electron: true
   esbuild: true
