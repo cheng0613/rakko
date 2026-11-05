@@ -85,6 +85,10 @@ docker compose up -d --build                     # db + api 全容器化，api �
 - **改名**：点顶栏标题就地编辑，Enter 保存、Esc 取消。
 - **删除**：侧栏会话悬停出 ×，确认后连消息、运行、事件一起删（外键 cascade）。
 - **搜索**：⌘K 聚焦搜索框，按标题实时过滤；回车跳到第一条。`?q=关键词` 也能直接带过滤打开。
+- **接着做**：运行失败 / 被取消 / 到步数上限时，回答下面会出现一条「接着做」。
+  它不接受重打提示词，直接在当前会话的历史上再跑一轮（`POST /v1/runs/:id/continue`）：
+  失败时默认追加「接着刚才的做，不要从头开始。」，取消时追加「继续。」，
+  也可以带 `instruction` 换成自己的说法。代价是一次配额，跟正常运行一样。
 
 ## 工具与审批
 
@@ -370,6 +374,7 @@ GET  /v1/threads/:id                           线程 + 最近一次运行 + 待
 GET  /v1/threads/:id/messages                  会话消息（含 kind/payload，工具与审批可重放）
 POST /v1/runs                                  发起运行（202，返回 tier/degraded；配额不足时 429）
 GET  /v1/runs/:id                              运行状态 + pendingApprovals
+POST /v1/runs/:id/continue                     接着已停下的运行继续（失败/取消/到上限）
 GET  /v1/runs/:id/events                       SSE 事件流，带 id；重连带 Last-Event-ID 只补没看过的
 POST /v1/runs/:id/approvals/:callId            审批：{"decision":"allow"|"deny","reason":"…"}
 POST /v1/runs/:id/cancel                       取消运行（会把等待中的审批一并作废）

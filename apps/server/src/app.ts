@@ -18,7 +18,9 @@ import {
 import {
   approvalDecisionSchema,
   createRunInput,
+  continueRunInput,
   createThreadInput,
+  TERMINAL_STATES,
   updateSettingsInput,
   updateThreadInput,
   type Message,
@@ -152,6 +154,41 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
     const { id } = request.params as { id: string };
     if (!(await store.getThread(id))) return reply.code(404).send({ error: 'thread_not_found', message: '会话不存在' });
     return { items: await store.listMessages(id) };
+  });
+
+  /**
+   * 接着一个已经停下的运行继续做：不重打提示词，直接在当前会话历史上再跑一轮。
+   * 失败、取消、到步数上限都走这里。
+   */
+  app.post('/v1/runs/:id/continue', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const source = await store.getRun(id);
+    if (!source) return reply.code(404).send({ error: 'run_not_found', message: '运行不存在' });
+
+    if (!(TERMINAL_STATES as readonly RunState[]).includes(source.state)) {
+      return reply.code(409).send({ error: 'run_active', message: '这次运行还没结束，先等它停下或取消' });
+    }
+
+    const parsed = continueRunInput.safeParse(request.body ?? {});
+    if (!parsed.success) return reply.code(400).send(invalid(parsed.error.issues));
+
+    const decision = await store.quotaDecision();
+    if (decision.kind === 'block') return reply.code(429).send({ error: 'quota_exceeded', message: decision.reason });
+
+    const tier: ModelTier = decision.kind === 'degrade' ? 'fast' : 'standard';
+    const instruction =
+      parsed.data.instruction?.trim() ||
+      (source.state === 'failed' ? '接着刚才的做，不要从头开始。' : '继续。');
+
+    const run = await store.createRun({
+      threadId: source.threadId,
+      prompt: instruction,
+      model: gateway.models[tier],
+    });
+    await store.appendMessage({ threadId: source.threadId, role: 'user', text: instruction, runId: run.id });
+    void drive(run, tier, decision.kind === 'degrade' ? decision.reason : null);
+
+    return reply.code(202).send({ ...run, tier, degraded: tier === 'fast', continuedFrom: source.id });
   });
 
   app.get('/v1/runs/:id', async (request, reply) => {

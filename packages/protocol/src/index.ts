@@ -150,6 +150,12 @@ export const createThreadInput = z.object({
 });
 export type CreateThreadInput = z.infer<typeof createThreadInput>;
 
+/** 接着一个已经停下的运行继续做；instruction 可覆盖默认的「接着刚才的做」 */
+export const continueRunInput = z.object({
+  instruction: z.string().min(1).max(2000).optional(),
+});
+export type ContinueRunInput = z.infer<typeof continueRunInput>;
+
 export const updateThreadInput = z.object({
   // 先 trim 再判空：只输空格不算有效标题
   title: z.string().trim().min(1).max(120),

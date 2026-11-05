@@ -704,6 +704,9 @@
 
   .tool-out{font-family:var(--mono);font-size:11px;line-height:1.6;color:var(--text-2);white-space:pre-wrap;word-break:break-word;border-top:1px solid var(--line);padding-top:7px;margin-top:4px;max-height:132px;overflow:auto}
 
+  .retry{display:flex;align-items:center;gap:10px;flex-wrap:wrap;border:1px solid var(--line);border-radius:14px;background:var(--surface-2);padding:9px 12px;margin:12px 0}
+  .retry-why{font-size:12px;color:var(--muted)}
+  .retry .btn{margin-left:auto;padding:6px 14px}
   .note{display:flex;align-items:center;gap:8px;font-size:11.8px;line-height:1.5;color:var(--muted);border:1px solid var(--line);border-radius:14px;background:var(--surface-2);padding:8px 11px;margin:12px 0}
   .note .tag{flex:none}
 
@@ -1541,6 +1544,35 @@
     scrollBottom();
   };
 
+  /** 运行没做完时，给一条「接着做」，别让人重打一遍 */
+  const addContinueBar = (turn, runId, runState) => {
+    const bar = make('div', 'retry');
+    const why = make('span', 'retry-why', runState === 'canceled' ? '这次运行被你停下了' : '这次运行没做完');
+    const btn = make('button', 'btn primary', '接着做');
+    btn.addEventListener('click', () => void continueRun(runId, btn));
+    bar.append(why, btn);
+    turn.body.append(bar);
+    scrollBottom();
+  };
+
+  const continueRun = async (runId, btn) => {
+    btn.disabled = true;
+    try {
+      const run = await api('/v1/runs/' + runId + '/continue', { method: 'POST', body: JSON.stringify({}) });
+      pushUserBubble(run.prompt);
+      setRunning(true);
+      currentTurn = null;
+      state.running = { id: run.id };
+      state.lastModel = run.model;
+      renderCtx();
+      listen(run.id);
+      loadUsage();
+    } catch (error) {
+      btn.disabled = false;
+      toast('接着做失败：' + error.message);
+    }
+  };
+
   /* ---------------- 事件处理 ---------------- */
   let currentTurn = null;
   const toolCards = new Map();
@@ -1603,6 +1635,7 @@
         closeStream();
         setRunning(false);
         currentTurn = null;
+        if (event.state !== 'succeeded') addContinueBar(turn, event.runId, event.state);
         // 标题是拿第一句话生成的，跑完刷新一下侧栏
         void loadThreads().catch(() => {});
         break;
@@ -1688,6 +1721,12 @@
     renderHistory();
     renderRecents();
     closeSide();
+
+    // 上次没做完：给一条「接着做」，不用重打
+    if (latest && (latest.state === 'failed' || latest.state === 'canceled')) {
+      const target = historyTurn ?? openAssistant();
+      addContinueBar(target, latest.id, latest.state);
+    }
 
     // 上次停在等待审批：把这次运行接回来，别人点了同意这边也能看到
     if (latest && latest.state === 'waiting_approval') {

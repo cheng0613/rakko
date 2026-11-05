@@ -533,3 +533,74 @@ test('新会话用第一句话当标题，且能重命名与删除', async () =>
   assert.equal((await app.inject({ method: 'DELETE', url: `/v1/threads/${thread.id}` })).statusCode, 404);
   await app.close();
 });
+
+test('运行失败后能「接着做」，不用重打提示词', async () => {
+  const store = new MemoryStore();
+  let calls = 0;
+
+  // 前两次（标准档 + 快档）都挂，之后恢复正常
+  const provider: ModelProvider = {
+    id: 'flaky',
+    async *stream(request) {
+      calls += 1;
+      if (calls <= 2) throw new Error('上游 503');
+      const last = request.messages.at(-1)?.content ?? '';
+      yield { kind: 'delta', text: `接着做完了：${last.slice(0, 20)}` };
+      yield { kind: 'done', finishReason: 'stop' };
+    },
+  };
+
+  const gateway = new ProviderGateway({ provider, models: FAKE_MODELS, firstChunkTimeoutMs: 2_000 });
+  const app = createApp({ store, gateway });
+  const thread = (await app.inject({ method: 'POST', url: '/v1/threads', payload: {} })).json();
+
+  const failed = (await app.inject({ method: 'POST', url: '/v1/runs', payload: { threadId: thread.id, prompt: '把报告写完' } })).json();
+  const failedBody = await waitFor(app, failed.id, (body) => body.state === 'failed' || body.state === 'succeeded');
+  assert.equal(failedBody.state, 'failed');
+
+  const continued = await app.inject({ method: 'POST', url: `/v1/runs/${failed.id}/continue` });
+  assert.equal(continued.statusCode, 202);
+  assert.equal(continued.json().continuedFrom, failed.id);
+  assert.equal(continued.json().prompt, '接着刚才的做，不要从头开始。');
+
+  const done = await waitFor(app, continued.json().id, (body) => body.state === 'succeeded' || body.state === 'failed');
+  assert.equal(done.state, 'succeeded');
+
+  const items = await store.listMessages(thread.id);
+  // 降级会写一条 notice，这里只看对话文本
+  const texts = items.filter((item) => item.kind === 'text');
+  assert.deepEqual(
+    texts.map((item) => `${item.role}/${item.kind}`),
+    ['user/text', 'user/text', 'assistant/text'],
+  );
+  assert.equal(texts[1]?.text, '接着刚才的做，不要从头开始。');
+  assert.match(texts[2]?.text ?? '', /接着做完了/);
+  assert.ok(calls >= 3, '第一次运行两次都挂，继续之后才成功');
+  await app.close();
+});
+
+test('还在跑的运行不能继续（409），自定义指令会替换默认措辞', async () => {
+  const store = new MemoryStore();
+  const app = createApp({ store });
+
+  const thread = (await app.inject({ method: 'POST', url: '/v1/threads', payload: {} })).json();
+  const run = (await app.inject({ method: 'POST', url: '/v1/runs', payload: { threadId: thread.id, prompt: '跑起来' } })).json();
+  await store.patchRun(run.id, { state: 'running' });
+
+  const blocked = await app.inject({ method: 'POST', url: `/v1/runs/${run.id}/continue` });
+  assert.equal(blocked.statusCode, 409);
+  assert.equal(blocked.json().error, 'run_active');
+
+  await store.patchRun(run.id, { state: 'canceled', finishedAt: new Date().toISOString() });
+  const custom = await app.inject({
+    method: 'POST',
+    url: `/v1/runs/${run.id}/continue`,
+    payload: { instruction: '换个思路，先看日志' },
+  });
+  assert.equal(custom.statusCode, 202);
+  assert.equal(custom.json().prompt, '换个思路，先看日志');
+
+  const missing = await app.inject({ method: 'POST', url: '/v1/runs/nope/continue' });
+  assert.equal(missing.statusCode, 404);
+  await app.close();
+});
