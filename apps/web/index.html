@@ -1164,6 +1164,7 @@
             <label class="field"><span>名字</span><input id="autoName" placeholder="晨间简报" /></label>
             <label class="field"><span>定时（分 时 日 月 周）</span><input id="autoSchedule" placeholder="0 8 * * *" /></label>
             <label class="field"><span>任务</span><textarea id="autoPrompt" rows="2" placeholder="汇总今天的日程与未读消息"></textarea></label>
+            <label class="field"><span>作用到应用（可选）</span><select id="autoApp"><option value="">不挂应用，每次开新会话</option></select></label>
             <div class="auto-form-actions">
               <span class="muted">0 8 * * * = 每天 08:00 · */30 * * * * = 每 30 分钟</span>
               <button class="btn" id="autoCancel">取消</button>
@@ -3340,6 +3341,7 @@
       ui.sub.textContent = '到点就自己跑；点进去能看到它开的会话';
       void loadAutomations();
       void loadRuns();
+      void api('/v1/apps').then((body) => { state.apps = body.items || []; renderAutomations(); }).catch(() => {});
     } else if (name === 'apps') {
       ui.title.textContent = '应用';
       ui.sub.textContent = '从对话里沉淀下来的小应用，打开就能用';
@@ -3519,6 +3521,11 @@
       meta.append(make('span', undefined, promptText));
       meta.append(make('span', 'sep'));
       meta.append(make('span', 'tag ' + (item.enabled ? 'mint' : 'violet'), item.enabled ? '启用' : '已暂停'));
+      if (item.appId) {
+        meta.append(make('span', 'sep'));
+        const app = (state.apps || []).find((entry) => entry.id === item.appId);
+        meta.append(make('span', 'tag accent', '→ ' + (app ? app.name : '应用')));
+      }
       if (item.lastRunAt) {
         meta.append(make('span', 'sep'));
         meta.append(make('span', undefined, '上次 ' + relTime(item.lastRunAt)));
@@ -3530,7 +3537,7 @@
         runBtn.disabled = true;
         try {
           await api('/v1/automations/' + item.id + '/run', { method: 'POST' });
-          toast('已经开跑，去侧栏看新会话');
+          toast(item.appId ? '已经开跑，完了去「应用」里看界面' : '已经开跑，去侧栏看新会话');
           await loadThreads().catch(() => {});
           setTimeout(() => { runBtn.disabled = false; }, 1200);
         } catch (error) {
@@ -3570,8 +3577,30 @@
   $('#autoRefresh').addEventListener('click', () => void loadAutomations());
   $('#runsRefresh')?.addEventListener('click', () => void loadRuns());
   $('#appsRefresh')?.addEventListener('click', () => void loadApps());
+  const fillAppOptions = async () => {
+    const select = $('#autoApp');
+    if (!select) return;
+    const current = select.value;
+    select.innerHTML = '';
+    const none = document.createElement('option');
+    none.value = '';
+    none.textContent = '不挂应用，每次开新会话';
+    select.append(none);
+    try {
+      const body = await api('/v1/apps');
+      for (const app of body.items || []) {
+        const option = document.createElement('option');
+        option.value = app.id;
+        option.textContent = app.name;
+        select.append(option);
+      }
+    } catch { /* 读不到就先只用「不挂」 */ }
+    select.value = current;
+  };
+
   $('#autoNew').addEventListener('click', () => {
     $('#autoForm').hidden = false;
+    void fillAppOptions();
     $('#autoName').focus();
   });
   $('#autoCancel').addEventListener('click', () => {
@@ -3585,8 +3614,12 @@
       toast('名字、定时、任务都要填');
       return;
     }
+    const appId = $('#autoApp') ? $('#autoApp').value : '';
     try {
-      await api('/v1/automations', { method: 'POST', body: JSON.stringify({ name, schedule, prompt }) });
+      await api('/v1/automations', {
+        method: 'POST',
+        body: JSON.stringify({ name, schedule, prompt, ...(appId ? { appId } : {}) }),
+      });
       $('#autoName').value = '';
       $('#autoSchedule').value = '';
       $('#autoPrompt').value = '';

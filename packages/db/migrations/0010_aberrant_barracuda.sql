@@ -1,0 +1,2 @@
+ALTER TABLE "automations" ADD COLUMN "app_id" uuid;--> statement-breakpoint
+ALTER TABLE "automations" ADD CONSTRAINT "automations_app_id_apps_id_fk" FOREIGN KEY ("app_id") REFERENCES "public"."apps"("id") ON DELETE cascade ON UPDATE no action;

@@ -19,6 +19,7 @@ import {
   type PluginHost,
   type ToolSpec,
 } from '@rakko/core';
+import type { App } from '@rakko/protocol';
 import {
   approvalDecisionSchema,
   createRunInput,
@@ -133,12 +134,49 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
     },
   };
 
+  /**
+   * 让 agent 读真实统计。
+   * 界面里要展示「成功率 / 耗时 / 工具失败榜」时，它得有个地方取数，
+   * 否则只能编，或者像之前那样说「我拿不到数据」。
+   */
+  const overviewTool: ToolSpec = {
+    name: 'read_overview',
+    description:
+      '读最近运行的统计：成功率、中位与 p90 耗时、最常出错的工具，以及最近 N 次运行的明细（状态、耗时、工具次数、错误）。' +
+      '要在界面里展示真实运行数据时，先调它取数，不要凭空写数字。',
+    risk: 'low',
+    requiresApproval: false,
+    jsonSchema: {
+      type: 'object',
+      properties: { limit: { type: 'number', description: '取最近多少次运行，默认 10，最多 50' } },
+    },
+    run: async (args) => {
+      const raw = Number((args as { limit?: unknown }).limit ?? 10);
+      const limit = Number.isFinite(raw) ? Math.min(50, Math.max(1, Math.round(raw))) : 10;
+      const overview = await store.runsOverview(limit);
+      return JSON.stringify({
+        stats: overview.stats,
+        items: overview.items.map((run) => ({
+          at: run.createdAt,
+          thread: run.threadTitle,
+          source: run.source,
+          state: run.state,
+          durationMs: run.durationMs,
+          toolCalls: run.toolCalls,
+          toolFailures: run.toolFailures,
+          error: run.error,
+        })),
+      });
+    },
+  };
+
   const tools = options.tools ?? new ToolRegistry({ workspace });
   if (!options.tools) {
     for (const tool of createBuiltinTools({ workspace })) tools.register(tool);
   }
   // save_app 依赖 store，属于服务端能力，不管有没有传 tools 都要有
   if (!tools.get('save_app')) tools.register(saveAppTool);
+  if (!tools.get('read_overview')) tools.register(overviewTool);
 
   const gate = new ApprovalGate({ timeoutMs: options.approvalTimeoutMs ?? 10 * 60_000 });
   /** 用户点过「允许这类」的工具；启动时从设置里读回来 */
@@ -300,23 +338,56 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
   /* ---------------- 自动化 ---------------- */
 
   /** 跑一次自动化：开一个会话、起一个运行，和手动发一句没有区别 */
-  async function runAutomation(automation: { id: string; name: string; prompt: string }) {
+  /** 应用里的定时任务：把应用身份和当前界面写进提示词 */
+  function appRunPrompt(app: App, instruction: string): string {
+    const spec = JSON.stringify(app.spec);
+    return [
+      `【当前应用：${app.name}】${app.description ? `（${app.description}）` : ''}`,
+      `当前界面（genui 组件树）：${spec.length > 4000 ? `${spec.slice(0, 4000)}…` : spec}`,
+      '',
+      `如果这次要改界面：改完用 save_app 保存，name 仍然是「${app.name}」；`,
+      '如果只是收集信息，就把结果整理进界面（表格或清单），也保存一次。',
+      '',
+      '本次任务：',
+      instruction,
+    ].join('\n');
+  }
+
+  async function runAutomation(automation: { id: string; name: string; prompt: string; appId?: string | null }) {
     const decision = await store.quotaDecision();
     if (decision.kind === 'block') return null;
 
     const tier: ModelTier = decision.kind === 'degrade' ? 'fast' : 'standard';
+    // 挂了应用的：跑在应用自己的线程里，跑完界面就更新；否则照旧开一个新会话
+    const app = automation.appId ? await store.getApp(automation.appId) : null;
     const day = new Date().toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' });
-    const thread = await store.createThread(`${automation.name} · ${day}`);
+
+    let threadId: string;
+    if (app) {
+      if (app.threadId) {
+        threadId = app.threadId;
+      } else {
+        const created = await store.createThread(`${app.name} · 定时`);
+        await store.updateApp(app.id, { threadId: created.id });
+        app.threadId = created.id;
+        threadId = created.id;
+      }
+    } else {
+      const created = await store.createThread(`${automation.name} · ${day}`);
+      threadId = created.id;
+    }
+
+    const prompt = app ? appRunPrompt(app, automation.prompt) : automation.prompt;
     const run = await store.createRun({
-      threadId: thread.id,
-      prompt: automation.prompt,
+      threadId,
+      prompt,
       model: gateway.models[tier],
       source: 'automation',
     });
-    await store.appendMessage({ threadId: thread.id, role: 'user', text: automation.prompt, runId: run.id });
+    await store.appendMessage({ threadId, role: 'user', text: prompt, runId: run.id });
     await store.markAutomationRun(automation.id, new Date().toISOString());
     void drive(run, tier, decision.kind === 'degrade' ? decision.reason : null);
-    return { thread, run, tier };
+    return { thread: { id: threadId }, run, tier };
   }
 
   app.get('/v1/automations', async () => {
@@ -329,6 +400,9 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
   app.post('/v1/automations', async (request, reply) => {
     const parsed = createAutomationInput.safeParse(request.body ?? {});
     if (!parsed.success) return reply.code(400).send(invalid(parsed.error.issues));
+    if (parsed.data.appId && !(await store.getApp(parsed.data.appId))) {
+      return reply.code(404).send({ error: 'app_not_found', message: '要挂的应用不存在' });
+    }
     if (!validateCron(parsed.data.schedule)) {
       return reply.code(400).send({ error: 'invalid_schedule', message: '定时表达式要是五段 cron：分 时 日 月 周' });
     }

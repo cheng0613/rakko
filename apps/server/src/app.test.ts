@@ -1368,3 +1368,66 @@ test('save_app 工具：名字为空或界面不合法都不落库', async () =>
 
   await app.close();
 });
+
+test('自动化挂到应用：跑在应用自己的线程里，提示词带当前界面', async () => {
+  const store = new MemoryStore();
+  const seen: string[] = [];
+  const provider: ModelProvider = {
+    id: 'app-automation',
+    async *stream(request) {
+      seen.push(request.messages.map((message) => message.content).join('\n'));
+      yield { kind: 'delta', text: '更新好了。' };
+      yield { kind: 'done', finishReason: 'stop' };
+    },
+  };
+  const app = createApp({ store, provider });
+
+  const spec = {
+    component: 'card',
+    props: { title: '运行概览' },
+    children: [{ component: 'text', props: { text: '成功率 —' } }],
+  };
+  const created = (await app.inject({ method: 'POST', url: '/v1/apps', payload: { name: '概览板', spec } })).json();
+
+  const automation = (
+    await app.inject({
+      method: 'POST',
+      url: '/v1/automations',
+      payload: { name: '每小时刷新', schedule: '0 * * * *', prompt: '刷新成功率', appId: created.id },
+    })
+  ).json();
+  assert.equal(automation.appId, created.id, 'appId 要存下来');
+
+  await app.inject({ method: 'POST', url: `/v1/automations/${automation.id}/run` });
+
+  // 等这轮跑起来并结束
+  let run: { id: string; threadId: string; state: string } | null = null;
+  for (let i = 0; i < 100; i += 1) {
+    const runs = (await app.inject({ method: 'GET', url: '/v1/runs/overview?limit=5' })).json();
+    run = runs.items.find((item: { source: string }) => item.source === 'automation');
+    if (run && ['succeeded', 'failed', 'canceled'].includes(run.state)) break;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+
+  assert.ok(run, '要真的跑起来一次');
+  const detail = (await app.inject({ method: 'GET', url: `/v1/apps/${created.id}` })).json();
+  assert.equal(detail.threadId, run.threadId, '跑在应用自己的线程里');
+  assert.ok(
+    seen.some((prompt) => prompt.includes('【当前应用：概览板】') && prompt.includes('刷新成功率')),
+    '提示词要有应用身份和本次任务',
+  );
+
+  await app.close();
+});
+
+test('自动化挂到不存在的应用要报 404', async () => {
+  const store = new MemoryStore();
+  const app = createApp({ store, provider: { id: 'x', async *stream() { yield { kind: 'done', finishReason: 'stop' }; } } });
+  const res = await app.inject({
+    method: 'POST',
+    url: '/v1/automations',
+    payload: { name: 'x', schedule: '0 8 * * *', prompt: 'x', appId: '00000000-0000-0000-0000-000000000000' },
+  });
+  assert.equal(res.statusCode, 404);
+  await app.close();
+});

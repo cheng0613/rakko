@@ -125,7 +125,7 @@ export interface RunStore {
 
   /** 自动化：cron + 一句任务描述 */
   listAutomations(): Promise<Automation[]>;
-  createAutomation(input: { name: string; schedule: string; prompt: string; enabled?: boolean }): Promise<Automation>;
+  createAutomation(input: { name: string; schedule: string; prompt: string; enabled?: boolean; appId?: string }): Promise<Automation>;
   updateAutomation(id: string, patch: Partial<Pick<Automation, 'name' | 'schedule' | 'prompt' | 'enabled'>>): Promise<Automation | undefined>;
   deleteAutomation(id: string): Promise<boolean>;
   markAutomationRun(id: string, at: string): Promise<void>;
@@ -481,12 +481,13 @@ export class MemoryStore implements RunStore {
     return [...this.automations.values()].sort((a, b) => a.name.localeCompare(b.name));
   }
 
-  async createAutomation(input: { name: string; schedule: string; prompt: string; enabled?: boolean }): Promise<Automation> {
+  async createAutomation(input: { name: string; schedule: string; prompt: string; enabled?: boolean; appId?: string }): Promise<Automation> {
     const automation: Automation = {
       id: randomUUID(),
       name: input.name,
       schedule: input.schedule,
       prompt: input.prompt,
+      appId: input.appId ?? null,
       enabled: input.enabled ?? true,
       lastRunAt: null,
       createdAt: now(),
@@ -497,7 +498,7 @@ export class MemoryStore implements RunStore {
 
   async updateAutomation(
     id: string,
-    patch: Partial<Pick<Automation, 'name' | 'schedule' | 'prompt' | 'enabled'>>,
+    patch: Partial<Pick<Automation, 'name' | 'schedule' | 'prompt' | 'enabled' | 'appId'>>,
   ): Promise<Automation | undefined> {
     const current = this.automations.get(id);
     if (!current) return undefined;

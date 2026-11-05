@@ -106,6 +106,7 @@ const toAutomation = (row: typeof automations.$inferSelect): Automation => ({
   name: row.name,
   schedule: row.schedule,
   prompt: row.prompt,
+  appId: row.appId,
   enabled: row.enabled,
   lastRunAt: row.lastRunAt ? row.lastRunAt.toISOString() : null,
   createdAt: row.createdAt.toISOString(),
@@ -881,7 +882,7 @@ export class PostgresStore implements RunStore {
     return rows.map(toAutomation);
   }
 
-  async createAutomation(input: { name: string; schedule: string; prompt: string; enabled?: boolean }): Promise<Automation> {
+  async createAutomation(input: { name: string; schedule: string; prompt: string; enabled?: boolean; appId?: string }): Promise<Automation> {
     const [row] = await this.db
       .insert(automations)
       .values({
@@ -889,6 +890,7 @@ export class PostgresStore implements RunStore {
         name: input.name,
         schedule: input.schedule,
         prompt: input.prompt,
+        appId: input.appId ?? null,
         enabled: input.enabled ?? true,
       })
       .returning();
@@ -898,7 +900,7 @@ export class PostgresStore implements RunStore {
 
   async updateAutomation(
     id: string,
-    patch: Partial<Pick<Automation, 'name' | 'schedule' | 'prompt' | 'enabled'>>,
+    patch: Partial<Pick<Automation, 'name' | 'schedule' | 'prompt' | 'enabled' | 'appId'>>,
   ): Promise<Automation | undefined> {
     const [row] = await this.db
       .update(automations)
@@ -907,6 +909,7 @@ export class PostgresStore implements RunStore {
         ...(patch.schedule !== undefined ? { schedule: patch.schedule } : {}),
         ...(patch.prompt !== undefined ? { prompt: patch.prompt } : {}),
         ...(patch.enabled !== undefined ? { enabled: patch.enabled } : {}),
+        ...(patch.appId !== undefined ? { appId: patch.appId } : {}),
       })
       .where(and(eq(automations.id, id), eq(automations.userId, this.requireUserId())))
       .returning();

@@ -340,6 +340,8 @@ export const automationSchema = z.object({
   name: z.string(),
   schedule: z.string(),
   prompt: z.string(),
+  /** 作用到哪个小应用；null 表示每次开新会话 */
+  appId: id.nullable(),
   enabled: z.boolean(),
   lastRunAt: at.nullable(),
   createdAt: at,
@@ -352,6 +354,7 @@ export const createAutomationInput = z.object({
   schedule: z.string().trim().min(1).max(60),
   prompt: z.string().min(1).max(4000),
   enabled: z.boolean().optional(),
+  appId: id.optional(),
 });
 export type CreateAutomationInput = z.infer<typeof createAutomationInput>;
 
@@ -360,6 +363,7 @@ export const updateAutomationInput = z.object({
   schedule: z.string().trim().min(1).max(60).optional(),
   prompt: z.string().min(1).max(4000).optional(),
   enabled: z.boolean().optional(),
+  appId: id.nullable().optional(),
 });
 export type UpdateAutomationInput = z.infer<typeof updateAutomationInput>;
 

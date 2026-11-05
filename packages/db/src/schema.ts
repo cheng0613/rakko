@@ -128,6 +128,8 @@ export const automations = pgTable(
     /** cron 表达式，服务端统一时区 Asia/Shanghai */
     schedule: text('schedule').notNull(),
     prompt: text('prompt').notNull(),
+    /** 作用到哪个小应用：跑完直接更新它的界面；空表示开新会话 */
+    appId: uuid('app_id').references(() => apps.id, { onDelete: 'cascade' }),
     enabled: boolean('enabled').notNull().default(true),
     lastRunAt: timestamp('last_run_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
