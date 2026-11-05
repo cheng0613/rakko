@@ -7,12 +7,12 @@
  * - 配额只认 usage_ledger 的求和，用户改不动这个数。
  */
 
-import { and, asc, desc, eq, ilike, inArray, isNotNull, isNull, lt, or, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, ilike, inArray, isNotNull, isNull, lt, notInArray, or, sql } from 'drizzle-orm';
 
 import type { DbHandle } from '@rakko/db';
-import { apps, automations, kgEdges, kgNodes, memories, messages, runEvents, runs, skills, threads, usageLedger, users } from '@rakko/db';
+import { appVersions, apps, automations, kgEdges, kgNodes, memories, messages, runEvents, runs, skills, threads, usageLedger, users } from '@rakko/db';
 import { currentPeriod, decideQuota, periodStart, planLimit, type QuotaDecision } from '@rakko/core';
-import type { App, Automation, Graph, KgEdge, KgNode, Memory, MemoryKind, MemoryStatus, Message, MessageKind, RiskLevel, Run, RunEvent, RunState, Settings, Skill, Thread, Usage } from '@rakko/protocol';
+import type { App, AppVersion, Automation, Graph, KgEdge, KgNode, Memory, MemoryKind, MemoryStatus, Message, MessageKind, RiskLevel, Run, RunEvent, RunState, Settings, Skill, Thread, Usage } from '@rakko/protocol';
 
 import { entityKey, normalizeEntityName, toVectorLiteral } from '@rakko/core';
 
@@ -60,6 +60,15 @@ const toApp = (row: typeof apps.$inferSelect): App => ({
   threadId: row.threadId,
   createdAt: row.createdAt.toISOString(),
   updatedAt: row.updatedAt.toISOString(),
+});
+
+const toAppVersion = (row: typeof appVersions.$inferSelect): AppVersion => ({
+  id: row.id,
+  appId: row.appId,
+  name: row.name,
+  description: row.description,
+  spec: row.spec,
+  createdAt: row.createdAt.toISOString(),
 });
 
 const toKgNode = (row: typeof kgNodes.$inferSelect): KgNode => ({
@@ -241,6 +250,35 @@ export class PostgresStore implements RunStore {
    * 跨运行概览。列表用一条 SQL 出（事件表按 run_id 聚合，不把几千条事件读进来），
    * 工具成败单独数一条 —— 只有它需要把 tool_call 和 tool_result 按 callId 配上对。
    */
+  async listAppVersions(appId: string): Promise<AppVersion[]> {
+    const userId = this.requireUserId();
+    const [app] = await this.db
+      .select({ id: apps.id })
+      .from(apps)
+      .where(and(eq(apps.userId, userId), eq(apps.id, appId)))
+      .limit(1);
+    if (!app) return [];
+
+    const rows = await this.db
+      .select()
+      .from(appVersions)
+      .where(eq(appVersions.appId, appId))
+      .orderBy(desc(appVersions.createdAt))
+      .limit(20);
+    return rows.map(toAppVersion);
+  }
+
+  async restoreAppVersion(appId: string, versionId: string): Promise<App | null> {
+    const [version] = await this.db
+      .select()
+      .from(appVersions)
+      .where(and(eq(appVersions.appId, appId), eq(appVersions.id, versionId)))
+      .limit(1);
+    if (!version) return null;
+    // updateApp 会先把当前界面存成历史，所以回滚本身也能再回滚
+    return this.updateApp(appId, { spec: version.spec, name: version.name, description: version.description });
+  }
+
   async listApps(): Promise<App[]> {
     const userId = this.requireUserId();
     const rows = await this.db.select().from(apps).where(eq(apps.userId, userId)).orderBy(desc(apps.updatedAt));
@@ -275,6 +313,36 @@ export class PostgresStore implements RunStore {
 
   async updateApp(id: string, patch: { name?: string; description?: string; spec?: unknown; threadId?: string | null }): Promise<App | null> {
     const userId = this.requireUserId();
+
+    // 界面真变了先存一份旧版本；只改名字/线程不动历史
+    if (patch.spec !== undefined) {
+      const [current] = await this.db
+        .select()
+        .from(apps)
+        .where(and(eq(apps.userId, userId), eq(apps.id, id)))
+        .limit(1);
+      if (current && JSON.stringify(current.spec) !== JSON.stringify(patch.spec)) {
+        await this.db.insert(appVersions).values({
+          appId: id,
+          name: current.name,
+          description: current.description,
+          spec: current.spec,
+        });
+        // 只留最近 20 个
+        const keep = await this.db
+          .select({ id: appVersions.id })
+          .from(appVersions)
+          .where(eq(appVersions.appId, id))
+          .orderBy(desc(appVersions.createdAt))
+          .limit(20);
+        const keepIds = keep.map((row) => row.id);
+        if (keepIds.length === 20) {
+          await this.db
+            .delete(appVersions)
+            .where(and(eq(appVersions.appId, id), notInArray(appVersions.id, keepIds)));
+        }
+      }
+    }
     const [row] = await this.db
       .update(apps)
       .set({

@@ -814,6 +814,16 @@
   .app-window-head h3{margin:0;font-size:14.5px;font-weight:590}
   .app-window-head p{margin:2px 0 0;font-size:11px;color:var(--muted)}
   .app-window-body{flex:1;overflow:auto;padding:14px 16px 10px}
+  .app-head-tools{display:flex;gap:4px;margin-left:auto;flex:none}
+  .app-head-tools .btn{font-size:11.5px;padding:4px 10px}
+  .app-editor{display:flex;flex-direction:column;gap:10px;height:100%}
+  .app-editor textarea{flex:1;font-family:var(--mono);font-size:11.5px;line-height:1.55;border:1px solid var(--line);border-radius:12px;background:var(--surface);color:var(--text);padding:10px 12px;resize:none;outline:none;min-height:220px}
+  .app-editor textarea:focus{border-color:var(--accent)}
+  .app-editor-actions{display:flex;align-items:center;gap:8px}
+  .app-editor-actions .g-caption{margin-right:auto;line-height:1.4}
+  .app-versions{display:flex;flex-direction:column;gap:8px}
+  .app-version{display:flex;align-items:center;gap:10px;border:1px solid var(--line);border-radius:12px;padding:9px 12px;background:var(--surface)}
+  .app-version .btn{margin-left:auto;font-size:11.5px;padding:4px 10px}
   .app-log{flex:none;max-height:34%;overflow:auto;border-top:1px solid var(--line);padding:8px 14px 0;display:flex;flex-direction:column;gap:6px}
   .app-log:empty{display:none}
   .app-line{font-size:12px;line-height:1.55;color:var(--text-2);white-space:pre-wrap;word-break:break-word}
@@ -2375,11 +2385,18 @@
       const title = gEl('h3', undefined, app.name);
       const sub = gEl('p', undefined, app.description || '从对话里沉淀下来的小应用');
       headText.append(title, sub);
+
+      const tools = gEl('div', 'app-head-tools');
+      const editBtn = gEl('button', 'btn quiet', '编辑');
+      editBtn.type = 'button';
+      editBtn.title = '直接改界面结构（JSON）';
+      const historyBtn = gEl('button', 'btn quiet', '版本');
+      historyBtn.type = 'button';
+      historyBtn.title = '历史版本，可以回滚';
       const close = gEl('button', 'btn quiet', '关闭');
       close.type = 'button';
-      close.style.marginLeft = 'auto';
-      close.addEventListener('click', () => shell.remove());
-      head.append(headText, close);
+      tools.append(editBtn, historyBtn, close);
+      head.append(headText, tools);
 
       const body = gEl('div', 'app-window-body');
       const log = gEl('div', 'app-log');
@@ -2399,11 +2416,94 @@
       });
       document.body.append(shell);
 
+      close.addEventListener('click', () => shell.remove());
+
       const drawApp = () => {
         body.innerHTML = '';
         mountGenui(body, app.spec);
       };
       drawApp();
+
+      /** 直接改 JSON：改数字、删一行、调顺序，比让它重新生成快得多 */
+      const openEditor = () => {
+        body.innerHTML = '';
+        const wrap = gEl('div', 'app-editor');
+        const box = document.createElement('textarea');
+        box.spellcheck = false;
+        box.value = JSON.stringify(app.spec, null, 2);
+        const actions = gEl('div', 'app-editor-actions');
+        const hint = gEl('span', 'g-caption', '改完点保存；不合法的结构会被拒绝，界面上不会出现半成品');
+        const cancel = gEl('button', 'btn quiet', '取消');
+        cancel.type = 'button';
+        const save = gEl('button', 'btn primary', '保存');
+        save.type = 'button';
+
+        cancel.addEventListener('click', () => drawApp());
+        save.addEventListener('click', async () => {
+          let spec = null;
+          try {
+            spec = JSON.parse(box.value);
+          } catch (error) {
+            hint.textContent = '不是合法 JSON：' + error.message;
+            hint.style.color = 'var(--danger)';
+            return;
+          }
+          save.disabled = true;
+          try {
+            app = await api('/v1/apps/' + app.id, { method: 'PATCH', body: JSON.stringify({ spec }) });
+            drawApp();
+            line('你直接改了界面（旧版本已存进历史）', 'sys');
+          } catch (error) {
+            hint.textContent = error.message;
+            hint.style.color = 'var(--danger)';
+            save.disabled = false;
+          }
+        });
+
+        actions.append(hint, cancel, save);
+        wrap.append(box, actions);
+        body.append(wrap);
+      };
+
+      /** 历史版本：点一下就退回去 */
+      const openVersions = async () => {
+        body.innerHTML = '';
+        const wrap = gEl('div', 'app-versions');
+        wrap.append(gEl('div', 'g-caption', '每次界面变更都会存一份，最多留 20 个'));
+        try {
+          const body2 = await api('/v1/apps/' + app.id + '/versions');
+          const items = body2.items || [];
+          if (items.length === 0) wrap.append(gEl('div', 'text', '还没有历史版本 —— 改一次界面就会有了。'));
+          for (const version of items) {
+            const row = gEl('div', 'app-version');
+            const txt = gEl('div');
+            txt.append(gEl('div', 'text', runTime(version.createdAt)));
+            const blocks = (version.spec && Array.isArray(version.spec.children)) ? version.spec.children.length : 0;
+            txt.append(gEl('div', 'g-caption', version.name + ' · ' + blocks + ' 块'));
+            const restore = gEl('button', 'btn quiet', '恢复');
+            restore.type = 'button';
+            restore.addEventListener('click', async () => {
+              restore.disabled = true;
+              try {
+                app = await api('/v1/apps/' + app.id + '/versions/' + version.id + '/restore', { method: 'POST', body: '{}' });
+                drawApp();
+                line('恢复到了 ' + runTime(version.createdAt) + ' 的版本', 'sys');
+              } catch (error) {
+                restore.disabled = false;
+                toast('恢复失败：' + error.message);
+              }
+            });
+            row.append(txt, restore);
+            wrap.append(row);
+          }
+        } catch (error) {
+          wrap.append(gEl('div', 'g-err', '读不到版本：' + error.message));
+        }
+        body.append(wrap);
+      };
+
+      editBtn.addEventListener('click', openEditor);
+      historyBtn.addEventListener('click', () => void openVersions());
 
       const line = (text, cls) => {
         log.append(gEl('div', 'app-line' + (cls ? ' ' + cls : ''), text));

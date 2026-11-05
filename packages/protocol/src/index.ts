@@ -121,6 +121,17 @@ export const appSchema = z.object({
 });
 export type App = z.infer<typeof appSchema>;
 
+/** 应用的某个历史版本（只有 spec 与名字，够回滚） */
+export const appVersionSchema = z.object({
+  id,
+  appId: id,
+  name: z.string(),
+  description: z.string(),
+  spec: z.unknown(),
+  createdAt: at,
+});
+export type AppVersion = z.infer<typeof appVersionSchema>;
+
 export const createAppInput = z.object({
   name: z.string().trim().min(1).max(40),
   description: z.string().trim().max(200).optional(),

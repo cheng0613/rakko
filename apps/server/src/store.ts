@@ -10,7 +10,7 @@ import { randomUUID } from 'node:crypto';
 import { currentPeriod, decideQuota, entityKey, normalizeEntityName, periodStart, planLimit, type QuotaDecision, type QuotaState } from '@rakko/core';
 
 import { buildOverview, type RunOverviewRow, type RunsOverview, type ToolTally } from './overview.js';
-import type { App, Automation, Graph, Memory, MemoryStatus, Message, MessageKind, MessageRole, RiskLevel, Run, RunEvent, Settings, Skill, Thread, Usage } from '@rakko/protocol';
+import type { App, AppVersion, Automation, Graph, Memory, MemoryStatus, Message, MessageKind, MessageRole, RiskLevel, Run, RunEvent, Settings, Skill, Thread, Usage } from '@rakko/protocol';
 
 export interface AppendMessageInput {
   threadId: string;
@@ -94,6 +94,10 @@ export interface RunStore {
   createApp(input: { name: string; description?: string; spec: unknown; threadId?: string }): Promise<App>;
   updateApp(id: string, patch: { name?: string; description?: string; spec?: unknown; threadId?: string | null }): Promise<App | null>;
   deleteApp(id: string): Promise<boolean>;
+  /** 应用的历史版本（新的在前，最多留 20 个） */
+  listAppVersions(appId: string): Promise<AppVersion[]>;
+  /** 回滚到某个版本：当前版本会先被存成历史 */
+  restoreAppVersion(appId: string, versionId: string): Promise<App | null>;
   /** 技能：可挂载的规则块 */
   listSkills(): Promise<Skill[]>;
   createSkill(input: { name: string; description?: string; body: string; tools?: string[] }): Promise<Skill>;
@@ -759,6 +763,11 @@ export class MemoryStore implements RunStore {
   async updateApp(id: string, patch: { name?: string; description?: string; spec?: unknown; threadId?: string | null }): Promise<App | null> {
     const current = this.apps.get(id);
     if (!current) return null;
+
+    // 界面真的变了才留历史；只改名字或线程不用
+    if (patch.spec !== undefined && JSON.stringify(patch.spec) !== JSON.stringify(current.spec)) {
+      this.snapshotApp(current);
+    }
     const next: App = {
       ...current,
       ...(patch.name !== undefined ? { name: patch.name } : {}),
@@ -772,7 +781,34 @@ export class MemoryStore implements RunStore {
   }
 
   async deleteApp(id: string): Promise<boolean> {
+    this.versions.delete(id);
     return this.apps.delete(id);
+  }
+
+  private readonly versions = new Map<string, AppVersion[]>();
+
+  async listAppVersions(appId: string): Promise<AppVersion[]> {
+    return [...(this.versions.get(appId) ?? [])];
+  }
+
+  async restoreAppVersion(appId: string, versionId: string): Promise<App | null> {
+    const version = (this.versions.get(appId) ?? []).find((item) => item.id === versionId);
+    if (!version) return null;
+    return this.updateApp(appId, { spec: version.spec, name: version.name, description: version.description });
+  }
+
+  /** 改 spec 之前先把旧版本存下来；只留最近 20 个 */
+  private snapshotApp(app: App): void {
+    const list = this.versions.get(app.id) ?? [];
+    list.unshift({
+      id: randomUUID(),
+      appId: app.id,
+      name: app.name,
+      description: app.description,
+      spec: app.spec,
+      createdAt: now(),
+    });
+    this.versions.set(app.id, list.slice(0, 20));
   }
 
   async publish(event: RunEvent): Promise<void> {

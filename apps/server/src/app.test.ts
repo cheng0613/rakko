@@ -1431,3 +1431,41 @@ test('自动化挂到不存在的应用要报 404', async () => {
   assert.equal(res.statusCode, 404);
   await app.close();
 });
+
+test('应用版本：改界面留历史，能回滚，回滚本身也能再回滚', async () => {
+  const store = new MemoryStore();
+  const app = createApp({ store, provider: { id: 'v', async *stream() { yield { kind: 'done', finishReason: 'stop' }; } } });
+
+  const v1 = { component: 'text', props: { text: '第一版' } };
+  const created = (await app.inject({ method: 'POST', url: '/v1/apps', payload: { name: '版本测试', spec: v1 } })).json();
+
+  const before = (await app.inject({ method: 'GET', url: `/v1/apps/${created.id}/versions` })).json();
+  assert.equal(before.items.length, 0, '刚建出来没有历史');
+
+  const v2 = { component: 'text', props: { text: '第二版' } };
+  await app.inject({ method: 'PATCH', url: `/v1/apps/${created.id}`, payload: { spec: v2 } });
+
+  const versions = (await app.inject({ method: 'GET', url: `/v1/apps/${created.id}/versions` })).json();
+  assert.equal(versions.items.length, 1, '改一次留一份');
+  assert.deepEqual(versions.items[0].spec, v1, '存的是改之前的');
+
+  // 只改名字不该留历史
+  await app.inject({ method: 'PATCH', url: `/v1/apps/${created.id}`, payload: { name: '版本测试 2' } });
+  const stillOne = (await app.inject({ method: 'GET', url: `/v1/apps/${created.id}/versions` })).json();
+  assert.equal(stillOne.items.length, 1, '改名字不算界面变更');
+
+  const restored = (await app.inject({
+    method: 'POST',
+    url: `/v1/apps/${created.id}/versions/${versions.items[0].id}/restore`,
+  })).json();
+  assert.deepEqual(restored.spec, v1, '回到第一版');
+
+  const afterRestore = (await app.inject({ method: 'GET', url: `/v1/apps/${created.id}/versions` })).json();
+  assert.equal(afterRestore.items.length, 2, '回滚前也存了一份（第二版）');
+  assert.deepEqual(afterRestore.items[0].spec, v2);
+
+  const missing = await app.inject({ method: 'POST', url: `/v1/apps/${created.id}/versions/nope/restore` });
+  assert.equal(missing.statusCode, 404);
+
+  await app.close();
+});

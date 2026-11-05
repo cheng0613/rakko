@@ -265,6 +265,22 @@ export const apps = pgTable(
   (table) => [uniqueIndex('apps_user_name_uq').on(table.userId, table.name)],
 );
 
+/** 应用的历史版本：每次改界面存一份，改坏了能退回去 */
+export const appVersions = pgTable(
+  'app_versions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    appId: uuid('app_id')
+      .notNull()
+      .references(() => apps.id, { onDelete: 'cascade' }),
+    spec: jsonb('spec').notNull(),
+    name: text('name').notNull(),
+    description: text('description').notNull().default(''),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [index('app_versions_app_idx').on(table.appId, table.createdAt)],
+);
+
 export const threadsRelations = relations(threads, ({ many }) => ({
   messages: many(messages),
   runs: many(runs),
@@ -289,6 +305,7 @@ export const TABLES = [
   kgNodes,
   kgEdges,
   apps,
+  appVersions,
 ] as const;
 
 export type User = typeof users.$inferSelect;
@@ -303,3 +320,4 @@ export type UsageLedgerRow = typeof usageLedger.$inferSelect;
 export type KgNode = typeof kgNodes.$inferSelect;
 export type KgEdge = typeof kgEdges.$inferSelect;
 export type App = typeof apps.$inferSelect;
+export type AppVersion = typeof appVersions.$inferSelect;

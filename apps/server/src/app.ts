@@ -675,6 +675,20 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
     return reply.code(201).send(await store.createApp(parsed.data));
   });
 
+  /** 版本历史：改坏了能退回去 */
+  app.get('/v1/apps/:id/versions', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    if (!(await store.getApp(id))) return reply.code(404).send({ error: 'app_not_found', message: '应用不存在' });
+    return { items: await store.listAppVersions(id) };
+  });
+
+  app.post('/v1/apps/:id/versions/:versionId/restore', async (request, reply) => {
+    const { id, versionId } = request.params as { id: string; versionId: string };
+    const restored = await store.restoreAppVersion(id, versionId);
+    if (!restored) return reply.code(404).send({ error: 'version_not_found', message: '找不到这个版本' });
+    return restored;
+  });
+
   app.patch('/v1/apps/:id', async (request, reply) => {
     const { id } = request.params as { id: string };
     const parsed = updateAppInput.safeParse(request.body ?? {});
