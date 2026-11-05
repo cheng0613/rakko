@@ -224,3 +224,15 @@ test('卡在审批时取消运行：状态变 canceled，审批一并作废', as
   assert.equal(again.statusCode, 409);
   await app.close();
 });
+
+test('界面由服务端自己吐出来，同源不用跨域', async () => {
+  const app = makeApp();
+  const response = await app.inject({ method: 'GET', url: '/' });
+
+  assert.equal(response.statusCode, 200);
+  assert.match(response.headers['content-type'] ?? '', /text\/html/);
+  assert.match(response.body, /Rakko/);
+  assert.match(response.body, /run\.approval_requested/, '界面要认得审批事件');
+  assert.doesNotMatch(response.body, /src="\.\//, '单文件界面不应该引用同目录资源');
+  await app.close();
+});

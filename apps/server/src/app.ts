@@ -1,3 +1,5 @@
+import { readFile } from 'node:fs/promises';
+
 import Fastify, { type FastifyInstance } from 'fastify';
 
 import {
@@ -73,6 +75,18 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
     tools: tools.list().map((tool) => ({ name: tool.name, risk: tool.risk, approval: tool.requiresApproval })),
     pendingApprovals: gate.size,
   }));
+
+  /** 界面是自包含单文件，直接由服务端吐出，同源就没有跨域问题 */
+  const webFile = new URL('../../web/index.html', import.meta.url);
+  let webCache: string | null = null;
+  app.get('/', async (_request, reply) => {
+    try {
+      if (!webCache) webCache = await readFile(webFile, 'utf8');
+      return reply.type('text/html; charset=utf-8').send(webCache);
+    } catch {
+      return reply.code(404).send({ error: 'web_missing', message: '界面文件 apps/web/index.html 不在' });
+    }
+  });
 
   app.get('/v1/usage', async () => store.usage());
 

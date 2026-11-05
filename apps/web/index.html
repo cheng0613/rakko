@@ -1,0 +1,1231 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>Rakko · 对话</title>
+<style>
+:root{
+  --bg:#FBF8F3; --surface:#FFFFFF; --surface-alt:#F4EFE7;
+  --text:#33241B; --text-2:#6E5C4E; --text-3:#9A8B7D;
+  --border:#E6DED2; --border-strong:#D8CCBC;
+  --accent:#5AA9EC; --accent-pressed:#3F85CB; --accent-soft:#E3F1FC;
+  --on-accent:#12232E; --on-accent-pressed:#0B1A24;
+  --success:#4F7A5B; --success-soft:#E7F0E9;
+  --warning:#B97A2B; --warning-soft:#F8EEDF;
+  --danger:#B4462F; --danger-soft:#F9E8E3;
+  --r-sm:10px; --r-md:14px; --r-lg:20px; --r-pill:999px;
+  --sans:-apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+  --dur:180ms; --ease:cubic-bezier(.2,.8,.2,1);
+  color-scheme:light;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --bg:#17120E; --surface:#221A14; --surface-alt:#2B211A;
+    --text:#F6EFE6; --text-2:#C6B6A6; --text-3:#8E7F71;
+    --border:#392C23; --border-strong:#4A3A2E;
+    --accent:#7BCBF0; --accent-pressed:#5AA9EC; --accent-soft:#1E3A4A;
+    --on-accent:#0B1A24; --on-accent-pressed:#08131A;
+    --success:#7FB08C; --success-soft:#1F2C24;
+    --warning:#E0A45C; --warning-soft:#2E2519;
+    --danger:#E2795F; --danger-soft:#31201B;
+    color-scheme:dark;
+  }
+}
+[data-theme="dark"]{
+  --bg:#17120E; --surface:#221A14; --surface-alt:#2B211A;
+  --text:#F6EFE6; --text-2:#C6B6A6; --text-3:#8E7F71;
+  --border:#392C23; --border-strong:#4A3A2E;
+  --accent:#7BCBF0; --accent-pressed:#5AA9EC; --accent-soft:#1E3A4A;
+  --on-accent:#0B1A24; --on-accent-pressed:#08131A;
+  --success:#7FB08C; --success-soft:#1F2C24;
+  --warning:#E0A45C; --warning-soft:#2E2519;
+  --danger:#E2795F; --danger-soft:#31201B;
+  color-scheme:dark;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);
+  font-size:14px;line-height:22px;-webkit-font-smoothing:antialiased;
+  text-rendering:optimizeLegibility;
+}
+button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:pointer}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:8px}
+.app{display:grid;grid-template-columns:268px 1fr;height:100dvh}
+
+/* ---------- 侧栏 ---------- */
+.side{
+  display:flex;flex-direction:column;min-height:0;
+  background:var(--surface-alt);border-right:1px solid var(--border);
+  padding:14px 12px calc(14px + env(safe-area-inset-bottom));
+}
+.brand{display:flex;align-items:center;gap:9px;padding:6px 8px 14px}
+.mark{
+  width:26px;height:26px;border-radius:50%;
+  border:2.5px solid var(--text);border-right-color:transparent;
+  transform:rotate(-38deg);flex:0 0 auto;
+}
+.brand b{font-size:15px;letter-spacing:.01em}
+.brand span{font-size:11px;color:var(--text-3);margin-left:auto;font-variant-numeric:tabular-nums}
+.newchat{
+  display:flex;align-items:center;gap:8px;justify-content:center;
+  width:100%;padding:10px 12px;border-radius:var(--r-md);
+  background:var(--accent);color:var(--on-accent);font-weight:600;
+  border-bottom:3px solid var(--accent-pressed);
+  transition:transform var(--dur) var(--ease),border-bottom-width var(--dur);
+}
+.newchat:active{transform:translateY(2px);border-bottom-width:1px}
+.newchat kbd{
+  font-family:var(--mono);font-size:11px;opacity:.66;font-weight:500;
+  border:1px solid currentColor;border-radius:5px;padding:0 4px;line-height:15px;
+}
+.navmini{display:flex;gap:4px;margin:12px 0 6px;padding:0 2px;flex-wrap:wrap}
+.navmini button{
+  font-size:12px;color:var(--text-2);padding:4px 9px;border-radius:var(--r-pill);
+  border:1px solid transparent;
+}
+.navmini button[aria-current="true"]{background:var(--surface);border-color:var(--border);color:var(--text);font-weight:600}
+.side-title{
+  font-size:11px;color:var(--text-3);font-weight:600;letter-spacing:.04em;
+  padding:12px 8px 6px;
+}
+.threads{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:2px}
+.thread-item{
+  display:block;width:100%;text-align:left;padding:8px 10px;border-radius:var(--r-sm);
+  color:var(--text-2);font-size:13px;line-height:18px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.thread-item:hover{background:var(--surface)}
+.thread-item[aria-current="true"]{background:var(--surface);color:var(--text);font-weight:600}
+.side-foot{border-top:1px solid var(--border);margin-top:10px;padding-top:10px;display:flex;flex-direction:column;gap:8px}
+.usage{display:flex;flex-direction:column;gap:6px;padding:2px 8px 0}
+.usage-row{display:flex;justify-content:space-between;font-size:11px;color:var(--text-3);font-variant-numeric:tabular-nums}
+.usage-row b{color:var(--text-2);font-weight:600}
+.bar{height:4px;border-radius:2px;background:var(--border);overflow:hidden}
+.bar i{display:block;height:100%;background:var(--accent);border-radius:2px;transition:width var(--dur) var(--ease)}
+.mode-chip{
+  display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text-3);
+  padding:0 8px 4px;
+}
+.dot{width:6px;height:6px;border-radius:50%;background:var(--success);flex:0 0 auto}
+.dot.off{background:var(--warning)}
+
+/* ---------- 主区 ---------- */
+.main{display:flex;flex-direction:column;min-width:0;min-height:0;background:var(--bg)}
+.top{
+  display:flex;align-items:center;gap:10px;
+  padding:calc(10px + env(safe-area-inset-top)) 18px 10px;
+  border-bottom:1px solid var(--border);background:var(--bg);
+}
+.top h1{font-size:14px;font-weight:600;margin:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.top .sub{font-size:11px;color:var(--text-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.top-actions{margin-left:auto;display:flex;gap:6px;align-items:center}
+.icon-btn{
+  width:32px;height:32px;border-radius:var(--r-sm);border:1px solid var(--border);
+  display:grid;place-items:center;color:var(--text-2);background:var(--surface);
+}
+.icon-btn:hover{color:var(--text)}
+.burger{display:none}
+.banner{
+  display:flex;gap:8px;align-items:flex-start;
+  font-size:12px;line-height:18px;color:var(--text-2);
+  padding:8px 18px;background:var(--warning-soft);border-bottom:1px solid var(--border);
+}
+.banner b{color:var(--text)}
+.thread{padding:18px 18px 8px;overflow:auto;flex:1;min-height:0;display:flex;flex-direction:column;gap:18px}
+.thread-inner{width:100%;max-width:760px;margin:0 auto;display:flex;flex-direction:column;gap:18px}
+
+/* 空状态 */
+.empty{margin:auto;text-align:center;max-width:420px;padding:24px 8px}
+.empty .big{
+  width:84px;height:64px;margin:0 auto 16px;border-radius:18px;
+  background:var(--accent-soft);display:grid;place-items:center;
+}
+.empty .big .mark{width:34px;height:34px;border-width:3px;border-right-color:transparent}
+.empty h2{margin:0 0 6px;font-size:17px;font-weight:600}
+.empty p{margin:0;color:var(--text-2);font-size:13px;line-height:20px}
+.prompts{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-top:16px}
+.prompts button{
+  border:1px solid var(--border);background:var(--surface);border-radius:var(--r-pill);
+  padding:6px 12px;font-size:12px;color:var(--text-2);
+}
+.prompts button:hover{border-color:var(--border-strong);color:var(--text)}
+
+/* 消息 */
+.msg{display:flex;gap:10px;min-width:0}
+.msg.user{flex-direction:row-reverse}
+.avatar{
+  width:28px;height:28px;border-radius:50%;flex:0 0 auto;display:grid;place-items:center;
+  font-size:11px;font-weight:700;border:1px solid var(--border);background:var(--surface);color:var(--text-2);
+}
+.msg.assistant .avatar{border-color:var(--accent);color:var(--accent)}
+.bubble{min-width:0;max-width:100%;display:flex;flex-direction:column;gap:8px}
+.msg.user .bubble{
+  background:var(--surface);border:1px solid var(--border);border-radius:var(--r-md);
+  padding:10px 13px;max-width:min(78%,560px);
+}
+.msg.user .bubble .text{white-space:pre-wrap;word-break:break-word}
+.text{word-break:break-word}
+.text p{margin:0 0 8px}
+.text p:last-child{margin-bottom:0}
+.text code{
+  font-family:var(--mono);font-size:12px;background:var(--surface-alt);
+  border:1px solid var(--border);border-radius:6px;padding:1px 5px;
+}
+.text pre{
+  font-family:var(--mono);font-size:12px;line-height:18px;background:var(--surface);
+  border:1px solid var(--border);border-radius:var(--r-sm);padding:10px 12px;overflow:auto;margin:8px 0;
+}
+.text ul,.text ol{margin:0 0 8px;padding-left:20px}
+.text li{margin:2px 0}
+.meta{font-size:11px;color:var(--text-3);display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.meta .sep{width:3px;height:3px;border-radius:50%;background:var(--border-strong)}
+
+/* 思考 */
+.think{
+  border:1px dashed var(--border-strong);border-radius:var(--r-sm);
+  background:var(--surface);overflow:hidden;
+}
+.think summary{
+  list-style:none;cursor:pointer;padding:7px 11px;display:flex;align-items:center;gap:7px;
+  font-size:12px;color:var(--text-3);user-select:none;
+}
+.think summary::-webkit-details-marker{display:none}
+.think summary .chev{transition:transform var(--dur) var(--ease);font-size:10px}
+.think[open] summary .chev{transform:rotate(90deg)}
+.think .body{
+  padding:0 11px 10px;font-size:12px;line-height:19px;color:var(--text-3);
+  white-space:pre-wrap;max-height:220px;overflow:auto;
+}
+.thinking-pulse{display:inline-flex;gap:3px;align-items:center}
+.thinking-pulse i{
+  width:4px;height:4px;border-radius:50%;background:var(--text-3);
+  animation:blink 1.1s var(--ease) infinite;
+}
+.thinking-pulse i:nth-child(2){animation-delay:.15s}
+.thinking-pulse i:nth-child(3){animation-delay:.3s}
+@keyframes blink{0%,60%,100%{opacity:.25}30%{opacity:1}}
+
+/* 工具卡 */
+.tool{
+  border:1px solid var(--border);border-radius:var(--r-md);background:var(--surface);
+  padding:10px 12px;display:flex;flex-direction:column;gap:7px;
+}
+.tool-head{display:flex;align-items:center;gap:8px;font-size:12px;min-width:0}
+.tool-name{font-family:var(--mono);font-weight:600;color:var(--text)}
+.status{
+  margin-left:auto;font-size:11px;padding:1px 8px;border-radius:var(--r-pill);
+  border:1px solid var(--border);color:var(--text-2);white-space:nowrap;
+}
+.status.ok{color:var(--success);border-color:var(--success);background:var(--success-soft)}
+.status.fail{color:var(--danger);border-color:var(--danger);background:var(--danger-soft)}
+.status.wait{color:var(--warning);border-color:var(--warning);background:var(--warning-soft)}
+.status.run{color:var(--accent);border-color:var(--accent);background:var(--accent-soft)}
+.tool-args{
+  font-family:var(--mono);font-size:11px;line-height:17px;color:var(--text-2);
+  background:var(--surface-alt);border-radius:8px;padding:7px 9px;
+  max-height:92px;overflow:auto;white-space:pre-wrap;word-break:break-all;
+}
+.tool-out{font-size:12px;color:var(--text-2);max-height:120px;overflow:auto;white-space:pre-wrap;word-break:break-word}
+.tool-out.head-only{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+
+.approval .cmd.one-line{
+  font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  padding:7px 11px;
+}
+.argsmore{margin-top:-4px}
+.argsmore summary{
+  list-style:none;cursor:pointer;font-size:11px;color:var(--text-3);
+  padding:2px 0;width:max-content;
+}
+.argsmore summary::-webkit-details-marker{display:none}
+.argsmore .cmd{margin-top:4px}
+/* 审批卡 */
+.approval{
+  border:1px solid var(--accent);border-radius:var(--r-lg);background:var(--surface);
+  padding:14px 15px;display:flex;flex-direction:column;gap:11px;
+}
+.approval-top{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.approval-title{font-size:13px;font-weight:600}
+.risk{
+  font-size:10.5px;padding:1px 7px;border-radius:var(--r-pill);
+  border:1px solid var(--danger);color:var(--danger);background:var(--danger-soft);
+  letter-spacing:.02em;
+}
+.risk.medium{color:var(--warning);border-color:var(--warning);background:var(--warning-soft)}
+.approval .countdown{margin-left:auto;font-size:11px;color:var(--text-3);font-variant-numeric:tabular-nums}
+.approval .what{font-size:12px;color:var(--text-2)}
+.approval .what code{font-family:var(--mono);font-size:11.5px;color:var(--text)}
+.approval .cmd{
+  font-family:var(--mono);font-size:12px;line-height:19px;color:var(--text);
+  background:var(--surface-alt);border-radius:var(--r-sm);padding:9px 11px;
+  white-space:pre-wrap;word-break:break-word;max-height:130px;overflow:auto;
+}
+.approval-actions{display:flex;gap:8px;flex-wrap:wrap}
+.btn{
+  padding:8px 14px;border-radius:var(--r-md);font-size:13px;font-weight:600;
+  border:1px solid var(--border);background:var(--surface);color:var(--text);
+  transition:transform var(--dur) var(--ease),border-bottom-width var(--dur);
+}
+.btn:hover{border-color:var(--border-strong)}
+.btn.primary{
+  background:var(--accent);color:var(--on-accent);border-color:transparent;
+  border-bottom:3px solid var(--accent-pressed);
+}
+.btn.primary:active{transform:translateY(2px);border-bottom-width:1px}
+.btn.danger{color:var(--danger);border-color:var(--danger)}
+.btn[disabled]{opacity:.5;cursor:default;transform:none}
+.approval-result{font-size:12px;display:flex;align-items:center;gap:7px}
+.approval-result.allow{color:var(--success)}
+.approval-result.deny{color:var(--warning)}
+.hint{font-size:11px;color:var(--text-3)}
+
+/* 降级 / 提示 */
+.notice{
+  display:flex;gap:8px;align-items:flex-start;font-size:12px;line-height:18px;
+  border:1px solid var(--warning);border-radius:var(--r-sm);background:var(--warning-soft);
+  color:var(--text-2);padding:8px 11px;
+}
+.notice b{color:var(--text)}
+
+/* 输入区 */
+.composer{
+  padding:10px 18px calc(14px + env(safe-area-inset-bottom));
+  border-top:1px solid var(--border);background:var(--bg);
+}
+.composer-inner{max-width:760px;margin:0 auto;display:flex;flex-direction:column;gap:7px}
+.box{
+  display:flex;align-items:flex-end;gap:8px;background:var(--surface);
+  border:1px solid var(--border);border-radius:var(--r-lg);padding:8px 8px 8px 13px;
+}
+.box:focus-within{border-color:var(--accent)}
+textarea{
+  flex:1;min-height:24px;max-height:180px;resize:none;border:0;background:none;outline:none;
+  font:inherit;color:var(--text);padding:3px 0;line-height:22px;
+}
+textarea::placeholder{color:var(--text-3)}
+textarea:focus-visible{outline:none}
+.send{
+  width:34px;height:34px;border-radius:50%;background:var(--accent);color:var(--on-accent);
+  display:grid;place-items:center;flex:0 0 auto;
+}
+.send[disabled]{opacity:.45}
+.send svg{width:17px;height:17px}
+.composer-foot{display:flex;align-items:center;gap:8px;font-size:11px;color:var(--text-3);padding:0 3px}
+.composer-foot .right{margin-left:auto;display:flex;gap:8px;align-items:center}
+.linkish{color:var(--text-2);text-decoration:underline;text-underline-offset:2px}
+.scrim{display:none}
+
+@media (max-width:820px){
+  .app{grid-template-columns:1fr}
+  .side{
+    position:fixed;inset:0 auto 0 0;width:min(84vw,300px);z-index:30;
+    transform:translateX(-102%);transition:transform var(--dur) var(--ease);
+    border-right:1px solid var(--border);
+  }
+  body.nav-open .side{transform:none}
+  body.nav-open .scrim{display:block;position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:20}
+  .burger{display:grid}
+  .thread{padding:14px 14px 6px}
+  .composer{padding:8px 12px calc(12px + env(safe-area-inset-bottom))}
+  .top{padding:calc(8px + env(safe-area-inset-top)) 12px 8px}
+  .msg.user .bubble{max-width:86%}
+  .approval .countdown{width:100%;margin-left:0}
+}
+@media (prefers-reduced-motion:reduce){
+  *{animation:none!important;transition:none!important}
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="side" aria-label="会话导航">
+    <div class="brand">
+      <span class="mark" aria-hidden="true"></span>
+      <b>Rakko</b>
+      <span id="modeTag">连接中…</span>
+    </div>
+    <button class="newchat" id="newChat">＋ 新对话 <kbd>⌘N</kbd></button>
+    <div class="navmini" role="tablist" aria-label="主导航">
+      <button aria-current="true">对话</button>
+      <button>任务</button>
+      <button>记忆</button>
+      <button>技能</button>
+      <button>设置</button>
+    </div>
+    <div class="side-title">最近对话</div>
+    <div class="threads" id="threadList"></div>
+    <div class="side-foot">
+      <div class="usage" title="按运行次数计，与 token 无关">
+        <div class="usage-row"><span>本周用量</span><b id="usageText">— / —</b></div>
+        <div class="bar"><i id="usageBar" style="width:0%"></i></div>
+      </div>
+      <div class="mode-chip"><span class="dot" id="modeDot"></span><span id="modeText">检测服务端…</span></div>
+    </div>
+  </aside>
+  <div class="scrim" id="scrim"></div>
+
+  <main class="main">
+    <header class="top">
+      <button class="icon-btn burger" id="burger" aria-label="打开会话列表">
+        <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true"><path d="M3 5h14M3 10h14M3 15h14" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" fill="none"/></svg>
+      </button>
+      <div style="min-width:0">
+        <h1 id="threadTitle">新对话</h1>
+        <div class="sub" id="threadSub">海獭会砸壳 · 也能扛长任务</div>
+      </div>
+      <div class="top-actions">
+        <button class="icon-btn" id="cancelBtn" hidden aria-label="停止这次运行" title="停止">
+          <svg viewBox="0 0 20 20" width="14" height="14" aria-hidden="true"><rect x="6" y="6" width="8" height="8" rx="1.5" fill="currentColor"/></svg>
+        </button>
+        <button class="icon-btn" id="themeBtn" aria-label="切换深浅色" title="切换深浅色">
+          <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true"><path d="M10 3v2M10 15v2M3 10h2M15 10h2M5 5l1.4 1.4M13.6 13.6L15 15M15 5l-1.4 1.4M6.4 13.6L5 15" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" fill="none"/><circle cx="10" cy="10" r="3.2" stroke="currentColor" stroke-width="1.4" fill="none"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <div class="banner" id="banner" hidden></div>
+
+    <div class="thread" id="threadScroll">
+      <div class="thread-inner" id="thread"></div>
+    </div>
+
+    <div class="composer">
+      <div class="composer-inner">
+        <div class="box">
+          <textarea id="input" rows="1" placeholder="让海獭做点什么…（Enter 发送，Shift+Enter 换行）" aria-label="输入消息"></textarea>
+          <button class="send" id="send" aria-label="发送">
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10h11M11 5.5 15.5 10 11 14.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>
+          </button>
+        </div>
+        <div class="composer-foot">
+          <span id="modelHint">—</span>
+          <span class="right">
+            <button class="linkish" id="demoBtn" hidden>看演示</button>
+            <span id="modeHint">—</span>
+          </span>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script>
+(() => {
+  'use strict';
+
+  /* ---------------- 基础 ---------------- */
+  const $ = (sel, root = document) => root.querySelector(sel);
+  const make = (tag, cls, text) => {
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text !== undefined) node.textContent = text;
+    return node;
+  };
+  const esc = (text) => text.replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const fmtTime = (iso) => {
+    const d = new Date(iso);
+    return isNaN(d) ? '' : d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+  };
+  const params = new URLSearchParams(location.search);
+  const API = (params.get('api') || localStorage.getItem('rakko.api') || (location.protocol === 'file:' ? 'http://127.0.0.1:8787' : location.origin)).replace(/\/$/, '');
+  const forcedDemo = params.get('demo') === '1';
+
+  const ui = {
+    threadScroll: $('#threadScroll'), thread: $('#thread'), list: $('#threadList'),
+    title: $('#threadTitle'), sub: $('#threadSub'), input: $('#input'), send: $('#send'),
+    banner: $('#banner'), cancel: $('#cancelBtn'), modelHint: $('#modelHint'),
+    modeTag: $('#modeTag'), modeText: $('#modeText'), modeDot: $('#modeDot'), modeHint: $('#modeHint'),
+    usageText: $('#usageText'), usageBar: $('#usageBar'), demoBtn: $('#demoBtn'),
+  };
+
+  const state = {
+    mode: 'real',
+    threads: [],
+    threadId: null,
+    messages: [],
+    running: null,
+    source: null,
+    demoPending: null,
+    health: null,
+    startedAt: 0,
+  };
+
+  /* ---------------- 主题 ---------------- */
+  const applyTheme = (value) => {
+    document.documentElement.dataset.theme = value;
+    localStorage.setItem('rakko.theme', value);
+  };
+  const savedTheme = localStorage.getItem('rakko.theme') || 'auto';
+  document.documentElement.dataset.theme = savedTheme;
+  $('#themeBtn').addEventListener('click', () => {
+    const order = ['auto', 'light', 'dark'];
+    const next = order[(order.indexOf(document.documentElement.dataset.theme || 'auto') + 1) % order.length];
+    applyTheme(next);
+    $('#themeBtn').title = { auto: '跟随系统', light: '浅色', dark: '深色' }[next];
+  });
+
+  /* ---------------- 侧栏（移动端） ---------------- */
+  const closeNav = () => document.body.classList.remove('nav-open');
+  $('#burger').addEventListener('click', () => document.body.classList.toggle('nav-open'));
+  $('#scrim').addEventListener('click', closeNav);
+
+  /* ---------------- 轻量 markdown ---------------- */
+  const md = (text) => {
+    const blocks = esc(text).split(/\n{2,}/);
+    return blocks.map((block) => {
+      const lines = block.split('\n');
+      const isList = (prefix) => lines.every((line) => line.trim().startsWith(prefix) || line.trim() === '');
+      const inline = (line) => line
+        .replace(/`([^`]+)`/g, '<code>$1</code>')
+        .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+        .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
+      if (block.trim().startsWith('```')) {
+        const body = block.replace(/^```[a-z]*\n?/, '').replace(/```$/, '');
+        return '<pre>' + body + '</pre>';
+      }
+      if (isList('- ')) {
+        return '<ul>' + lines.filter((l) => l.trim()).map((l) => '<li>' + inline(l.replace(/^\s*-\s/, '')) + '</li>').join('') + '</ul>';
+      }
+      if (lines.length && lines.every((l) => /^\d+\.\s/.test(l.trim()) || l.trim() === '')) {
+        return '<ol>' + lines.filter((l) => l.trim()).map((l) => '<li>' + inline(l.replace(/^\s*\d+\.\s/, '')) + '</li>').join('') + '</ol>';
+      }
+      return '<p>' + lines.map(inline).join('<br>') + '</p>';
+    }).join('');
+  };
+
+  /* ---------------- 渲染：会话列表 / 用量 ---------------- */
+  const renderThreads = () => {
+    ui.list.innerHTML = '';
+    if (state.threads.length === 0) {
+      ui.list.append(make('div', 'hint', '还没有对话'));
+      return;
+    }
+    for (const thread of state.threads) {
+      const item = make('button', 'thread-item', thread.title || '未命名');
+      if (thread.id === state.threadId) item.setAttribute('aria-current', 'true');
+      item.addEventListener('click', () => {
+        closeNav();
+        openThread(thread.id);
+      });
+      ui.list.append(item);
+    }
+  };
+
+  const renderUsage = (usage) => {
+    if (!usage) return;
+    ui.usageText.textContent = usage.used + ' / ' + usage.limit + ' 次';
+    const pct = usage.limit > 0 ? Math.min(100, Math.round((usage.used / usage.limit) * 100)) : 0;
+    ui.usageBar.style.width = pct + '%';
+    ui.usageBar.style.background = pct >= 100 ? 'var(--warning)' : 'var(--accent)';
+    ui.usageText.title = '剩余 ' + usage.remaining + ' 次 · 月初重置';
+  };
+
+  const setMode = (mode, detail) => {
+    state.mode = mode;
+    if (mode === 'demo') {
+      ui.modeTag.textContent = '演示';
+      ui.modeText.textContent = detail || '演示数据（未连服务端）';
+      ui.modeDot.className = 'dot off';
+      ui.modeHint.textContent = '脚本回放';
+    } else {
+      ui.modeTag.textContent = '已连接';
+      ui.modeText.textContent = '服务端 ' + API.replace(/^https?:\/\//, '');
+      ui.modeDot.className = 'dot';
+      ui.modeHint.textContent = '实时事件流';
+    }
+  };
+
+  const showBanner = (html) => {
+    ui.banner.innerHTML = html;
+    ui.banner.hidden = false;
+  };
+
+  /* ---------------- 渲染：消息 ---------------- */
+  const emptyState = () => {
+    const wrap = make('div', 'empty');
+    const big = make('div', 'big');
+    const mark = make('span', 'mark');
+    big.append(mark);
+    const h2 = make('h2', undefined, '海獭在等你');
+    const p = make('p', undefined, '它会先想，再动手。写文件、跑命令这类动真格的活，会先停下来问你一句。');
+    const prompts = make('div', 'prompts');
+    ['读一下 README，说说这项目是干嘛的', '帮我把这周的用量整理成表', '跑一遍测试，失败就修'].forEach((text) => {
+      const b = make('button', undefined, text);
+      b.addEventListener('click', () => {
+        ui.input.value = text;
+        ui.input.focus();
+        autoGrow();
+      });
+      prompts.append(b);
+    });
+    wrap.append(big, h2, p, prompts);
+    return wrap;
+  };
+
+  const renderHistory = () => {
+    ui.thread.innerHTML = '';
+    if (state.messages.length === 0) {
+      ui.thread.append(emptyState());
+      return;
+    }
+    for (const message of state.messages) {
+      if (message.role === 'user') {
+        const row = make('div', 'msg user');
+        row.append(make('div', 'avatar', '你'));
+        const bubble = make('div', 'bubble');
+        const text = make('div', 'text');
+        text.textContent = message.text;
+        bubble.append(text);
+        row.append(bubble);
+        ui.thread.append(row);
+      } else if (message.role === 'assistant') {
+        const row = make('div', 'msg assistant');
+        row.append(make('div', 'avatar', '獭'));
+        const bubble = make('div', 'bubble');
+        const text = make('div', 'text');
+        text.innerHTML = md(message.text);
+        bubble.append(text, make('div', 'meta', fmtTime(message.createdAt)));
+        row.append(bubble);
+        ui.thread.append(row);
+      }
+    }
+    scrollToBottom(true);
+  };
+
+  const scrollToBottom = (smooth) => {
+    requestAnimationFrame(() => {
+      ui.threadScroll.scrollTo({ top: ui.threadScroll.scrollHeight, behavior: smooth ? 'smooth' : 'auto' });
+    });
+  };
+
+  /* ---------------- 一次运行的可视单元 ---------------- */
+  const createTurn = () => {
+    if ($('.empty')) ui.thread.innerHTML = '';
+    const row = make('div', 'msg assistant');
+    row.append(make('div', 'avatar', '獭'));
+    const bubble = make('div', 'bubble');
+    row.append(bubble);
+    ui.thread.append(row);
+    scrollToBottom();
+
+    const turn = {
+      row, bubble,
+      reasoning: null,
+      parts: [],
+      currentPart: null,
+      answerText: '',
+      done: false,
+      startedAt: Date.now(),
+    };
+
+    return turn;
+  };
+
+  const ensureReasoning = (turn) => {
+    if (turn.reasoning) return turn.reasoning;
+    const details = make('details', 'think');
+    const summary = make('summary');
+    const chev = make('span', 'chev', '▸');
+    const label = make('span', undefined, '正在想…');
+    const pulse = make('span', 'thinking-pulse');
+    pulse.append(make('i'), make('i'), make('i'));
+    summary.append(chev, label, pulse);
+    const body = make('div', 'body');
+    details.append(summary, body);
+    turn.bubble.insertBefore(details, turn.answerEl || null);
+    turn.reasoning = { details, label, pulse, body, chars: 0, startedAt: Date.now() };
+    return turn.reasoning;
+  };
+
+  const appendReasoning = (turn, text) => {
+    const box = ensureReasoning(turn);
+    box.body.textContent += text;
+    box.chars += text.length;
+    scrollToBottom();
+  };
+
+  const finishReasoning = (turn) => {
+    if (!turn.reasoning) return;
+    const seconds = Math.max(1, Math.round((Date.now() - turn.reasoning.startedAt) / 1000));
+    turn.reasoning.pulse.remove();
+    turn.reasoning.label.textContent = '思考了 ' + seconds + ' 秒 · ' + turn.reasoning.chars + ' 字';
+  };
+
+  const ensureAnswer = (turn) => {
+    if (turn.currentPart) return turn.currentPart;
+    const el = make('div', 'text');
+    turn.bubble.append(el);
+    turn.currentPart = { el, text: '' };
+    turn.parts.push(turn.currentPart);
+    return turn.currentPart;
+  };
+
+  /** 工具卡插进来之后，后面的文字要另起一块，别插到上面那段里 */
+  const closeAnswerPart = (turn) => { turn.currentPart = null; };
+
+  const appendAnswer = (turn, text) => {
+    finishReasoning(turn);
+    const part = ensureAnswer(turn);
+    part.text += text;
+    part.el.textContent = part.text;   // 流式阶段用纯文本，快且不乱跳
+    turn.answerText += text;
+    scrollToBottom();
+  };
+
+  const finishAnswer = (turn, model, note) => {
+    if (turn.done) return;
+    turn.done = true;
+    finishReasoning(turn);
+    if (turn.parts.length === 0) ensureAnswer(turn);
+    for (const part of turn.parts) part.el.innerHTML = md(part.text || '（这次没有输出内容）');
+    const meta = make('div', 'meta');
+    meta.append(make('span', undefined, model || '模型'));
+    meta.append(make('span', 'sep'));
+    meta.append(make('span', undefined, ((Date.now() - turn.startedAt) / 1000).toFixed(1) + 's'));
+    if (note) {
+      meta.append(make('span', 'sep'));
+      meta.append(make('span', undefined, note));
+    }
+    turn.bubble.append(meta);
+    scrollToBottom();
+  };
+
+  /* 工具卡 */
+  const addTool = (turn, call) => {
+    const card = make('div', 'tool');
+    const head = make('div', 'tool-head');
+    head.append(make('span', 'tool-name', call.name));
+    head.append(make('span', 'status run', '执行中'));
+    const args = make('div', 'tool-args', JSON.stringify(call.args, null, 2));
+    card.append(head, args);
+    turn.bubble.append(card);
+    closeAnswerPart(turn);
+    scrollToBottom();
+
+    return {
+      card,
+      done(ok, output) {
+        const status = head.querySelector('.status');
+        status.className = 'status ' + (ok ? 'ok' : 'fail');
+        status.textContent = ok ? '完成' : '失败';
+        const out = make('div', 'tool-out head-only', output || '（无输出）');
+        out.title = '点击展开';
+        out.addEventListener('click', () => out.classList.toggle('head-only'));
+        card.append(out);
+      },
+      markWaiting() {
+        const status = head.querySelector('.status');
+        status.className = 'status wait';
+        status.textContent = '等待审批';
+      },
+    };
+  };
+
+  /* 审批卡 */
+  const addApproval = (turn, call, risk, expiresAt, onDecide) => {
+    const card = make('div', 'approval');
+    const top = make('div', 'approval-top');
+    top.append(make('span', 'approval-title', '需要你点头'));
+    const riskTag = make('span', 'risk' + (risk === 'medium' ? ' medium' : ''), risk === 'high' ? '高风险' : risk === 'medium' ? '中等风险' : '低风险');
+    top.append(riskTag);
+    const countdown = make('span', 'countdown');
+    top.append(countdown);
+
+    const what = make('div', 'what');
+    what.append(make('span', undefined, '模型想调用 '), make('code', undefined, call.name), make('span', undefined, '：'));
+
+    const args = call.args || {};
+    const summary = typeof args.path === 'string' ? args.path
+      : typeof args.command === 'string' ? args.command
+      : null;
+
+    const body = make('div', 'cmd', summary !== null ? summary : JSON.stringify(args, null, 2));
+    if (summary !== null) body.classList.add('one-line');
+
+    const more = make('details', 'argsmore');
+    more.append(make('summary', undefined, '完整参数'));
+    more.append(make('div', 'cmd', JSON.stringify(args, null, 2)));
+
+    const actions = make('div', 'approval-actions');
+    const allow = make('button', 'btn primary', '允许这次');
+    const deny = make('button', 'btn danger', '拒绝');
+    actions.append(allow, deny);
+    const hint = make('div', 'hint', '拒绝不会让任务失败 —— 模型会读到「你没允许」，然后换个做法。');
+
+    card.append(top, what, body);
+    if (summary !== null) card.append(more);
+    card.append(actions, hint);
+    turn.bubble.append(card);
+    closeAnswerPart(turn);
+    scrollToBottom();
+
+    let settled = false;
+    const timer = setInterval(() => {
+      const left = new Date(expiresAt).getTime() - Date.now();
+      if (isNaN(left)) { countdown.textContent = ''; return; }
+      if (left <= 0) { countdown.textContent = '已超时'; return; }
+      const m = Math.floor(left / 60000);
+      const s = Math.floor((left % 60000) / 1000);
+      countdown.textContent = m > 0 ? m + ' 分 ' + s + ' 秒后自动拒绝' : s + ' 秒后自动拒绝';
+    }, 1000);
+
+    const settle = (decision) => {
+      if (settled) return;
+      settled = true;
+      clearInterval(timer);
+      actions.remove();
+      hint.remove();
+      const result = make('div', 'approval-result ' + (decision === 'allow' ? 'allow' : 'deny'));
+      result.textContent = decision === 'allow' ? '✓ 你允许了这次调用' : '✕ 你拒绝了这次调用，模型会换个做法';
+      card.append(result);
+      countdown.textContent = '';
+      onDecide(decision);
+    };
+
+    allow.addEventListener('click', () => settle('allow'));
+    deny.addEventListener('click', () => settle('deny'));
+
+    return {
+      card,
+      markWaiting: () => { countdown.textContent = '等待审批…'; },
+      settleExternally: (decision, note) => {
+        if (settled) return;
+        settled = true;
+        clearInterval(timer);
+        actions.remove();
+        hint.remove();
+        const result = make('div', 'approval-result ' + (decision === 'allow' ? 'allow' : 'deny'));
+        result.textContent = decision === 'allow'
+          ? '✓ ' + (note || '已允许（来自其他端）')
+          : '✕ ' + (note || '已拒绝（来自其他端）');
+        card.append(result);
+        countdown.textContent = '';
+      },
+    };
+  };
+
+  const addNotice = (turn, text) => {
+    const notice = make('div', 'notice');
+    notice.innerHTML = '<span>⇄</span><div><b>已降级</b> · ' + esc(text) + '</div>';
+    turn.bubble.append(notice);
+    closeAnswerPart(turn);
+    scrollToBottom();
+  };
+
+  /* ---------------- 事件处理 ---------------- */
+  let currentTurn = null;
+  const toolCards = new Map();
+  const approvalCards = new Map();
+
+  const handleEvent = (event) => {
+    if (!currentTurn) currentTurn = createTurn();
+    const turn = currentTurn;
+
+    switch (event.type) {
+      case 'run.started':
+        break;
+      case 'run.reasoning':
+        appendReasoning(turn, event.text);
+        break;
+      case 'run.delta':
+        appendAnswer(turn, event.text);
+        break;
+      case 'run.tool_call': {
+        const card = addTool(turn, event);
+        toolCards.set(event.callId, card);
+        break;
+      }
+      case 'run.approval_requested': {
+        const pending = addApproval(turn, event, event.risk, approvals.get(event.callId) || new Date(Date.now() + 600000).toISOString(), (decision) => {
+          decideApproval(event.callId, decision);
+        });
+        approvalCards.set(event.callId, pending);
+        toolCards.get(event.callId)?.markWaiting();
+        break;
+      }
+      case 'run.approval_decided': {
+        approvalCards.get(event.callId)?.settleExternally(
+          event.decision,
+          event.reason ? (event.decision === 'allow' ? '已允许：' + event.reason : '已拒绝：' + event.reason) : undefined,
+        );
+        break;
+      }
+      case 'run.tool_result':
+        toolCards.get(event.callId)?.done(event.ok, event.output);
+        break;
+      case 'run.fallback':
+        addNotice(turn, event.reason);
+        break;
+      case 'run.error':
+        appendAnswer(turn, '\n\n**出错了**：' + event.message);
+        break;
+      case 'run.state':
+        if (event.state === 'waiting_approval') {
+          ui.input.placeholder = '等你点一下「允许」，海獭才动手…';
+          ui.cancel.hidden = false;
+        } else if (event.state === 'running') {
+          ui.input.placeholder = '海獭在干活，先看着…';
+        }
+        break;
+      case 'run.done':
+        finishAnswer(turn, state.lastModel, event.state === 'canceled' ? '已取消' : null);
+        closeStream();
+        setRunning(false);
+        currentTurn = null;
+        break;
+      default:
+        break;
+    }
+  };
+
+  /* ---------------- 真实模式 ---------------- */
+  const approvals = new Map();  // callId -> expiresAt
+
+  const api = async (path, options) => {
+    const response = await fetch(API + path, {
+      ...options,
+      headers: { 'content-type': 'application/json', ...(options && options.headers) },
+    });
+    const text = await response.text();
+    let body = null;
+    try { body = text ? JSON.parse(text) : null; } catch { body = null; }
+    if (!response.ok) {
+      const message = (body && body.message) || ('请求失败 ' + response.status);
+      throw new Error(message);
+    }
+    return body;
+  };
+
+  const decideApproval = async (callId, decision) => {
+    if (state.mode === 'demo') {
+      if (state.demoResolve) state.demoResolve(decision);
+      return;
+    }
+    try {
+      await api('/v1/runs/' + state.running.id + '/approvals/' + callId, {
+        method: 'POST',
+        body: JSON.stringify({ decision }),
+      });
+    } catch (error) {
+      showBanner('<span>⚠︎</span><div><b>审批没有送出去</b> · ' + esc(error.message) + '</div>');
+    }
+  };
+
+  const setRunning = (running) => {
+    state.running = running ? (state.running || {}) : null;
+    ui.send.disabled = !!running;
+    ui.cancel.hidden = !running;
+    ui.input.placeholder = running ? '海獭在干活，先看着…' : '让海獭做点什么…（Enter 发送，Shift+Enter 换行）';
+  };
+
+  const refreshUsage = async () => {
+    try {
+      const usage = await api('/v1/usage');
+      renderUsage(usage);
+    } catch { /* 忽略 */ }
+  };
+
+  const loadThreads = async () => {
+    const body = await api('/v1/threads');
+    state.threads = body.items || [];
+    renderThreads();
+  };
+
+  const openThread = async (id) => {
+    state.threadId = id;
+    ui.thread.innerHTML = '';
+    try {
+      const body = await api('/v1/threads/' + id + '/messages');
+      state.messages = body.items || [];
+    } catch {
+      state.messages = [];
+    }
+    const thread = state.threads.find((item) => item.id === id);
+    ui.title.textContent = thread ? thread.title : '对话';
+    ui.thread.innerHTML = '';
+    renderHistory();
+    renderThreads();
+  };
+
+  const createThread = async () => {
+    const thread = await api('/v1/threads', { method: 'POST', body: JSON.stringify({}) });
+    state.threads.unshift(thread);
+    state.threadId = thread.id;
+    state.messages = [];
+    ui.title.textContent = thread.title;
+    ui.thread.innerHTML = '';
+    renderHistory();
+    renderThreads();
+    closeNav();
+    ui.input.focus();
+    return thread;
+  };
+
+  const sendReal = async (text) => {
+    if (!state.threadId) await createThread();
+    const userRow = make('div', 'msg user');
+    userRow.append(make('div', 'avatar', '你'));
+    const bubble = make('div', 'bubble');
+    const body = make('div', 'text');
+    body.textContent = text;
+    bubble.append(body);
+    userRow.append(bubble);
+    if ($('.empty')) ui.thread.innerHTML = '';
+    ui.thread.append(userRow);
+    state.messages.push({ role: 'user', text, createdAt: new Date().toISOString() });
+    scrollToBottom();
+
+    setRunning(true);
+    currentTurn = null;
+    try {
+      const run = await api('/v1/runs', {
+        method: 'POST',
+        body: JSON.stringify({ threadId: state.threadId, prompt: text }),
+      });
+      state.lastModel = run.model;
+      state.running = { id: run.id };
+      if (run.degraded) {
+        // 配额降级：先给出提示，事件流里不会重复
+        setTimeout(() => {
+          if (currentTurn) addNotice(currentTurn, '本周次数已用完，这次用快速模型跑');
+        }, 60);
+      }
+      listen(run.id);
+      refreshUsage();
+    } catch (error) {
+      setRunning(false);
+      showBanner('<span>⚠︎</span><div><b>没能发起运行</b> · ' + esc(error.message) + '</div>');
+    }
+  };
+
+  const closeStream = () => {
+    if (state.source) {
+      state.source.close();
+      state.source = null;
+    }
+  };
+
+  const listen = (runId) => {
+    closeStream();
+    const source = new EventSource(API + '/v1/runs/' + runId + '/events');
+    state.source = source;
+    state.running = { id: runId, source };
+    source.onmessage = (event) => {
+      try { handleEvent(JSON.parse(event.data)); } catch { /* 坏包跳过 */ }
+    };
+    for (const type of ['run.started', 'run.reasoning', 'run.delta', 'run.tool_call', 'run.tool_result', 'run.approval_requested', 'run.approval_decided', 'run.fallback', 'run.error', 'run.state', 'run.done']) {
+      source.addEventListener(type, (event) => {
+        try { handleEvent(JSON.parse(event.data)); } catch { /* 坏包跳过 */ }
+      });
+    }
+    source.onerror = () => {
+      if (source.readyState === EventSource.CLOSED) {
+        if (state.source === source) state.source = null;
+        setRunning(false);
+      }
+    };
+  };
+
+  /* ---------------- 演示模式 ---------------- */
+  const demo = {
+    async run(text) {
+      if ($('.empty')) ui.thread.innerHTML = '';
+      const userRow = make('div', 'msg user');
+      userRow.append(make('div', 'avatar', '你'));
+      const bubble = make('div', 'bubble');
+      const body = make('div', 'text');
+      body.textContent = text;
+      bubble.append(body);
+      userRow.append(bubble);
+      ui.thread.append(userRow);
+      scrollToBottom();
+
+      setRunning(true);
+      state.lastModel = 'deepseek-v4-pro';
+      const at = () => new Date().toISOString();
+      const emit = (type, payload) => handleEvent({ type, at: at(), runId: 'demo', ...payload });
+
+      emit('run.started');
+      emit('run.state', { state: 'running' });
+      await sleep(260);
+
+      const thoughts = '先把这次要做的事拆开：读一眼工作区里的说明，确认项目定位，然后再决定要不要动笔。写文件属于动真格的操作，得先问过人。';
+      for (const chunk of thoughts.match(/.{1,9}/g)) {
+        emit('run.reasoning', { text: chunk });
+        await sleep(28);
+      }
+      emit('run.delta', { text: '我先看一下工作区里的文件。\n' });
+      await sleep(220);
+
+      emit('run.tool_call', { callId: 'demo_read', name: 'read_file', args: { path: 'README.md' } });
+      await sleep(650);
+      emit('run.tool_result', {
+        callId: 'demo_read', ok: true,
+        output: '# Rakko\n\n个人 agent 的执行内核与界面。品牌动物是海獭……\n\n## 工具与审批\n一个运行 = 若干轮「模型说 → 工具做 → 结果回给模型」。',
+      });
+      emit('run.delta', { text: '看明白了：这是个海獭主题的个人 agent，工具调用要过审批。\n\n我把结论写进 `notes/summary.md`，' });
+      await sleep(320);
+      emit('run.delta', { text: '这一笔会改文件，需要你点头。' });
+      await sleep(200);
+
+      const callId = 'demo_write_' + Date.now();
+      const expiresAt = new Date(Date.now() + 120000).toISOString();
+      approvals.set(callId, expiresAt);
+      emit('run.tool_call', { callId, name: 'write_file', args: { path: 'notes/summary.md', content: 'Rakko = 海獭主题的个人 agent，工具调用需审批。\n' } });
+      emit('run.approval_requested', {
+        callId, name: 'write_file', risk: 'high',
+        args: { path: 'notes/summary.md', content: 'Rakko = 海獭主题的个人 agent，工具调用需审批。\n' },
+      });
+
+      const autoDecide = params.get('decide');
+      if (autoDecide === 'allow' || autoDecide === 'deny') {
+        setTimeout(() => { if (state.demoResolve) state.demoResolve(autoDecide); }, 900);
+      }
+
+      const decision = await new Promise((resolve) => { state.demoResolve = resolve; });
+      state.demoResolve = null;
+      emit('run.approval_decided', { callId, decision });
+      approvalCards.get(callId)?.settleExternally(decision, decision === 'allow' ? '你允许了这次调用' : '你拒绝了这次调用');
+
+      if (decision === 'allow') {
+        await sleep(420);
+        emit('run.tool_result', { callId, ok: true, output: '已写入 notes/summary.md（39 字节）' });
+        emit('run.delta', { text: '\n\n写好了。总结一下：\n\n- **它是什么**：海獭主题的个人 agent，砸壳＝会用工具\n- **这次做了什么**：读 README、写笔记\n- **下一步**：接界面，把事件流画出来\n\n需要我顺手把 `notes/` 也加进 `.gitignore` 吗？' });
+      } else {
+        await sleep(300);
+        emit('run.tool_result', { callId, ok: false, output: '用户没有允许这次调用，工具未执行。' });
+        emit('run.delta', { text: '\n\n好，那就不写文件。我把结论直接放这儿：\n\n- **它是什么**：海獭主题的个人 agent，砸壳＝会用工具\n- **这次做了什么**：只读了一眼 README，没动任何文件\n\n哪天想写了再喊我。' });
+      }
+
+      await sleep(320);
+      emit('run.state', { state: 'succeeded' });
+      emit('run.done', { state: 'succeeded' });
+      setRunning(false);
+    },
+  };
+
+  /* ---------------- 输入区 ---------------- */
+  const autoGrow = () => {
+    ui.input.style.height = 'auto';
+    ui.input.style.height = Math.min(180, ui.input.scrollHeight) + 'px';
+  };
+  ui.input.addEventListener('input', autoGrow);
+  ui.input.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+      event.preventDefault();
+      submit();
+    }
+  });
+  ui.send.addEventListener('click', () => submit());
+
+  const submit = async () => {
+    const text = ui.input.value.trim();
+    if (!text || state.running) return;
+    ui.input.value = '';
+    autoGrow();
+    if (state.mode === 'demo') await demo.run(text);
+    else await sendReal(text);
+  };
+
+  ui.cancel.addEventListener('click', async () => {
+    if (state.mode === 'demo') {
+      if (state.demoResolve) state.demoResolve('deny');
+      return;
+    }
+    if (!state.running) return;
+    try {
+      await api('/v1/runs/' + state.running.id + '/cancel', { method: 'POST' });
+    } catch (error) {
+      showBanner('<span>⚠︎</span><div><b>取消失败</b> · ' + esc(error.message) + '</div>');
+    }
+  });
+
+  $('#newChat').addEventListener('click', async () => {
+    if (state.mode === 'demo') {
+      state.messages = [];
+      ui.thread.innerHTML = '';
+      renderHistory();
+      closeNav();
+      return;
+    }
+    try { await createThread(); } catch (error) {
+      showBanner('<span>⚠︎</span><div><b>建会话失败</b> · ' + esc(error.message) + '</div>');
+    }
+  });
+
+  const switchToDemo = (why) => {
+    setMode('demo', why);
+    state.messages = [];
+    state.threadId = null;
+    ui.title.textContent = '新对话';
+    ui.thread.innerHTML = '';
+    renderHistory();
+    ui.usageText.textContent = '62 / 120 次';
+    ui.usageBar.style.width = '52%';
+    ui.modelHint.textContent = 'deepseek-v4-pro → deepseek/deepseek-flash';
+    renderThreads();
+    showBanner('<span>◐</span><div><b>演示数据</b> · ' + esc(why) + '。下面是一次真实事件流的回放：思考 → 读文件 → 等你点头才写文件。</div>');
+    ui.demoBtn.hidden = true;
+
+    // ?auto=1：打开就自动跑一段，方便截图 / 手机上看流程
+    if (params.get('auto') === '1') {
+      setTimeout(() => {
+        if (!state.running) demo.run('读一下 README，把结论记成一条笔记。');
+      }, 500);
+    }
+  };
+
+  ui.demoBtn.addEventListener('click', () => switchToDemo('手动切到演示数据'));
+
+  document.addEventListener('keydown', (event) => {
+    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'n') {
+      event.preventDefault();
+      $('#newChat').click();
+    }
+  });
+
+  /* ---------------- 启动 ---------------- */
+  (async () => {
+    renderHistory();
+    if (forcedDemo) {
+      switchToDemo('没连上服务端，这里跑脚本');
+      return;
+    }
+    try {
+      const health = await Promise.race([
+        api('/health'),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('连接超时')), 1500)),
+      ]);
+      state.health = health;
+      setMode('real');
+      ui.modelHint.textContent = health.models
+        ? health.models.standard + ' → ' + health.models.fast
+        : '模型未知';
+      ui.sub.textContent = health.tools ? health.tools.length + ' 个工具 · ' + health.store + ' 存储' : '';
+      ui.banner.hidden = true;
+      await loadThreads();
+      await refreshUsage();
+      const first = state.threads[0];
+      if (first) await openThread(first.id);
+      else ui.input.focus();
+
+      if (params.get('auto') === '1' && !state.running) {
+        setTimeout(() => {
+          ui.input.value = '读一下 README.md，说说这个项目是干什么的。';
+          autoGrow();
+          submit();
+        }, 500);
+      }
+    } catch (error) {
+      switchToDemo('连不上服务端（' + API.replace(/^https?:\/\//, '') + '）');
+    }
+  })();
+})();
+</script>
+</body>
+</html>
