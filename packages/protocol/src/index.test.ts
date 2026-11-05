@@ -17,6 +17,8 @@ test('每种运行事件都能往返序列化', () => {
   const events = [
     { type: 'run.started' as const, ...base },
     { type: 'run.delta' as const, ...base, text: '海獭在砸壳' },
+    { type: 'run.reasoning' as const, ...base, text: '先看看现在是什么状态' },
+    { type: 'run.fallback' as const, ...base, from: 'deepseek-v4-pro', to: 'deepseek-flash', reason: '接口返回 503' },
     { type: 'run.tool_call' as const, ...base, callId: 'c1', name: 'shell', args: { cmd: 'ls' } },
     { type: 'run.tool_result' as const, ...base, callId: 'c1', ok: true, output: 'ok' },
     { type: 'run.state' as const, ...base, state: 'running' as const },

@@ -26,3 +26,17 @@ export {
   type ProviderRequest,
   type ProviderResult,
 } from './provider.js';
+export {
+  OpenAICompatibleProvider,
+  ProviderHttpError,
+  ProviderTimeoutError,
+  type OpenAICompatibleOptions,
+} from './providers/openai-compatible.js';
+export {
+  ProviderGateway,
+  ProviderUnavailable,
+  type GatewayChunk,
+  type GatewayRequest,
+  type ModelTier,
+  type ProviderGatewayOptions,
+} from './gateway.js';

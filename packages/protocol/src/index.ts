@@ -29,6 +29,17 @@ const at = z.string().min(1);
 export const runEventSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('run.started'), runId: id, at }),
   z.object({ type: z.literal('run.delta'), runId: id, at, text: z.string() }),
+  /** 模型的思考过程；只用于展示「正在想」，不能拼进回答 */
+  z.object({ type: z.literal('run.reasoning'), runId: id, at, text: z.string() }),
+  /** 主模型不可用，已降级到快模型 */
+  z.object({
+    type: z.literal('run.fallback'),
+    runId: id,
+    at,
+    from: z.string(),
+    to: z.string(),
+    reason: z.string(),
+  }),
   z.object({
     type: z.literal('run.tool_call'),
     runId: id,

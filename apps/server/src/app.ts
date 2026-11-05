@@ -1,6 +1,6 @@
 import Fastify, { type FastifyInstance } from 'fastify';
 
-import { FakeProvider, type ModelProvider } from '@rakko/core';
+import { FakeProvider, ProviderGateway, type ModelTier, type ModelProvider } from '@rakko/core';
 import { createRunInput, createThreadInput, type Run, type RunEvent } from '@rakko/protocol';
 
 import { MemoryStore, type RunStore } from './store.js';
@@ -9,22 +9,34 @@ const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
 
 const invalid = (issues: unknown[]) => ({ error: 'invalid_request', message: '请求体不合法', issues });
 
+export const FAKE_MODELS: Record<ModelTier, string> = { standard: 'fake-standard', fast: 'fake-fast' };
+
 export interface AppOptions {
-  provider?: ModelProvider;
   store?: RunStore;
+  gateway?: ProviderGateway;
+  /** 没给 gateway 时的便捷入口，默认假 provider */
+  provider?: ModelProvider;
 }
 
 export function createApp(options: AppOptions = {}): FastifyInstance {
   const app = Fastify({ logger: false });
   const store = options.store ?? new MemoryStore();
-  const provider = options.provider ?? new FakeProvider();
+  const gateway =
+    options.gateway ??
+    new ProviderGateway({
+      provider: options.provider ?? new FakeProvider(),
+      models: FAKE_MODELS,
+      firstChunkTimeoutMs: 5_000,
+    });
   const timers = new Set<ReturnType<typeof setInterval>>();
 
   app.get('/health', async () => ({
     ok: true,
     service: 'rakko-api',
     version: '0.1.0',
-    provider: provider.id,
+    provider: gateway.providerId,
+    models: gateway.models,
+    breakers: { standard: gateway.breakerState('standard'), fast: gateway.breakerState('fast') },
     store: store.kind,
   }));
 
@@ -63,14 +75,14 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
       return reply.code(429).send({ error: 'quota_exceeded', message: decision.reason });
     }
 
-    const degraded = decision.kind === 'degrade';
-    const model = degraded ? 'fast' : (parsed.data.model ?? 'standard');
-    const run = await store.createRun({ threadId: thread.id, prompt: parsed.data.prompt, model });
+    // 配额层面已经超了，就直接从快模型起跑，别先撞一次主模型
+    const tier: ModelTier = decision.kind === 'degrade' ? 'fast' : 'standard';
+    const run = await store.createRun({ threadId: thread.id, prompt: parsed.data.prompt, model: gateway.models[tier] });
     await store.appendMessage({ threadId: thread.id, role: 'user', text: parsed.data.prompt, runId: run.id });
 
-    void drive(run, degraded ? decision.reason : null);
+    void drive(run, tier, decision.kind === 'degrade' ? decision.reason : null);
 
-    return reply.code(202).send({ ...run, degraded });
+    return reply.code(202).send({ ...run, tier, degraded: tier === 'fast' });
   });
 
   app.get('/v1/runs/:id/events', async (request, reply) => {
@@ -105,7 +117,7 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
     return reply;
   });
 
-  async function drive(run: Run, notice: string | null): Promise<void> {
+  async function drive(run: Run, tier: ModelTier, notice: string | null): Promise<void> {
     const at = (): string => new Date().toISOString();
     const emit = (event: RunEvent): Promise<void> => store.publish(event);
 
@@ -116,10 +128,16 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
       if (notice) await emit({ type: 'run.delta', runId: run.id, at: at(), text: `（${notice}）\n` });
 
       let text = '';
-      for await (const chunk of provider.stream({ runId: run.id, prompt: run.prompt, model: run.model })) {
+      for await (const chunk of gateway.stream({ runId: run.id, prompt: run.prompt, tier })) {
         if (chunk.kind === 'delta') {
           text += chunk.text;
           await emit({ type: 'run.delta', runId: run.id, at: at(), text: chunk.text });
+        } else if (chunk.kind === 'reasoning') {
+          await emit({ type: 'run.reasoning', runId: run.id, at: at(), text: chunk.text });
+        } else if (chunk.kind === 'fallback') {
+          await store.patchRun(run.id, { model: gateway.models[chunk.to] });
+          await emit({ type: 'run.fallback', runId: run.id, at: at(), from: chunk.from, to: chunk.to, reason: chunk.reason });
+          await emit({ type: 'run.delta', runId: run.id, at: at(), text: `（${chunk.reason}）\n` });
         } else if (chunk.kind === 'tool_call') {
           await emit({
             type: 'run.tool_call',
@@ -130,7 +148,6 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
             args: chunk.args,
           });
         }
-        await sleep(5);
       }
 
       await store.appendMessage({ threadId: run.threadId, role: 'assistant', text, runId: run.id });
@@ -144,6 +161,9 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
       await emit({ type: 'run.error', runId: run.id, at: at(), message });
       await emit({ type: 'run.done', runId: run.id, at: at(), state: 'failed' });
     }
+
+    // 假 provider 也需要一点节奏，否则 SSE 一次性推完看不出流式
+    await sleep(0);
   }
 
   app.addHook('onClose', async () => {

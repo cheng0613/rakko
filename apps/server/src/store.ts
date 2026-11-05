@@ -23,7 +23,7 @@ export interface CreateRunInput {
   model: string;
 }
 
-export type RunPatch = Partial<Pick<Run, 'state' | 'error' | 'finishedAt'>>;
+export type RunPatch = Partial<Pick<Run, 'state' | 'error' | 'finishedAt' | 'model'>>;
 
 export type Listener = (event: RunEvent) => void;
 

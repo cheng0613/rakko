@@ -166,6 +166,7 @@ export class PostgresStore implements RunStore {
       .update(runs)
       .set({
         ...(patch.state ? { state: patch.state } : {}),
+        ...(patch.model ? { model: patch.model } : {}),
         ...(patch.error !== undefined ? { error: patch.error } : {}),
         ...(patch.finishedAt !== undefined ? { finishedAt: patch.finishedAt ? new Date(patch.finishedAt) : null } : {}),
         ...(patch.state === 'running' ? { startedAt: new Date() } : {}),
