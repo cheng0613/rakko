@@ -189,3 +189,38 @@ test('语义检索的 HNSW 索引确实建在库里', { skip: !databaseUrl }, as
     await handle.close();
   }
 });
+
+test('真库分页：40 条消息按 15 条一页翻完，顺序不乱', { skip: !databaseUrl }, async () => {
+  const handle = createDb(databaseUrl!, { max: 2 });
+  await migrateDb(handle);
+
+  const email = `paging-${Date.now()}@rakko.app`;
+  const store = new PostgresStore(handle, { email, plan: 'pro' });
+  await store.ready();
+
+  try {
+    const thread = await store.createThread('分页测试');
+    for (let i = 1; i <= 40; i += 1) {
+      await store.appendMessage({ threadId: thread.id, role: 'user', kind: 'text', text: `第 ${i} 条` });
+    }
+
+    const seen: string[] = [];
+    let before: number | undefined;
+    let pages = 0;
+    for (;;) {
+      const page = await store.pageMessages(thread.id, { limit: 15, ...(before ? { beforeSeq: before } : {}) });
+      seen.unshift(...page.items.map((message) => message.text));
+      pages += 1;
+      if (!page.hasMore) break;
+      before = page.items[0]?.seq;
+    }
+
+    assert.equal(pages, 3, '40 条 / 每页 15 → 15 + 15 + 10');
+    assert.equal(seen.length, 40);
+    assert.deepEqual(seen.slice(0, 3), ['第 1 条', '第 2 条', '第 3 条']);
+    assert.deepEqual(seen.slice(-2), ['第 39 条', '第 40 条'], '翻完顺序要正');
+  } finally {
+    await handle.sql`delete from users where email = ${email}`;
+    await store.close();
+  }
+});

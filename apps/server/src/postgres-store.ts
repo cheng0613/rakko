@@ -7,7 +7,7 @@
  * - 配额只认 usage_ledger 的求和，用户改不动这个数。
  */
 
-import { and, asc, desc, eq, ilike, inArray, isNotNull, isNull, or, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, ilike, inArray, isNotNull, isNull, lt, or, sql } from 'drizzle-orm';
 
 import type { DbHandle } from '@rakko/db';
 import { automations, kgEdges, kgNodes, memories, messages, runEvents, runs, skills, threads, usageLedger, users } from '@rakko/db';
@@ -41,6 +41,7 @@ const toThread = (row: typeof threads.$inferSelect): Thread => ({
 const toMessage = (row: typeof messages.$inferSelect): Message => ({
   id: row.id,
   threadId: row.threadId,
+  seq: row.seq,
   role: row.role as Message['role'],
   kind: row.kind as MessageKind,
   text: row.text,
@@ -280,6 +281,30 @@ export class PostgresStore implements RunStore {
       .where(eq(messages.threadId, threadId))
       .orderBy(asc(messages.seq));
     return rows.map(toMessage);
+  }
+
+  /**
+   * 分页取消息：比 beforeSeq 更早的 limit 条，升序返回。
+   * 多取一条来判断还有没有更早的，省一次 count。
+   */
+  async pageMessages(
+    threadId: string,
+    options: { limit: number; beforeSeq?: number },
+  ): Promise<{ items: Message[]; hasMore: boolean }> {
+    const where = options.beforeSeq
+      ? and(eq(messages.threadId, threadId), lt(messages.seq, options.beforeSeq))
+      : eq(messages.threadId, threadId);
+
+    const rows = await this.db
+      .select()
+      .from(messages)
+      .where(where)
+      .orderBy(desc(messages.seq))
+      .limit(options.limit + 1);
+
+    const hasMore = rows.length > options.limit;
+    const page = hasMore ? rows.slice(0, options.limit) : rows;
+    return { items: page.reverse().map(toMessage), hasMore };
   }
 
   async appendMessage(input: AppendMessageInput): Promise<Message> {

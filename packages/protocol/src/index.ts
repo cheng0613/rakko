@@ -112,6 +112,8 @@ export type MessageKind = (typeof MESSAGE_KINDS)[number];
 export const messageSchema = z.object({
   id,
   threadId: id,
+  /** 会话内序号，从 1 递增；分页用 before=<seq> 往前翻 */
+  seq: z.number().int().positive(),
   role: messageRoleSchema,
   kind: messageKindSchema,
   text: z.string(),
@@ -144,6 +146,13 @@ export const usageSchema = z.object({
   degradeOnExceed: z.boolean(),
 });
 export type Usage = z.infer<typeof usageSchema>;
+
+/** 消息分页：默认 30 条，最多 200 条 */
+export const messagesQuery = z.object({
+  limit: z.coerce.number().int().min(1).max(200).optional(),
+  before: z.coerce.number().int().min(1).optional(),
+});
+export type MessagesQuery = z.infer<typeof messagesQuery>;
 
 export const createThreadInput = z.object({
   title: z.string().min(1).max(120).optional(),

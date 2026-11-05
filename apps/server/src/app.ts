@@ -25,6 +25,7 @@ import {
   createMemoryInput,
   createSkillInput,
   createThreadInput,
+  messagesQuery,
   updateAutomationInput,
   updateMemoryInput,
   updateSkillInput,
@@ -44,6 +45,9 @@ import { MemoryStore, type PendingCall, type RunStore } from './store.js';
 const invalid = (issues: unknown[]) => ({ error: 'invalid_request', message: '请求体不合法', issues });
 
 export const FAKE_MODELS: Record<ModelTier, string> = { standard: 'fake-standard', fast: 'fake-fast' };
+
+/** 消息分页默认每页条数 */
+const DEFAULT_MESSAGE_PAGE = 30;
 
 export interface AppOptions {
   store?: RunStore;
@@ -352,7 +356,13 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
   app.get('/v1/threads/:id/messages', async (request, reply) => {
     const { id } = request.params as { id: string };
     if (!(await store.getThread(id))) return reply.code(404).send({ error: 'thread_not_found', message: '会话不存在' });
-    return { items: await store.listMessages(id) };
+
+    const parsed = messagesQuery.safeParse(request.query);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_query', message: 'limit / before 不合法' });
+
+    const limit = parsed.data.limit ?? DEFAULT_MESSAGE_PAGE;
+    const page = await store.pageMessages(id, { limit, beforeSeq: parsed.data.before });
+    return { items: page.items, hasMore: page.hasMore };
   });
 
   /**
@@ -849,8 +859,9 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
     await store.publish({ type: 'run.started', runId: run.id, at: at() });
     await store.publish({ type: 'run.state', runId: run.id, at: at(), state: 'running' });
 
-    // 整条会话都带上：上一轮说过什么、调过什么工具，模型都看得到
-    const history = trimHistory(buildHistory(await store.listMessages(run.threadId)));
+    // 会话历史只取最近一段（trimHistory 还要再收一次）；长会话不必整条读进内存
+    const recent = await store.pageMessages(run.threadId, { limit: 200 });
+    const history = trimHistory(buildHistory(recent.items));
     const systemPrompt = buildSystemPrompt() + (await buildSkillSection()) + (await buildMemorySection(run.prompt));
     await executeRun(run, tier, [{ role: 'system', content: systemPrompt }, ...history], null, notice);
   }
@@ -864,7 +875,7 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
 
     extracting.add(run.id);
     try {
-      const items = await store.listMessages(run.threadId);
+      const items = (await store.pageMessages(run.threadId, { limit: 40 })).items;
       const messages = buildHistory(items);
       const existing = await store.listMemories();
       const candidates = await extractMemories({
@@ -989,7 +1000,7 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
 
   /** 重启后恢复：拿库里的历史 + 还挂着的审批，接着跑 */
   async function resumeRun(run: Run, pending: PendingCall | null): Promise<void> {
-    const items = await store.listMessages(run.threadId);
+    const items = (await store.pageMessages(run.threadId, { limit: 200 })).items;
     const messages: ChatMessage[] = [
       {
         role: 'system',

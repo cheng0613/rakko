@@ -1091,3 +1091,41 @@ test('孤立实体被剪掉，不留垃圾节点', { skip: !process.env.DATABASE
     await store.close();
   }
 });
+
+test('消息分页：默认一页 30 条，往前的用 before 翻', async () => {
+  const store = new MemoryStore();
+  const provider: ModelProvider = {
+    id: 'paging',
+    async *stream() {
+      yield { kind: 'delta', text: '好。' };
+      yield { kind: 'done', finishReason: 'stop' };
+    },
+  };
+  const app = createApp({ store, provider });
+
+  const thread = (await app.inject({ method: 'POST', url: '/v1/threads', payload: { title: '长会话' } })).json();
+  for (let i = 1; i <= 45; i += 1) {
+    await store.appendMessage({ threadId: thread.id, role: i % 2 ? 'user' : 'assistant', kind: 'text', text: `第 ${i} 条` });
+  }
+
+  const first = (await app.inject({ method: 'GET', url: `/v1/threads/${thread.id}/messages` })).json();
+  assert.equal(first.items.length, 30, '默认一页 30 条');
+  assert.equal(first.hasMore, true);
+  assert.equal(first.items[0].text, '第 16 条', '返回最近的 30 条，升序');
+  assert.equal(first.items.at(-1).text, '第 45 条');
+
+  const older = (await app.inject({ method: 'GET', url: `/v1/threads/${thread.id}/messages?before=${first.items[0].seq}` })).json();
+  assert.equal(older.items.length, 15, '剩下 15 条');
+  assert.equal(older.hasMore, false);
+  assert.equal(older.items[0].text, '第 1 条');
+  assert.equal(older.items.at(-1).text, '第 15 条');
+
+  const small = (await app.inject({ method: 'GET', url: `/v1/threads/${thread.id}/messages?limit=5` })).json();
+  assert.equal(small.items.length, 5);
+  assert.deepEqual(small.items.map((m: { text: string }) => m.text), ['第 41 条', '第 42 条', '第 43 条', '第 44 条', '第 45 条']);
+
+  const bad = await app.inject({ method: 'GET', url: `/v1/threads/${thread.id}/messages?limit=0` });
+  assert.equal(bad.statusCode, 400, 'limit 越界要报错');
+
+  await app.close();
+});

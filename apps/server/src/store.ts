@@ -118,6 +118,8 @@ export interface RunStore {
   renameThread(id: string, title: string): Promise<Thread | undefined>;
   deleteThread(id: string): Promise<boolean>;
   listMessages(threadId: string): Promise<Message[]>;
+  /** 分页：取比 beforeSeq 更早的 limit 条（升序返回），hasMore 表示还有更早的 */
+  pageMessages(threadId: string, options: { limit: number; beforeSeq?: number }): Promise<{ items: Message[]; hasMore: boolean }>;
   appendMessage(input: AppendMessageInput): Promise<Message>;
   createRun(input: CreateRunInput): Promise<Run>;
   getRun(id: string): Promise<Run | undefined>;
@@ -558,10 +560,23 @@ export class MemoryStore implements RunStore {
     return this.messages.get(threadId) ?? [];
   }
 
+  async pageMessages(
+    threadId: string,
+    options: { limit: number; beforeSeq?: number },
+  ): Promise<{ items: Message[]; hasMore: boolean }> {
+    const all = this.messages.get(threadId) ?? [];
+    const end = options.beforeSeq ? all.findIndex((message) => message.seq >= options.beforeSeq!) : all.length;
+    const stop = end === -1 ? all.length : end;
+    const start = Math.max(0, stop - options.limit);
+    return { items: all.slice(start, stop), hasMore: start > 0 };
+  }
+
   async appendMessage(input: AppendMessageInput): Promise<Message> {
+    const existing = this.messages.get(input.threadId) ?? [];
     const message: Message = {
       id: randomUUID(),
       threadId: input.threadId,
+      seq: (existing.at(-1)?.seq ?? 0) + 1,
       role: input.role,
       kind: input.kind ?? 'text',
       text: input.text,
@@ -569,9 +584,8 @@ export class MemoryStore implements RunStore {
       runId: input.runId ?? null,
       createdAt: now(),
     };
-    const list = this.messages.get(input.threadId) ?? [];
-    list.push(message);
-    this.messages.set(input.threadId, list);
+    existing.push(message);
+    this.messages.set(input.threadId, existing);
 
     const thread = this.threads.get(input.threadId);
     if (thread) this.threads.set(thread.id, { ...thread, updatedAt: message.createdAt });

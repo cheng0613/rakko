@@ -732,6 +732,10 @@
   .note{display:flex;align-items:center;gap:8px;font-size:11.8px;line-height:1.5;color:var(--muted);border:1px solid var(--line);border-radius:14px;background:var(--surface-2);padding:8px 11px;margin:12px 0}
   .note .tag{flex:none}
 
+  /* 会话很长时顶部的「加载更早」：居中、安静，不抢正文 */
+  .messages .older{align-self:center;font-size:12px;padding:6px 16px;border-radius:99px}
+  .messages .older:hover{color:var(--text)}
+
   .demo-bar{display:flex;align-items:center;gap:8px;padding:9px 22px;border-bottom:1px solid var(--line);background:var(--surface-2);font-size:11.8px;color:var(--muted);flex:none}
   .demo-bar .tag{flex:none}
   .demo-bar[hidden]{display:none}
@@ -1155,6 +1159,15 @@
     demoText: $('#demoText'), modelChip: $('#modelChipText'), landDate: $('#landDate'),
   };
 
+  /** ?page=<n> 临时改每页条数，方便调试长会话 */
+  const PAGE_SIZE = Number(params.get('page')) || 0;
+  const pageQuery = (before) => {
+    const parts = [];
+    if (PAGE_SIZE > 0) parts.push('limit=' + PAGE_SIZE);
+    if (before !== undefined) parts.push('before=' + encodeURIComponent(before));
+    return parts.length > 0 ? '?' + parts.join('&') : '';
+  };
+
   const DEMO_TOOLS = [
     { name: 'read_file', risk: 'low', approval: false },
     { name: 'list_dir', risk: 'low', approval: false },
@@ -1169,6 +1182,8 @@
     threads: [],
     threadId: null,
     messages: [],
+    messagesHasMore: false,
+    loadingOlder: false,
     running: null,
     source: null,
     health: null,
@@ -1303,6 +1318,7 @@
           if (state.threadId === thread.id) {
             state.threadId = null;
             state.messages = [];
+            state.messagesHasMore = false;
             ui.messages.innerHTML = '';
             showLanding(true);
             ui.title.textContent = '对话';
@@ -1432,6 +1448,34 @@
     turn.body.append(el);
   };
 
+  /**
+   * 往前翻一页。
+   * 重点是保住视线：先量一下当前滚到哪，插进去之后再补回同样的偏移，
+   * 否则读者会觉得自己被「弹」到了会话末尾。
+   */
+  const loadOlder = async () => {
+    const first = state.messages[0];
+    if (!first || !state.threadId) return;
+    state.loadingOlder = true;
+    renderHistory();
+
+    const before = ui.messages.scrollHeight - ui.messages.scrollTop;
+    try {
+      const page = await api('/v1/threads/' + state.threadId + '/messages' + pageQuery(first.seq));
+      const items = page.items || [];
+      if (items.length > 0) {
+        state.messages = [...items, ...state.messages];
+      }
+      state.messagesHasMore = Boolean(page.hasMore);
+    } catch {
+      state.messagesHasMore = false;
+    } finally {
+      state.loadingOlder = false;
+      renderHistory();
+      ui.messages.scrollTop = ui.messages.scrollHeight - before;
+    }
+  };
+
   /* 历史：按消息类型重放 —— 工具卡、审批卡都待回原位，而不是只剩文字 */
   const renderHistory = () => {
     ui.messages.innerHTML = '';
@@ -1440,6 +1484,19 @@
       return;
     }
     showLanding(false);
+
+    // 一页装不下：顶部给个「加载更早」，往下看的同时可以往回翻
+    if (state.messagesHasMore) {
+      const older = document.createElement('button');
+      older.className = 'btn quiet older';
+      older.type = 'button';
+      older.dataset.action = 'older';
+      older.textContent = state.loadingOlder ? '正在加载…' : '加载更早的消息';
+      older.addEventListener('click', () => {
+        if (!state.loadingOlder) loadOlder();
+      });
+      ui.messages.append(older);
+    }
 
     let turn = null;
     const cards = toolCards;
@@ -1885,10 +1942,11 @@
     let latest = null;
     try {
       const [messages, detail] = await Promise.all([
-        api('/v1/threads/' + id + '/messages'),
+        api('/v1/threads/' + id + '/messages' + pageQuery()),
         api('/v1/threads/' + id),
       ]);
       state.messages = messages.items || [];
+      state.messagesHasMore = Boolean(messages.hasMore);
       latest = detail.latestRun;
       if (detail.pendingApprovals && detail.pendingApprovals.length > 0) {
         state.pendingCallId = detail.pendingApprovals[0].callId;
@@ -2909,7 +2967,10 @@
       await loadThreads();
       await loadUsage();
       try { state.settings = await api('/v1/settings'); } catch { state.settings = null; }
-      if (state.threads[0]) await openThread(state.threads[0].id);
+      // ?thread=<id> 直接打开某个会话（深链，调试截图也靠它）
+      const wantedThread = params.get('thread');
+      if (wantedThread) await openThread(wantedThread);
+      else if (state.threads[0]) await openThread(state.threads[0].id);
 
       const query = params.get('q');
       if (query) {
