@@ -872,6 +872,76 @@
           </div>
         </aside>
       </section>
+
+      <section class="view" id="view-settings">
+        <div class="grid" style="grid-template-columns:minmax(0,1fr);max-width:860px;gap:14px">
+          <article class="card">
+            <h3 style="margin:0 0 2px;font-size:14px;font-weight:560">外观</h3>
+            <p style="margin:0 0 6px;font-size:11.8px;color:var(--muted)">深浅色只跟着这台设备走，不同步到别的端</p>
+            <div class="set-row">
+              <div class="txt"><b>主题</b><span>跟随系统，或固定在浅色 / 深色</span></div>
+              <div class="seg" id="themeSeg">
+                <button data-theme-choice="auto">跟随系统</button>
+                <button data-theme-choice="light">浅色</button>
+                <button data-theme-choice="dark">深色</button>
+              </div>
+            </div>
+          </article>
+
+          <article class="card">
+            <h3 style="margin:0 0 2px;font-size:14px;font-weight:560">推理模型</h3>
+            <p style="margin:0 0 6px;font-size:11.8px;color:var(--muted)">标准档兜质量，快档兜速度；模型来自服务端配置，这里只读</p>
+            <div class="set-row">
+              <div class="txt"><b>标准档</b><span id="setModelStandard">—</span></div>
+              <span class="tag accent">默认</span>
+            </div>
+            <div class="set-row">
+              <div class="txt"><b>快档</b><span id="setModelFast">—</span></div>
+              <span class="tag">降级时使用</span>
+            </div>
+            <div class="set-row">
+              <div class="txt"><b>熔断状态</b><span>连续失败 3 次开门，30 秒后放一个探针</span></div>
+              <div style="display:flex;gap:6px" id="setBreakers"></div>
+            </div>
+          </article>
+
+          <article class="card">
+            <h3 style="margin:0 0 2px;font-size:14px;font-weight:560">计划与用量</h3>
+            <p style="margin:0 0 6px;font-size:11.8px;color:var(--muted)">按运行次数计，与 token 用量无关</p>
+            <div class="set-row">
+              <div class="txt"><b id="setPlan">—</b><span id="setUsageText">—</span></div>
+              <span class="tag mint" id="setUsageTag">生效中</span>
+            </div>
+            <div style="padding:0 0 12px">
+              <div class="kvbar"><i id="setUsageBar" style="width:0%"></i></div>
+            </div>
+            <div class="set-row">
+              <div class="txt"><b>用超了怎么办</b><span id="setDegradeHint">先降级到快模型继续跑，不中断任务</span></div>
+              <label class="switch">
+                <input type="checkbox" id="setDegrade" />
+                <span class="track"></span>
+              </label>
+            </div>
+          </article>
+
+          <article class="card">
+            <h3 style="margin:0 0 2px;font-size:14px;font-weight:560">工具</h3>
+            <p style="margin:0 0 12px;font-size:11.8px;color:var(--muted)">模型只能调用这些；标「需审批」的会先停下来问你</p>
+            <div id="setTools" style="display:flex;flex-direction:column;gap:2px"></div>
+          </article>
+
+          <article class="card">
+            <h3 style="margin:0 0 2px;font-size:14px;font-weight:560">存储</h3>
+            <p style="margin:0 0 6px;font-size:11.8px;color:var(--muted)">Postgres 是唯一事实源，进程里没有缓存副本</p>
+            <div class="set-row">
+              <div class="txt"><b>事实源</b><span id="setStore">—</span></div>
+            </div>
+            <div class="set-row">
+              <div class="txt"><b>工作区</b><span id="setWorkspace" style="word-break:break-all">—</span></div>
+            </div>
+          </article>
+        </div>
+      </section>
     </div>
   </main>
 </div>
@@ -951,6 +1021,7 @@
     const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
     document.documentElement.dataset.theme = next;
     localStorage.setItem('rakko.theme', next);
+    if (currentView === 'settings') renderSettings();
   });
 
   const toast = (text) => {
@@ -1467,6 +1538,7 @@
   };
 
   const openThread = async (id) => {
+    if (currentView !== 'chat') setView('chat');
     state.threadId = id;
     state.pendingCallId = null;
     closeStream();
@@ -1693,7 +1765,8 @@
     item.addEventListener('click', () => {
       document.querySelectorAll('.nav-item').forEach((other) => other.classList.remove('active'));
       item.classList.add('active');
-      if (item.dataset.nav !== 'chat') toast('「' + item.textContent.trim() + '」还没做，现在只有对话页');
+      if (item.dataset.nav === 'chat' || item.dataset.nav === 'settings') setView(item.dataset.nav);
+      else toast('「' + item.textContent.trim() + '」还没做');
       closeSide();
     });
   });
@@ -1720,6 +1793,102 @@
     }
     try { await createThread(); } catch (error) { toast('建会话失败：' + error.message); }
   };
+
+
+  /* ---------------- 视图切换：对话 / 设置 ---------------- */
+  const views = { chat: $('#view-chat'), settings: $('#view-settings') };
+  let currentView = 'chat';
+
+  const setView = (name) => {
+    currentView = name;
+    for (const [key, node] of Object.entries(views)) node.classList.toggle('active', key === name);
+    document.querySelectorAll('.nav-item').forEach((item) => {
+      item.classList.toggle('active', item.dataset.nav === name);
+    });
+    if (name === 'settings') {
+      ui.title.textContent = '设置';
+      ui.sub.textContent = '计划与用量、模型、工具与存储';
+      renderSettings();
+    } else {
+      ui.title.textContent = state.threadId ? (state.threads.find((t) => t.id === state.threadId)?.title || '对话') : '对话';
+      ui.sub.textContent = state.health ? (state.health.tools ? state.health.tools.length + ' 个工具' : '') + ' · ' + state.health.store + ' 存储' : '长任务会自己接着做，你可以随时插入新的指令';
+    }
+    closeSide();
+  };
+
+  const renderSettings = () => {
+    const health = state.health;
+    const usage = state.usage;
+
+    document.querySelectorAll('#themeSeg button').forEach((button) => {
+      button.classList.toggle('on', button.dataset.themeChoice === (localStorage.getItem('rakko.theme') || 'auto'));
+    });
+
+    $('#setModelStandard').textContent = health && health.models ? health.models.standard : '—';
+    $('#setModelFast').textContent = health && health.models ? health.models.fast : '—';
+
+    const breakers = $('#setBreakers');
+    breakers.innerHTML = '';
+    if (health && health.breakers) {
+      for (const [tier, status] of Object.entries(health.breakers)) {
+        const tag = make('span', 'tag ' + (status === 'closed' ? 'mint' : status === 'open' ? 'danger' : 'orange'), tier + ' · ' + (status === 'closed' ? '正常' : status === 'open' ? '熔断' : '半开'));
+        breakers.append(tag);
+      }
+    }
+
+    $('#setPlan').textContent = usage ? usage.plan + ' 计划' : '—';
+    if (usage) {
+      $('#setUsageText').textContent = '本周已用 ' + usage.used + ' / ' + usage.limit + ' 次 · 剩 ' + usage.remaining + ' 次';
+      const pct = usage.limit > 0 ? Math.min(100, Math.round((usage.used / usage.limit) * 100)) : 0;
+      $('#setUsageBar').style.width = pct + '%';
+      $('#setUsageBar').style.background = pct >= 100 ? 'var(--orange)' : 'var(--accent)';
+      $('#setDegrade').checked = usage.degradeOnExceed !== false;
+      $('#setDegradeHint').textContent = usage.degradeOnExceed === false
+        ? '用超了直接拦下，等下周重置'
+        : '先降级到快模型继续跑，不中断任务';
+    }
+
+    const tools = $('#setTools');
+    tools.innerHTML = '';
+    if (health && health.tools) {
+      for (const tool of health.tools) {
+        const row = make('div', 'set-row');
+        const txt = make('div', 'txt');
+        txt.append(make('b', undefined, tool.name));
+        txt.append(make('span', undefined, tool.risk === 'high' ? '高风险 · 会改文件或跑命令' : '低风险 · 只读'));
+        row.append(txt);
+        row.append(make('span', 'tag ' + (tool.approval ? 'danger' : 'mint'), tool.approval ? '需审批' : '直接执行'));
+        tools.append(row);
+      }
+    }
+
+    $('#setStore').textContent = health ? (health.store === 'postgres' ? 'Postgres' : '内存（重启清空）') : '—';
+    $('#setWorkspace').textContent = health ? health.workspace : '—';
+  };
+
+  document.querySelectorAll('#themeSeg button').forEach((button) => {
+    button.addEventListener('click', () => {
+      const choice = button.dataset.themeChoice;
+      localStorage.setItem('rakko.theme', choice);
+      document.documentElement.dataset.theme = choice === 'auto'
+        ? (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
+        : choice;
+      renderSettings();
+    });
+  });
+
+  $('#setDegrade').addEventListener('change', async (event) => {
+    const next = event.target.checked;
+    try {
+      await api('/v1/settings', { method: 'PATCH', body: JSON.stringify({ degradeOnExceed: next }) });
+      await loadUsage();
+      renderSettings();
+      toast(next ? '用超了会降级继续跑' : '用超了会直接拦下');
+    } catch (error) {
+      event.target.checked = !next;
+      toast('保存失败：' + error.message);
+    }
+  });
 
   const setMode = (mode, detail) => {
     state.mode = mode;
@@ -1774,6 +1943,8 @@
       await loadThreads();
       await loadUsage();
       if (state.threads[0]) await openThread(state.threads[0].id);
+
+      if (params.get('view') === 'settings') setView('settings');
 
       if (params.get('auto') === '1') {
         setTimeout(() => {

@@ -174,6 +174,17 @@ export type ApprovalDecisionInput = z.infer<typeof approvalDecisionSchema>;
 export const riskLevelSchema = z.enum(['low', 'medium', 'high']);
 export type RiskLevel = z.infer<typeof riskLevelSchema>;
 
+/** 用户设置：目前只有「用超了怎么办」，以后加别的都进这个对象 */
+export const settingsSchema = z.object({
+  degradeOnExceed: z.boolean(),
+});
+export type Settings = z.infer<typeof settingsSchema>;
+
+export const updateSettingsInput = z.object({
+  degradeOnExceed: z.boolean().optional(),
+});
+export type UpdateSettingsInput = z.infer<typeof updateSettingsInput>;
+
 /** 前端轮询 / 刷新后恢复审批卡片用 */
 export const pendingApprovalSchema = z.object({
   runId: id,

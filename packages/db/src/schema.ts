@@ -33,6 +33,8 @@ export const users = pgTable(
     displayName: text('display_name').notNull(),
     /** free | pro | team */
     plan: text('plan').notNull().default('free'),
+    /** 用户级设置（目前是 degradeOnExceed） */
+    settings: jsonb('settings').notNull().default({}),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [uniqueIndex('users_email_uq').on(table.email)],

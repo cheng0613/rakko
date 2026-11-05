@@ -158,6 +158,10 @@ node --env-file=.env apps/server/dist/index.js   # 然后开 http://127.0.0.1:87
   全部来自 `/health` 与事件流，不是写死的装饰；
 - **用量**：`/v1/usage` 落成侧栏底部那一条（次数制，回写 `usage_ledger`）。
 
+**设置页**（侧栏「设置」）展示的全是这台机器上真实生效的值：主题、标准/快档模型与熔断状态、
+计划与用量（次数制，带进度条）、「用超了怎么办」开关、已挂载工具及风险、事实源与工作区。
+那个开关是真会落库的（`users.settings`），改完 `/v1/usage` 立刻跟着变。
+
 **这一轮只做桌面**（1440 基准，设计稿也是按桌面画的）。不为手机做布局、不写移动端覆盖；
 设计稿样式表里的断点（≤1180 收右栏、≤980 抽屉）随样式表免费带着，能兜住但不打磨。
 
@@ -189,6 +193,8 @@ node --env-file=.env apps/server/dist/index.js   # 然后开 http://127.0.0.1:87
 ```
 GET  /health                                   服务、provider、模型、熔断、工具、等待中的审批
 GET  /v1/usage                                 配额（次数制，来自 usage_ledger）
+GET  /v1/settings                              用户设置（degradeOnExceed）
+PATCH /v1/settings                             改设置（目前只认 degradeOnExceed）
 GET  /v1/threads                               会话列表
 POST /v1/threads                               新建会话
 GET  /v1/threads/:id                           线程 + 最近一次运行 + 待批调用（刷新后据此接着看流）

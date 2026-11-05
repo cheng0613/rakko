@@ -12,7 +12,7 @@ import { and, asc, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import type { DbHandle } from '@rakko/db';
 import { messages, runEvents, runs, threads, usageLedger, users } from '@rakko/db';
 import { currentPeriod, decideQuota, periodStart, planLimit, type QuotaDecision } from '@rakko/core';
-import type { Message, MessageKind, RiskLevel, Run, RunEvent, RunState, Thread, Usage } from '@rakko/protocol';
+import type { Message, MessageKind, RiskLevel, Run, RunEvent, RunState, Settings, Thread, Usage } from '@rakko/protocol';
 
 import type { AppendMessageInput, CreateRunInput, Listener, PendingCall, ResumableRun, RunPatch, RunStore } from './store.js';
 
@@ -275,6 +275,25 @@ export class PostgresStore implements RunStore {
     return decideQuota({ limit: usage.limit, used: usage.used, degradeOnExceed: usage.degradeOnExceed });
   }
 
+  async getSettings(): Promise<Settings> {
+    const [user] = await this.db.select().from(users).where(eq(users.id, this.requireUserId())).limit(1);
+    const raw = (user?.settings ?? {}) as Partial<Settings>;
+    return { degradeOnExceed: typeof raw.degradeOnExceed === 'boolean' ? raw.degradeOnExceed : this.degradeOnExceed };
+  }
+
+  async updateSettings(patch: Partial<Settings>): Promise<Settings> {
+    const current = await this.getSettings();
+    const next: Settings = {
+      degradeOnExceed: typeof patch.degradeOnExceed === 'boolean' ? patch.degradeOnExceed : current.degradeOnExceed,
+    };
+    // 只认白名单里的键，别的脏数据不写进去
+    await this.db
+      .update(users)
+      .set({ settings: sql`coalesce(${users.settings}, '{}'::jsonb) || ${JSON.stringify({ degradeOnExceed: next.degradeOnExceed })}::jsonb` })
+      .where(eq(users.id, this.requireUserId()));
+    return next;
+  }
+
   async chargeRun(run: Run): Promise<void> {
     await this.db.insert(usageLedger).values({
       userId: this.requireUserId(),
@@ -298,6 +317,7 @@ export class PostgresStore implements RunStore {
 
     const used = Number(row?.total ?? 0);
     const limit = planLimit(user.plan);
+    const settings = await this.getSettings();
 
     return {
       plan: planLabel(user.plan),
@@ -305,7 +325,7 @@ export class PostgresStore implements RunStore {
       used,
       remaining: Math.max(0, limit - used),
       periodStart: periodStart(),
-      degradeOnExceed: this.degradeOnExceed,
+      degradeOnExceed: settings.degradeOnExceed,
     };
   }
 

@@ -8,7 +8,7 @@
 import { randomUUID } from 'node:crypto';
 
 import { currentPeriod, decideQuota, periodStart, planLimit, type QuotaDecision, type QuotaState } from '@rakko/core';
-import type { Message, MessageKind, MessageRole, RiskLevel, Run, RunEvent, Thread, Usage } from '@rakko/protocol';
+import type { Message, MessageKind, MessageRole, RiskLevel, Run, RunEvent, Settings, Thread, Usage } from '@rakko/protocol';
 
 export interface AppendMessageInput {
   threadId: string;
@@ -55,6 +55,9 @@ export interface RunStore {
   resumableRuns(): Promise<ResumableRun[]>;
   /** 线程最近一次运行，界面刷新后据此决定要不要接着看流 */
   latestRunForThread(threadId: string): Promise<Run | undefined>;
+  /** 用户设置（用超了降级还是拦下） */
+  getSettings(): Promise<Settings>;
+  updateSettings(patch: Partial<Settings>): Promise<Settings>;
   listThreads(): Promise<Thread[]>;
   getThread(id: string): Promise<Thread | undefined>;
   createThread(title?: string): Promise<Thread>;
@@ -110,6 +113,17 @@ export class MemoryStore implements RunStore {
 
   async resumableRuns(): Promise<ResumableRun[]> {
     return [];
+  }
+
+  async getSettings(): Promise<Settings> {
+    return { degradeOnExceed: this.quota.degradeOnExceed };
+  }
+
+  async updateSettings(patch: Partial<Settings>): Promise<Settings> {
+    if (typeof patch.degradeOnExceed === 'boolean') {
+      this.quota = { ...this.quota, degradeOnExceed: patch.degradeOnExceed };
+    }
+    return this.getSettings();
   }
 
   async latestRunForThread(threadId: string): Promise<Run | undefined> {

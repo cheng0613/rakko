@@ -425,3 +425,24 @@ test('重启后停在等待审批的运行能接着批，把工具跑完', { ski
   await handle.sql`delete from users where email = ${email}`;
   await store2.close();
 });
+
+test('设置可读可改：用超了到底降级还是拦下，用户自己定', async () => {
+  const store = new MemoryStore({ used: 120 });
+  const app = makeApp({ store });
+
+  const before = (await app.inject({ method: 'GET', url: '/v1/settings' })).json();
+  assert.equal(before.degradeOnExceed, true);
+
+  const patched = await app.inject({ method: 'PATCH', url: '/v1/settings', payload: { degradeOnExceed: false } });
+  assert.equal(patched.statusCode, 200);
+  assert.equal(patched.json().degradeOnExceed, false);
+
+  // 配额已满 + 不降级 → 直接 429
+  const thread = (await app.inject({ method: 'POST', url: '/v1/threads', payload: {} })).json();
+  const blocked = await app.inject({ method: 'POST', url: '/v1/runs', payload: { threadId: thread.id, prompt: '还能跑吗' } });
+  assert.equal(blocked.statusCode, 429);
+
+  const empty = await app.inject({ method: 'PATCH', url: '/v1/settings', payload: {} });
+  assert.equal(empty.statusCode, 400);
+  await app.close();
+});

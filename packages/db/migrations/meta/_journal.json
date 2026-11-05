@@ -15,6 +15,13 @@
       "when": 1793849316353,
       "tag": "0001_faulty_preak",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1793849852754,
+      "tag": "0002_low_nicolaos",
+      "breakpoints": true
     }
   ]
 }

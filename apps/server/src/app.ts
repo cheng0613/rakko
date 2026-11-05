@@ -18,6 +18,7 @@ import {
   approvalDecisionSchema,
   createRunInput,
   createThreadInput,
+  updateSettingsInput,
   type Message,
   type Run,
   type RunEvent,
@@ -94,6 +95,17 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
   });
 
   app.get('/v1/usage', async () => store.usage());
+
+  app.get('/v1/settings', async () => store.getSettings());
+
+  app.patch('/v1/settings', async (request, reply) => {
+    const parsed = updateSettingsInput.safeParse(request.body ?? {});
+    if (!parsed.success) return reply.code(400).send(invalid(parsed.error.issues));
+    if (Object.keys(parsed.data).length === 0) {
+      return reply.code(400).send({ error: 'invalid_request', message: '没有要改的设置项' });
+    }
+    return store.updateSettings(parsed.data);
+  });
 
   app.get('/v1/threads', async () => ({ items: await store.listThreads() }));
 
