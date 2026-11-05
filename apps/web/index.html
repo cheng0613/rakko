@@ -821,6 +821,12 @@
   .app-line.me::before{content:'你 · ';color:var(--faint);font-size:10.5px}
   .app-line.sys{color:var(--faint);font-size:11px}
   .app-line.err{color:var(--danger);font-size:11.5px}
+  .app-approval{border:1px solid var(--line-strong);border-radius:14px;background:var(--surface);padding:10px 12px;display:flex;flex-direction:column;gap:8px}
+  .app-approval.done{opacity:.55}
+  .app-approval-head{display:flex;align-items:center;gap:8px;font-size:12px}
+  .app-approval-head b{font-weight:590}
+  .app-approval-actions{display:flex;gap:8px;flex-wrap:wrap}
+  .app-approval-actions .g-btn{font-size:11.5px;padding:4px 11px}
   .app-composer{flex:none;display:flex;gap:8px;align-items:flex-end;padding:10px 12px 14px;border-top:1px solid var(--line)}
   .app-composer textarea{flex:1;font:inherit;font-size:12.5px;line-height:1.5;max-height:88px;min-height:36px;resize:none;border:1px solid var(--line);border-radius:16px;background:var(--surface);color:var(--text);padding:8px 12px;outline:none}
   .app-composer textarea:focus{border-color:var(--accent)}
@@ -838,6 +844,11 @@
   .g-stack{display:flex;flex-direction:column;gap:8px}
   .g-row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
   .g-list{margin:0;padding-left:18px;font-size:13px;line-height:1.6;color:var(--text-2);display:flex;flex-direction:column;gap:4px}
+  .g-table-wrap{overflow-x:auto}
+  /* 窄窗口里表格要挤得下：数字列不换行，任务列允许折两行 */
+  .app-window .g-table{font-size:11.5px}
+  .app-window .g-table th,.app-window .g-table td{padding:6px 4px;white-space:nowrap}
+  .app-window .g-table td:nth-child(2),.app-window .g-table th:nth-child(2){white-space:normal;max-width:118px}
   .g-table{width:100%;border-collapse:collapse;font-size:12.5px}
   .g-table th{text-align:left;font-weight:560;color:var(--muted);font-size:11px;padding:6px 8px;border-bottom:1px solid var(--line-strong)}
   .g-table td{padding:7px 8px;border-bottom:1px solid var(--line);color:var(--text-2)}
@@ -2410,6 +2421,42 @@
         return true;
       };
 
+      /**
+       * 应用里的审批卡：跑在同一个窗口里，不用回主对话。
+       * 点了就把卡片收起来（按钮禁用），避免重复提交。
+       */
+      const askApproval = (pending) =>
+        new Promise((resolve) => {
+          const card = gEl('div', 'app-approval');
+          const head = gEl('div', 'app-approval-head');
+          head.append(
+            gEl('b', undefined, pending.name || '工具'),
+            gEl('span', 'g-caption', pending.risk === 'high' ? '高风险' : '需要确认'),
+          );
+          card.append(head);
+
+          const hint = traceArgs(pending.args || {});
+          if (hint) card.append(gEl('div', 'g-caption', hint));
+
+          const row = gEl('div', 'app-approval-actions');
+          const choice = (label, decision, scope) => {
+            const btn = gEl('button', 'g-btn', label);
+            btn.type = 'button';
+            if (decision === 'allow') btn.dataset.on = '1';
+            btn.addEventListener('click', () => {
+              for (const other of row.querySelectorAll('button')) other.disabled = true;
+              card.classList.add('done');
+              resolve({ decision, ...(scope ? { scope } : {}) });
+            });
+            return btn;
+          };
+          row.append(choice('允许这次', 'allow'), choice('允许这类', 'allow', 'always'), choice('拒绝', 'deny'));
+          card.append(row);
+
+          log.append(card);
+          log.scrollTop = log.scrollHeight;
+        });
+
       /** 把话发给它：跑一轮，把输出抄到下面的对话里，界面跟着更新 */
       const drive = async (text) => {
         if (!text) return;
@@ -2435,9 +2482,14 @@
             (app.description ? '（' + app.description + '）' : '') +
             '\n当前界面（genui 组件树）：' +
             (spec.length > 4000 ? spec.slice(0, 4000) + '…' : spec) +
-            '\n\n请按我的要求修改这个应用，改完用 save_app 保存，name 仍然是「' + app.name + '」。' +
-            '界面要能自己用起来（表格/按钮/表单），不要只放一段说明文字。' +
+            '\n\n如果我的要求是改界面：改完用 save_app 保存，name 仍然是「' + app.name + '」，' +
+            '界面要能自己用起来（表格/按钮/表单），别只放一段说明文字。' +
+            '如果我只是问问题、或者让你做别的事，就不要动这个应用。' +
             '\n\n我的要求：';
+
+          // 先把游标放到这条线程的末尾，否则每次都会把历史再抄一遍到窗口里
+          const head = await api('/v1/threads/' + app.threadId + '/messages?limit=1');
+          let cursor = (head.items || []).at(-1)?.seq ?? 0;
 
           const run = await api('/v1/runs', {
             method: 'POST',
@@ -2445,7 +2497,6 @@
           });
 
           const startedAt = Date.now();
-          let cursor = 0;
           let lastTextAt = 0;
           for (;;) {
             await sleep(1000);
@@ -2468,8 +2519,18 @@
             }
 
             if (state.state === 'waiting_approval') {
-              line('这次它要动工具，需要你允许 —— 到左边的对话里点一下', 'err');
-              break;
+              const pending = (state.pendingApprovals || [])[0];
+              if (!pending) {
+                line('它在等审批，但没拿到审批项', 'err');
+                break;
+              }
+              const decision = await askApproval(pending);
+              await api('/v1/runs/' + run.id + '/approvals/' + pending.callId, {
+                method: 'POST',
+                body: JSON.stringify(decision),
+              });
+              line(decision.decision === 'allow' ? '你允许了 ' + pending.name : '你拒绝了 ' + pending.name, 'sys');
+              continue;
             }
             if (['succeeded', 'failed', 'canceled'].includes(state.state)) {
               if (state.state === 'failed') line(state.error || '这次没跑完', 'err');
@@ -2660,7 +2721,7 @@
           body.append(tr);
         }
         table.append(head, body);
-        const wrap = gEl('div');
+        const wrap = gEl('div', 'g-table-wrap');
         wrap.append(table);
         if (props.caption) wrap.append(gEl('div', 'g-caption', fill(props.caption)));
         return wrap;

@@ -77,6 +77,12 @@
   .line.me::before{content:'你 · ';color:var(--faint);font-size:10.5px}
   .line.sys{color:var(--faint);font-size:11px}
   .typing{color:var(--faint);font-size:11.5px}
+  .approval{border:1px solid var(--line-strong);border-radius:14px;background:var(--surface);padding:10px 12px;display:flex;flex-direction:column;gap:8px}
+  .approval.done{opacity:.55}
+  .approval-head{display:flex;align-items:center;gap:8px;font-size:12px}
+  .approval-head b{font-weight:590}
+  .approval .row{display:flex;gap:8px;flex-wrap:wrap}
+  .approval .btn{font-size:11.5px;padding:4px 11px}
 
   form.composer{flex:none;display:flex;gap:8px;align-items:flex-end;padding:10px 12px calc(12px + env(safe-area-inset-bottom));
                 border-top:1px solid var(--line);background:var(--bg)}
@@ -270,6 +276,43 @@
 
     await new Promise((resolve) => setTimeout(resolve, 900));
     thinking.remove();
+
+    if (/写|文件|保存/.test(text)) {
+      const card = el('div', 'approval');
+      const head = el('div', 'approval-head');
+      head.append(el('b', undefined, 'write_file'), el('span', 'muted', '高风险'));
+      card.append(head, el('div', 'muted', 'path=notes/summary.md'));
+      const row = el('div', 'row');
+      const allow = el('button', 'btn', '允许这次');
+      allow.type = 'button';
+      allow.dataset.on = '1';
+      const always = el('button', 'btn', '允许这类');
+      always.type = 'button';
+      const deny = el('button', 'btn', '拒绝');
+      deny.type = 'button';
+      row.append(allow, always, deny);
+      card.append(row);
+      log.append(card);
+      log.scrollTop = log.scrollHeight;
+
+      allow.addEventListener('click', () => {
+        for (const b of row.querySelectorAll('button')) b.disabled = true;
+        card.classList.add('done');
+        line('你允许了 write_file', 'sys');
+        line('写好了：notes/summary.md（4 行）。界面没动，只动了文件。', '');
+      });
+      always.addEventListener('click', () => {
+        for (const b of row.querySelectorAll('button')) b.disabled = true;
+        card.classList.add('done');
+        line('你允许了 write_file，这类以后不再问', 'sys');
+      });
+      deny.addEventListener('click', () => {
+        for (const b of row.querySelectorAll('button')) b.disabled = true;
+        card.classList.add('done');
+        line('你拒绝了 write_file，这次运行就在这儿停下', 'sys');
+      });
+      return;
+    }
 
     if (/失败/.test(text)) {
       state.result = '失败';
