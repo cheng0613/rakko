@@ -88,7 +88,7 @@ test('状态机拒绝越过终态', () => {
 test('假 provider 的流以 done 收尾', async () => {
   const provider = new FakeProvider();
   const chunks = [];
-  for await (const chunk of provider.stream({ runId: 'r1', prompt: '看看构建', model: 'fast' })) {
+  for await (const chunk of provider.stream({ runId: 'r1', messages: [{ role: 'user', content: '看看构建' }], model: 'fast' })) {
     chunks.push(chunk);
   }
   assert.equal(chunks.at(-1)?.kind, 'done');

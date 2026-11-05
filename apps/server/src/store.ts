@@ -32,6 +32,8 @@ export interface RunStore {
   readonly kind: 'memory' | 'postgres';
   /** 建连接、迁移、准备默认用户 */
   ready(): Promise<void>;
+  /** 进程重启后，把停在半路的运行标成失败（否则会永远挂在 waiting_approval） */
+  recoverOrphans(): Promise<number>;
   listThreads(): Promise<Thread[]>;
   getThread(id: string): Promise<Thread | undefined>;
   createThread(title?: string): Promise<Thread>;
@@ -66,6 +68,10 @@ export class MemoryStore implements RunStore {
   async ready(): Promise<void> {}
 
   async close(): Promise<void> {}
+
+  async recoverOrphans(): Promise<number> {
+    return 0;
+  }
 
   async listThreads(): Promise<Thread[]> {
     return [...this.threads.values()].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));

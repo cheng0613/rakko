@@ -1,8 +1,8 @@
 import { createDb, migrateDb } from '@rakko/db';
-import { FakeProvider, OpenAICompatibleProvider, ProviderGateway } from '@rakko/core';
+import { createBuiltinTools, FakeProvider, OpenAICompatibleProvider, ProviderGateway, ToolRegistry } from '@rakko/core';
 
 import { createApp, FAKE_MODELS } from './app.js';
-import { loadProviderSettings } from './config.js';
+import { loadAgentSettings, loadProviderSettings } from './config.js';
 import { PostgresStore } from './postgres-store.js';
 import { MemoryStore, type RunStore } from './store.js';
 
@@ -20,6 +20,8 @@ if (databaseUrl) {
   await postgres.ready();
   store = postgres;
   console.log('存储：Postgres 就绪（九张表已建，默认用户已就位）');
+  const recovered = await postgres.recoverOrphans();
+  if (recovered > 0) console.log(`存储：清理了 ${recovered} 个上次没跑完的运行`);
 } else {
   store = new MemoryStore();
   console.log('存储：内存（未配置 DATABASE_URL，重启即清空）');
@@ -43,7 +45,24 @@ if (hasKey) {
   console.log('模型：假 provider（未配置 RAKKO_API_KEY，输出是固定文本）');
 }
 
-const app = createApp({ store, gateway });
+const agentSettings = loadAgentSettings();
+const tools = new ToolRegistry({ workspace: agentSettings.workspace });
+for (const tool of createBuiltinTools({ workspace: agentSettings.workspace, shellTimeoutMs: agentSettings.shellTimeoutMs })) {
+  tools.register(tool);
+}
+
+console.log(`工作区：${agentSettings.workspace}`);
+console.log(`工具：${tools.list().map((tool) => `${tool.name}(${tool.risk})`).join(' ')}
+  审批超时 ${Math.round(agentSettings.approvalTimeoutMs / 1000)}s · 最多 ${agentSettings.maxSteps} 轮`);
+
+const app = createApp({
+  store,
+  gateway,
+  tools,
+  workspace: agentSettings.workspace,
+  approvalTimeoutMs: agentSettings.approvalTimeoutMs,
+  maxSteps: agentSettings.maxSteps,
+});
 
 const shutdown = async (signal: string): Promise<void> => {
   console.log(`收到 ${signal}，正在退出…`);

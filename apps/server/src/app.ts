@@ -1,11 +1,25 @@
 import Fastify, { type FastifyInstance } from 'fastify';
 
-import { FakeProvider, ProviderGateway, type ModelTier, type ModelProvider } from '@rakko/core';
-import { createRunInput, createThreadInput, type Run, type RunEvent } from '@rakko/protocol';
+import {
+  AgentLoop,
+  ApprovalGate,
+  createBuiltinTools,
+  FakeProvider,
+  ProviderGateway,
+  ToolRegistry,
+  type ModelProvider,
+  type ModelTier,
+} from '@rakko/core';
+import {
+  approvalDecisionSchema,
+  createRunInput,
+  createThreadInput,
+  type Run,
+  type RunEvent,
+  type RunState,
+} from '@rakko/protocol';
 
 import { MemoryStore, type RunStore } from './store.js';
-
-const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 const invalid = (issues: unknown[]) => ({ error: 'invalid_request', message: '请求体不合法', issues });
 
@@ -16,6 +30,11 @@ export interface AppOptions {
   gateway?: ProviderGateway;
   /** 没给 gateway 时的便捷入口，默认假 provider */
   provider?: ModelProvider;
+  /** 不传就用工作区的内置工具（读、列、写、跑命令） */
+  tools?: ToolRegistry;
+  workspace?: string;
+  approvalTimeoutMs?: number;
+  maxSteps?: number;
 }
 
 export function createApp(options: AppOptions = {}): FastifyInstance {
@@ -28,16 +47,31 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
       models: FAKE_MODELS,
       firstChunkTimeoutMs: 5_000,
     });
+
+  const workspace = options.workspace ?? process.cwd();
+  const tools = options.tools ?? new ToolRegistry({ workspace });
+  if (!options.tools) {
+    for (const tool of createBuiltinTools({ workspace })) tools.register(tool);
+  }
+
+  const gate = new ApprovalGate({ timeoutMs: options.approvalTimeoutMs ?? 10 * 60_000 });
+  const loop = new AgentLoop(gateway, tools, { maxSteps: options.maxSteps ?? 6 });
+
   const timers = new Set<ReturnType<typeof setInterval>>();
+  const controllers = new Map<string, AbortController>();
+  const canceled = new Set<string>();
 
   app.get('/health', async () => ({
     ok: true,
     service: 'rakko-api',
-    version: '0.1.0',
+    version: '0.2.0',
     provider: gateway.providerId,
     models: gateway.models,
     breakers: { standard: gateway.breakerState('standard'), fast: gateway.breakerState('fast') },
     store: store.kind,
+    workspace,
+    tools: tools.list().map((tool) => ({ name: tool.name, risk: tool.risk, approval: tool.requiresApproval })),
+    pendingApprovals: gate.size,
   }));
 
   app.get('/v1/usage', async () => store.usage());
@@ -60,7 +94,7 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
     const { id } = request.params as { id: string };
     const run = await store.getRun(id);
     if (!run) return reply.code(404).send({ error: 'run_not_found', message: '运行不存在' });
-    return run;
+    return { ...run, pendingApprovals: gate.list(id) };
   });
 
   app.post('/v1/runs', async (request, reply) => {
@@ -83,6 +117,39 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
     void drive(run, tier, decision.kind === 'degrade' ? decision.reason : null);
 
     return reply.code(202).send({ ...run, tier, degraded: tier === 'fast' });
+  });
+
+  /** 人在界面上点「允许 / 拒绝」。只能二选一，不允许改参数。 */
+  app.post('/v1/runs/:id/approvals/:callId', async (request, reply) => {
+    const { id, callId } = request.params as { id: string; callId: string };
+    const parsed = approvalDecisionSchema.safeParse(request.body ?? {});
+    if (!parsed.success) return reply.code(400).send(invalid(parsed.error.issues));
+
+    const decided = gate.decide(id, callId, {
+      decision: parsed.data.decision,
+      ...(parsed.data.reason ? { reason: parsed.data.reason } : {}),
+    });
+    if (!decided) {
+      return reply.code(409).send({
+        error: 'approval_gone',
+        message: '这条审批已经不在了 —— 可能已超时、已处理，或运行已结束',
+      });
+    }
+    return { ok: true, callId, decision: parsed.data.decision };
+  });
+
+  app.post('/v1/runs/:id/cancel', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const run = await store.getRun(id);
+    if (!run) return reply.code(404).send({ error: 'run_not_found', message: '运行不存在' });
+    if (['succeeded', 'failed', 'canceled'].includes(run.state)) {
+      return reply.code(409).send({ error: 'already_finished', message: '这次运行已经结束了' });
+    }
+
+    canceled.add(id);
+    const waiting = gate.cancelRun(id, '运行已取消，审批作废');
+    controllers.get(id)?.abort();
+    return { ok: true, releasedApprovals: waiting };
   });
 
   app.get('/v1/runs/:id/events', async (request, reply) => {
@@ -120,6 +187,14 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
   async function drive(run: Run, tier: ModelTier, notice: string | null): Promise<void> {
     const at = (): string => new Date().toISOString();
     const emit = (event: RunEvent): Promise<void> => store.publish(event);
+    const controller = new AbortController();
+    controllers.set(run.id, controller);
+
+    const finish = async (state: RunState, error?: string): Promise<void> => {
+      await store.patchRun(run.id, { state, finishedAt: at(), ...(error ? { error } : {}) });
+      await emit({ type: 'run.state', runId: run.id, at: at(), state });
+      await emit({ type: 'run.done', runId: run.id, at: at(), state });
+    };
 
     try {
       await store.patchRun(run.id, { state: 'running' });
@@ -127,48 +202,126 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
       await emit({ type: 'run.state', runId: run.id, at: at(), state: 'running' });
       if (notice) await emit({ type: 'run.delta', runId: run.id, at: at(), text: `（${notice}）\n` });
 
-      let text = '';
-      for await (const chunk of gateway.stream({ runId: run.id, prompt: run.prompt, tier })) {
-        if (chunk.kind === 'delta') {
-          text += chunk.text;
-          await emit({ type: 'run.delta', runId: run.id, at: at(), text: chunk.text });
-        } else if (chunk.kind === 'reasoning') {
-          await emit({ type: 'run.reasoning', runId: run.id, at: at(), text: chunk.text });
-        } else if (chunk.kind === 'fallback') {
-          await store.patchRun(run.id, { model: gateway.models[chunk.to] });
-          await emit({ type: 'run.fallback', runId: run.id, at: at(), from: chunk.from, to: chunk.to, reason: chunk.reason });
-          await emit({ type: 'run.delta', runId: run.id, at: at(), text: `（${chunk.reason}）\n` });
-        } else if (chunk.kind === 'tool_call') {
-          await emit({
-            type: 'run.tool_call',
-            runId: run.id,
-            at: at(),
-            callId: chunk.callId,
-            name: chunk.name,
-            args: chunk.args,
-          });
-        }
+      const outcome = await loop.run(
+        {
+          runId: run.id,
+          tier,
+          messages: [{ role: 'user', content: run.prompt }],
+          signal: controller.signal,
+        },
+        {
+          onChunk: async (chunk) => {
+            if (chunk.kind === 'delta') {
+              await emit({ type: 'run.delta', runId: run.id, at: at(), text: chunk.text });
+            } else if (chunk.kind === 'reasoning') {
+              await emit({ type: 'run.reasoning', runId: run.id, at: at(), text: chunk.text });
+            } else if (chunk.kind === 'fallback') {
+              await store.patchRun(run.id, { model: gateway.models[chunk.to] });
+              await emit({
+                type: 'run.fallback',
+                runId: run.id,
+                at: at(),
+                from: chunk.from,
+                to: chunk.to,
+                reason: chunk.reason,
+              });
+              await emit({ type: 'run.delta', runId: run.id, at: at(), text: `（${chunk.reason}）\n` });
+            }
+          },
+
+          onToolCall: async (call) => {
+            await emit({
+              type: 'run.tool_call',
+              runId: run.id,
+              at: at(),
+              callId: call.id,
+              name: call.name,
+              args: call.args,
+            });
+          },
+
+          onToolResult: async (call, result) => {
+            await emit({
+              type: 'run.tool_result',
+              runId: run.id,
+              at: at(),
+              callId: call.id,
+              ok: result.ok,
+              output: result.output,
+            });
+          },
+
+          approve: async (call, tool) => {
+            await store.patchRun(run.id, { state: 'waiting_approval' });
+            await emit({
+              type: 'run.approval_requested',
+              runId: run.id,
+              at: at(),
+              callId: call.id,
+              name: call.name,
+              risk: tool.risk,
+              args: call.args,
+            });
+
+            const decision = await gate.request({
+              runId: run.id,
+              callId: call.id,
+              name: call.name,
+              risk: tool.risk,
+              args: call.args,
+            });
+
+            await emit({
+              type: 'run.approval_decided',
+              runId: run.id,
+              at: at(),
+              callId: call.id,
+              decision: decision.decision,
+              ...(decision.reason ? { reason: decision.reason } : {}),
+            });
+
+            if (!canceled.has(run.id)) await store.patchRun(run.id, { state: 'running' });
+            return decision.decision;
+          },
+        },
+      );
+
+      if (canceled.has(run.id)) {
+        await finish('canceled');
+        return;
+      }
+      if (outcome.stopped === 'max_steps') {
+        await emit({
+          type: 'run.delta',
+          runId: run.id,
+          at: at(),
+          text: `（到步数上限 ${outcome.steps} 先停一下，等你发下一步指令）\n`,
+        });
       }
 
-      await store.appendMessage({ threadId: run.threadId, role: 'assistant', text, runId: run.id });
+      await store.appendMessage({ threadId: run.threadId, role: 'assistant', text: outcome.text, runId: run.id });
       await store.chargeRun(run);
-      await store.patchRun(run.id, { state: 'succeeded', finishedAt: at() });
-      await emit({ type: 'run.state', runId: run.id, at: at(), state: 'succeeded' });
-      await emit({ type: 'run.done', runId: run.id, at: at(), state: 'succeeded' });
+      await finish('succeeded');
     } catch (error) {
+      if (canceled.has(run.id) || controller.signal.aborted) {
+        await finish('canceled');
+        return;
+      }
       const message = error instanceof Error ? error.message : '未知错误';
-      await store.patchRun(run.id, { state: 'failed', error: message, finishedAt: at() });
       await emit({ type: 'run.error', runId: run.id, at: at(), message });
-      await emit({ type: 'run.done', runId: run.id, at: at(), state: 'failed' });
+      await finish('failed', message);
+    } finally {
+      controllers.delete(run.id);
+      canceled.delete(run.id);
     }
-
-    // 假 provider 也需要一点节奏，否则 SSE 一次性推完看不出流式
-    await sleep(0);
   }
 
   app.addHook('onClose', async () => {
     for (const timer of timers) clearInterval(timer);
     timers.clear();
+    gate.cancelAll();
+    for (const controller of controllers.values()) controller.abort();
+    controllers.clear();
   });
 
   return app;

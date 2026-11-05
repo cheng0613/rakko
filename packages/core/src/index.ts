@@ -21,10 +21,12 @@ export {
 } from './quota.js';
 export {
   FakeProvider,
+  type ChatMessage,
   type ModelProvider,
   type ProviderChunk,
   type ProviderRequest,
-  type ProviderResult,
+  type ToolCallRequest,
+  type ToolDefinition,
 } from './provider.js';
 export {
   OpenAICompatibleProvider,
@@ -40,3 +42,12 @@ export {
   type ModelTier,
   type ProviderGatewayOptions,
 } from './gateway.js';
+export { ToolRegistry, type ToolContext, type ToolResult, type ToolSpec } from './tools.js';
+export { createBuiltinTools, type BuiltinToolsOptions } from './tools/builtin.js';
+export {
+  ApprovalGate,
+  type ApprovalDecision,
+  type ApprovalGateOptions,
+  type ApprovalRequestInput,
+} from './approval.js';
+export { AgentLoop, type AgentHooks, type AgentLoopOptions, type AgentOutcome, type AgentRequest } from './agent.js';

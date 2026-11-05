@@ -23,7 +23,7 @@ const mockFetch = (rows: string[], init: { status?: number; body?: string } = {}
 
 const collect = async (provider: OpenAICompatibleProvider, prompt = '看看构建'): Promise<ProviderChunk[]> => {
   const chunks: ProviderChunk[] = [];
-  for await (const chunk of provider.stream({ runId: 'r1', prompt, model: 'deepseek-v4-pro' })) chunks.push(chunk);
+  for await (const chunk of provider.stream({ runId: 'r1', messages: [{ role: 'user', content: prompt }], model: 'deepseek-v4-pro' })) chunks.push(chunk);
   return chunks;
 };
 

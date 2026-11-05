@@ -56,6 +56,24 @@ export const runEventSchema = z.discriminatedUnion('type', [
     ok: z.boolean(),
     output: z.string(),
   }),
+  /** 高风险工具需要人来点一下 */
+  z.object({
+    type: z.literal('run.approval_requested'),
+    runId: id,
+    at,
+    callId: id,
+    name: id,
+    risk: z.enum(['low', 'medium', 'high']),
+    args: z.record(z.string(), z.unknown()),
+  }),
+  z.object({
+    type: z.literal('run.approval_decided'),
+    runId: id,
+    at,
+    callId: id,
+    decision: z.enum(['allow', 'deny']),
+    reason: z.string().optional(),
+  }),
   z.object({ type: z.literal('run.state'), runId: id, at, state: runStateSchema }),
   z.object({ type: z.literal('run.error'), runId: id, at, message: z.string(), code: z.string().optional() }),
   z.object({ type: z.literal('run.done'), runId: id, at, state: runStateSchema }),
@@ -126,6 +144,28 @@ export const apiErrorSchema = z.object({
   issues: z.array(z.unknown()).optional(),
 });
 export type ApiError = z.infer<typeof apiErrorSchema>;
+
+/** 审批：人只能给 allow / deny，不能顺手改参数。 */
+export const approvalDecisionSchema = z.object({
+  decision: z.enum(['allow', 'deny']),
+  reason: z.string().max(500).optional(),
+});
+export type ApprovalDecisionInput = z.infer<typeof approvalDecisionSchema>;
+
+export const riskLevelSchema = z.enum(['low', 'medium', 'high']);
+export type RiskLevel = z.infer<typeof riskLevelSchema>;
+
+/** 前端轮询 / 刷新后恢复审批卡片用 */
+export const pendingApprovalSchema = z.object({
+  runId: id,
+  callId: id,
+  name: z.string(),
+  risk: riskLevelSchema,
+  args: z.record(z.string(), z.unknown()),
+  requestedAt: at,
+  expiresAt: at,
+});
+export type PendingApproval = z.infer<typeof pendingApprovalSchema>;
 
 export type Parsed<T> = { ok: true; value: T } | { ok: false; reason: string };
 

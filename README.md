@@ -3,8 +3,9 @@
 个人 agent 的执行内核与界面。品牌动物是海獭（rakko）—— 砸壳、海带缠身、手拉手成筏，
 正好对应它的三件事：会用工具、能扛长任务、多端接着干。
 
-当前进度：**M0 地基 + Postgres 持久化 + 真模型接入**。九张表真的建在 Postgres 上，
-运行、消息、事件、用量全部落库；模型走 OpenAI 兼容网关，主模型不行时自动降级到快档。
+当前进度：**M0 地基 + Postgres 持久化 + 真模型接入 + 工具调用闭环**。九张表真的建在 Postgres 上，
+运行、消息、事件、用量全部落库；模型走 OpenAI 兼容网关，主模型不行时自动降级到快档；
+模型能调工具，高风险工具会真的挂起等人点「允许」。
 
 ## 已成型的决定
 
@@ -23,9 +24,9 @@
 packages/tokens     设计令牌：品牌六色 + 语义色板 + 深浅两套，唯一颜色来源
 packages/protocol   zod 契约：运行状态、九种 SSE 事件、REST DTO
 packages/genui      生成式 UI 白名单 12 组件 + 树校验 + 降级文本
-packages/core       状态机 · 熔断 · 配额规则 · provider 抽象 · 网关
+packages/core       状态机 · 熔断 · 配额规则 · provider 抽象 · 网关 · 工具执行器 · 审批闸门 · agent 循环
 packages/db         九张表的 drizzle schema、迁移、迁移执行器
-apps/server         Fastify：threads / runs / SSE / usage；内存与 Postgres 两套 Store
+apps/server         Fastify：threads / runs / SSE / approvals / usage；内存与 Postgres 两套 Store
 ```
 
 ## 命令
@@ -74,6 +75,38 @@ docker compose up -d --build                     # db + api 全容器化，api �
 
 实测：一次回答里 reasoning 事件可达几百条，用 token 换质量，所以首字超时给了 45 秒。
 
+## 工具与审批
+
+一个运行 = 若干轮「模型说 → 工具做 → 结果回给模型」。循环在 `packages/core/src/agent.ts`，
+最多 6 轮，到上限就停并告知用户，不无限自转。
+
+| 工具 | 风险 | 要审批 | 说明 |
+| --- | --- | --- | --- |
+| `read_file` | low | 否 | 读工作区里的文本文件，超过 120KB 截断 |
+| `list_dir` | low | 否 | 列目录，最多 200 项 |
+| `write_file` | high | **是** | 写文件，自动建目录 |
+| `shell` | high | **是** | 跑命令，默认 20s 超时，输出截断 8KB |
+
+三条纪律：
+
+1. **路径锁在工作区**：任何 `../` 解析到工作区外的路径直接拒，连读都不给读；
+2. **要不要审批由风险决定**，不交给模型判断；模型只能调注册过的工具，参数一律 zod 校验后才执行；
+3. **自毁类命令连审批都不给**：`rm -rf /`、`mkfs`、`dd of=/dev/`、`shutdown` 一律硬拦。
+
+审批流：
+
+```
+运行 ──▶ 模型要求 write_file
+          └─▶ 状态变 waiting_approval，推 run.approval_requested
+                ├─ 人点允许 ──▶ 执行 → run.tool_result → 模型继续
+                ├─ 人点拒绝 ──▶ 不执行，告诉模型「用户没允许」→ 模型换个做法
+                └─ 10 分钟无人理 ──▶ 自动拒绝，运行照样收尾，不会烂在那里
+```
+
+`waiting_approval` 只是等一次点击，不是失败；**被拒也不算失败**——模型会读到拒绝理由并换路子。
+进程重启时，停在 `queued` / `running` / `waiting_approval` 的运行会被标成 `failed`（“服务重启，这次运行被中断了”），
+因为已经没有进程在推它了，留着只会把界面骗成“还在跑”。
+
 ## 存储
 
 `RunStore` 是唯一接口，两套实现行为一致：
@@ -97,18 +130,21 @@ docker compose up -d --build                     # db + api 全容器化，api �
 ## 接口（M0）
 
 ```
-GET  /health                     服务、provider、模型、熔断、store 状态
-GET  /v1/usage                   配额（次数制，来自 usage_ledger）
-GET  /v1/threads                 会话列表
-POST /v1/threads                 新建会话
-GET  /v1/threads/:id/messages    会话消息
-POST /v1/runs                    发起一次运行（202，返回 tier/degraded；配额不足时 429）
-GET  /v1/runs/:id                运行状态
-GET  /v1/runs/:id/events         SSE 事件流，带 id 可续传
+GET  /health                                   服务、provider、模型、熔断、工具、等待中的审批
+GET  /v1/usage                                 配额（次数制，来自 usage_ledger）
+GET  /v1/threads                               会话列表
+POST /v1/threads                               新建会话
+GET  /v1/threads/:id/messages                  会话消息
+POST /v1/runs                                  发起运行（202，返回 tier/degraded；配额不足时 429）
+GET  /v1/runs/:id                              运行状态 + pendingApprovals
+GET  /v1/runs/:id/events                       SSE 事件流，带 id 可续传
+POST /v1/runs/:id/approvals/:callId            审批：{"decision":"allow"|"deny","reason":"…"}
+POST /v1/runs/:id/cancel                       取消运行（会把等待中的审批一并作废）
 ```
 
 事件类型：`run.started` / `run.state` / `run.reasoning` / `run.delta` / `run.tool_call` /
-`run.tool_result` / `run.fallback` / `run.error` / `run.done`。
+`run.tool_result` / `run.approval_requested` / `run.approval_decided` / `run.fallback` /
+`run.error` / `run.done`。
 
 ## 硬约束（写进代码，不写在文档里就没人守）
 
@@ -119,10 +155,13 @@ GET  /v1/runs/:id/events         SSE 事件流，带 id 可续传
 - 取消的运行不扣配额；只有真正跑完的运行进 `usage_ledger`。
 - **思考内容不许拼进回答**，它有自己的事件类型。
 - **key 只从环境变量读**，代码与仓库里不出现任何凭据；`.env` 已在 `.gitignore` 里。
+- **文件工具的路径必须落在工作区内**，越界一律拒；自毁命令连审批都不给。
+- **审批只能 allow / deny**，不允许在审批时改参数 —— 那等于让人替模型写代码。
 
 ## 下一步
 
-1. 工具调用闭环：`tool_call` 事件已有，缺真正的执行器与 `waiting_approval` 审批流。
-2. 桌面壳（Electron）与移动端（Expo）共用 `packages/protocol` 与 tokens。
-3. 界面按 `design.html` 的 AURA 稿逐屏落地，先做对话页与设置页。
-4. 自动化、技能、记忆三张表已有 schema，等对应功能进 M2 再接上。
+1. 工具补齐：`grep`、`apply_patch`、HTTP 请求，以及“同一工具连续失败就换策略”的退让逻辑。
+2. 审批持久化：现在等待中的审批只在内存里，重启即作废。要支持隔天回来再批，得落库。
+3. 桌面壳（Electron）与移动端（Expo）共用 `packages/protocol` 与 tokens。
+4. 界面按 `design.html` 的 AURA 稿逐屏落地，先做对话页（含审批卡片）与设置页。
+5. 自动化、技能、记忆三张表已有 schema，等对应功能进 M2 再接上。

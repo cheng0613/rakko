@@ -65,3 +65,29 @@ test('九张表真的写进 Postgres，重启后还读得到', { skip: !database
     await store.close();
   }
 });
+
+test('进程重启后，半路中断的运行不会被留在 waiting_approval', { skip: !databaseUrl }, async () => {
+  const handle = createDb(databaseUrl!, { max: 2 });
+  await migrateDb(handle);
+
+  const email = `orphan-test-${Date.now()}@rakko.app`;
+  const store = new PostgresStore(handle, { email, plan: 'free' });
+  await store.ready();
+
+  try {
+    const thread = await store.createThread('孤儿运行');
+    const run = await store.createRun({ threadId: thread.id, prompt: '等我审批', model: 'fast' });
+    await store.patchRun(run.id, { state: 'waiting_approval' });
+
+    const recovered = await store.recoverOrphans();
+    assert.ok(recovered >= 1);
+
+    const after = await store.getRun(run.id);
+    assert.equal(after?.state, 'failed');
+    assert.match(after?.error ?? '', /被中断/);
+    assert.ok(after?.finishedAt);
+  } finally {
+    await handle.sql`delete from users where email = ${email}`;
+    await store.close();
+  }
+});

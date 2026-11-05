@@ -5,7 +5,7 @@
  * 重试、降级、熔断都不在这里 —— 那是 ProviderGateway 的活。
  */
 
-import type { ModelProvider, ProviderChunk, ProviderRequest } from '../provider.js';
+import type { ChatMessage, ModelProvider, ProviderChunk, ProviderRequest } from '../provider.js';
 
 export interface OpenAICompatibleOptions {
   baseUrl: string;
@@ -62,6 +62,34 @@ const mapFinish = (reason: string | null | undefined): 'stop' | 'length' | 'tool
   return 'stop';
 };
 
+/** 本地消息 → 接口消息。assistant 的工具请求要还原成 tool_calls。 */
+const toWireMessages = (messages: ChatMessage[]): unknown[] =>
+  messages.map((message) => {
+    if (message.role === 'tool') {
+      return { role: 'tool', tool_call_id: message.toolCallId ?? '', content: message.content };
+    }
+    if (message.toolCalls?.length) {
+      return {
+        role: 'assistant',
+        content: message.content,
+        tool_calls: message.toolCalls.map((call) => ({
+          id: call.id,
+          type: 'function',
+          function: { name: call.name, arguments: JSON.stringify(call.args) },
+        })),
+      };
+    }
+    return { role: message.role, content: message.content };
+  });
+
+const toWireTools = (tools: ProviderRequest['tools']): unknown[] | undefined =>
+  tools?.length
+    ? tools.map((tool) => ({
+        type: 'function',
+        function: { name: tool.name, description: tool.description, parameters: tool.parameters },
+      }))
+    : undefined;
+
 export class OpenAICompatibleProvider implements ModelProvider {
   readonly id = 'openai-compatible';
   private readonly options: OpenAICompatibleOptions;
@@ -89,7 +117,8 @@ export class OpenAICompatibleProvider implements ModelProvider {
         body: JSON.stringify({
           model: request.model,
           stream: true,
-          messages: [{ role: 'user', content: request.prompt }],
+          messages: toWireMessages(request.messages),
+          ...(request.tools?.length ? { tools: toWireTools(request.tools), tool_choice: 'auto' } : {}),
           ...this.options.extraBody,
         }),
         signal: controller.signal,

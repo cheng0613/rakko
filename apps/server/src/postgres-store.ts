@@ -7,7 +7,7 @@
  * - 配额只认 usage_ledger 的求和，用户改不动这个数。
  */
 
-import { and, asc, desc, eq, isNull, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 
 import type { DbHandle } from '@rakko/db';
 import { messages, runEvents, runs, threads, usageLedger, users } from '@rakko/db';
@@ -90,6 +90,16 @@ export class PostgresStore implements RunStore {
 
   async close(): Promise<void> {
     await this.handle.close();
+  }
+
+  /** 半路被重启打断的运行没有进程在推了，留在这里会把界面骗成「还在跑」。 */
+  async recoverOrphans(): Promise<number> {
+    const rows = await this.db
+      .update(runs)
+      .set({ state: 'failed', error: '服务重启，这次运行被中断了', finishedAt: new Date() })
+      .where(inArray(runs.state, ['queued', 'running', 'waiting_approval']))
+      .returning({ id: runs.id });
+    return rows.length;
   }
 
   async listThreads(): Promise<Thread[]> {

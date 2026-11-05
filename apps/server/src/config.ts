@@ -31,3 +31,22 @@ export function loadProviderSettings(env: NodeJS.ProcessEnv = process.env): Prov
     firstChunkTimeoutMs: num(env.RAKKO_FIRST_CHUNK_MS, 45_000),
   };
 }
+
+export interface AgentSettings {
+  /** 沙箱根目录：所有文件工具都被锁在这里 */
+  workspace: string;
+  shellTimeoutMs: number;
+  /** 审批等多久自动拒绝 */
+  approvalTimeoutMs: number;
+  /** 一个运行最多几轮「模型 → 工具」 */
+  maxSteps: number;
+}
+
+export function loadAgentSettings(env: NodeJS.ProcessEnv = process.env): AgentSettings {
+  return {
+    workspace: env.RAKKO_WORKSPACE ?? process.cwd(),
+    shellTimeoutMs: num(env.RAKKO_SHELL_TIMEOUT_MS, 20_000),
+    approvalTimeoutMs: num(env.RAKKO_APPROVAL_TIMEOUT_MS, 10 * 60_000),
+    maxSteps: num(env.RAKKO_MAX_STEPS, 6),
+  };
+}

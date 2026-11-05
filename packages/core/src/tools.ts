@@ -1,0 +1,96 @@
+/**
+ * 工具注册表：白名单 + 参数校验 + 审批开关。
+ *
+ * 模型只能调用注册过的工具；参数一律用 zod 校验后才执行。
+ * 「要不要审批」由工具的 risk 决定，不交给模型自己判断。
+ */
+
+import type { RiskLevel } from '@rakko/protocol';
+import { z } from 'zod';
+
+import type { ToolCallRequest, ToolDefinition } from './provider.js';
+
+export interface ToolContext {
+  /** 所有文件路径都被限制在这个根目录里 */
+  workspace: string;
+}
+
+export interface ToolSpec {
+  name: string;
+  description: string;
+  risk: RiskLevel;
+  /** 高风险工具默认要人点一下 */
+  requiresApproval: boolean;
+  parameters: z.ZodType;
+  run: (args: never, context: ToolContext) => Promise<string>;
+}
+
+export interface ToolResult {
+  ok: boolean;
+  output: string;
+  durationMs: number;
+  /** 用户拒绝时置 true：这不是错误，是决定 */
+  denied?: boolean;
+}
+
+export type ToolInput = Omit<ToolSpec, 'run'>;
+
+export class ToolRegistry {
+  private readonly tools = new Map<string, ToolSpec>();
+  private readonly context: ToolContext;
+
+  constructor(context: ToolContext) {
+    this.context = context;
+  }
+
+  register(tool: ToolSpec): this {
+    this.tools.set(tool.name, tool);
+    return this;
+  }
+
+  get(name: string): ToolSpec | undefined {
+    return this.tools.get(name);
+  }
+
+  list(): ToolSpec[] {
+    return [...this.tools.values()];
+  }
+
+  /** 发给模型的描述，参数用 zod 转 JSON Schema，避免手写两份。 */
+  definitions(): ToolDefinition[] {
+    return this.list().map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      parameters: z.toJSONSchema(tool.parameters, { io: 'input' }),
+    }));
+  }
+
+  async execute(call: ToolCallRequest, options: { approve: () => Promise<'allow' | 'deny'> }): Promise<ToolResult> {
+    const tool = this.tools.get(call.name);
+    if (!tool) {
+      return { ok: false, output: `没有名为 ${call.name} 的工具。可用工具：${[...this.tools.keys()].join('、')}`, durationMs: 0 };
+    }
+
+    const parsed = tool.parameters.safeParse(call.args);
+    if (!parsed.success) {
+      const detail = parsed.error.issues.map((issue) => `${issue.path.join('.') || '(root)'}: ${issue.message}`).join('; ');
+      return { ok: false, output: `参数不合法：${detail}`, durationMs: 0 };
+    }
+
+    if (tool.requiresApproval) {
+      const decision = await options.approve();
+      if (decision !== 'allow') {
+        return { ok: false, denied: true, output: '用户没有允许这次调用，工具未执行。请换一个不需要审批的做法。', durationMs: 0 };
+      }
+    }
+
+    const started = Date.now();
+    try {
+      const output = await tool.run(parsed.data as never, this.context);
+      return { ok: true, output, durationMs: Date.now() - started };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '未知错误';
+      return { ok: false, output: message, durationMs: Date.now() - started };
+    }
+  }
+}

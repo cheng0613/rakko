@@ -40,7 +40,7 @@ const models = { standard: 'slow-pro', fast: 'quick-flash' };
 
 const collectKinds = async (gateway: ProviderGateway, tier: 'standard' | 'fast' = 'standard'): Promise<string[]> => {
   const kinds: string[] = [];
-  for await (const chunk of gateway.stream({ runId: 'r1', prompt: '跑一下', tier })) kinds.push(chunk.kind);
+  for await (const chunk of gateway.stream({ runId: 'r1', messages: [{ role: 'user', content: '跑一下' }], tier })) kinds.push(chunk.kind);
   return kinds;
 };
 
@@ -58,7 +58,7 @@ test('主模型还没吐字就挂了 → 降级到快模型，并明确告知原
   const gateway = new ProviderGateway({ provider, models });
 
   const chunks = [];
-  for await (const chunk of gateway.stream({ runId: 'r1', prompt: '跑一下', tier: 'standard' })) chunks.push(chunk);
+  for await (const chunk of gateway.stream({ runId: 'r1', messages: [{ role: 'user', content: '跑一下' }], tier: 'standard' })) chunks.push(chunk);
 
   assert.deepEqual(
     chunks.map((chunk) => chunk.kind),
@@ -87,7 +87,7 @@ test('已经吐出内容再挂，不换模型（否则回答会重复），直�
 
   await assert.rejects(
     async () => {
-      for await (const _chunk of gateway.stream({ runId: 'r1', prompt: '跑一下', tier: 'standard' })) {
+      for await (const _chunk of gateway.stream({ runId: 'r1', messages: [{ role: 'user', content: '跑一下' }], tier: 'standard' })) {
         // 收到前半段
       }
     },
@@ -138,7 +138,7 @@ test('首字超时也算故障，会立刻降级而不是干等', async () => {
   const gateway = new ProviderGateway({ provider, models, firstChunkTimeoutMs: 20 });
 
   const chunks = [];
-  for await (const chunk of gateway.stream({ runId: 'r1', prompt: '跑一下', tier: 'standard' })) chunks.push(chunk);
+  for await (const chunk of gateway.stream({ runId: 'r1', messages: [{ role: 'user', content: '跑一下' }], tier: 'standard' })) chunks.push(chunk);
 
   assert.equal(chunks[0]?.kind, 'fallback');
   const fallback = chunks[0];

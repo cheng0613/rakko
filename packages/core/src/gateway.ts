@@ -10,15 +10,17 @@
  */
 
 import { CircuitBreaker } from './circuit-breaker.js';
-import type { ModelProvider, ProviderChunk } from './provider.js';
+import type { ChatMessage, ModelProvider, ProviderChunk, ToolDefinition } from './provider.js';
 import { ProviderHttpError, ProviderTimeoutError } from './providers/openai-compatible.js';
 
 export type ModelTier = 'standard' | 'fast';
 
 export interface GatewayRequest {
   runId: string;
-  prompt: string;
   tier: ModelTier;
+  /** 完整对话历史：模型要看到上面几轮的工具结果 */
+  messages: ChatMessage[];
+  tools?: ToolDefinition[];
   signal?: AbortSignal;
 }
 
@@ -106,8 +108,9 @@ export class ProviderGateway {
         for await (const chunk of this.guard(
           this.provider.stream({
             runId: request.runId,
-            prompt: request.prompt,
             model: this.models[tier],
+            messages: request.messages,
+            ...(request.tools ? { tools: request.tools } : {}),
             ...(request.signal ? { signal: request.signal } : {}),
           }),
         )) {
