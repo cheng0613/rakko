@@ -57,8 +57,8 @@ export interface RunStore {
   latestRunForThread(threadId: string): Promise<Run | undefined>;
   /** 技能：可挂载的规则块 */
   listSkills(): Promise<Skill[]>;
-  createSkill(input: { name: string; description?: string; body: string }): Promise<Skill>;
-  updateSkill(id: string, patch: Partial<Pick<Skill, 'name' | 'description' | 'body'>>): Promise<Skill | undefined>;
+  createSkill(input: { name: string; description?: string; body: string; tools?: string[] }): Promise<Skill>;
+  updateSkill(id: string, patch: Partial<Pick<Skill, 'name' | 'description' | 'body' | 'tools'>>): Promise<Skill | undefined>;
   deleteSkill(id: string): Promise<boolean>;
 
   /** 记忆：跨会话留下的东西 */
@@ -108,7 +108,7 @@ const slugify = (name: string): string => {
 };
 
 /** 三个开箱可用的技能：挂上就生效，内容直接拼进系统提示 */
-export const BUILTIN_SKILLS: Array<{ slug: string; name: string; description: string; body: string }> = [
+export const BUILTIN_SKILLS: Array<{ slug: string; name: string; description: string; body: string; tools?: string[] }> = [
   {
     slug: 'code-review',
     name: '代码审查',
@@ -133,6 +133,16 @@ export const BUILTIN_SKILLS: Array<{ slug: string; name: string; description: st
       '3. 测试要能挡住回归：换个错误的实现，它应该变红。',
       '4. 边界写进测试里（并发、超时、空输入），不要只测顺利路径。',
     ].join('\n'),
+  },
+  {
+    slug: 'read-only',
+    name: '只读模式',
+    description: '只许看，不许改：禁用写文件、跑命令与发请求',
+    body: [
+      '这次运行只做只读操作：读文件、列目录、grep 搜索。',
+      '不能写文件、不能跑命令、不能发外部请求——需要动手时先把方案说清楚，等我确认。',
+    ].join('\n'),
+    tools: ['read_file', 'list_dir', 'grep'],
   },
   {
     slug: 'plain-chinese',
@@ -179,6 +189,7 @@ export class MemoryStore implements RunStore {
         name: builtin.name,
         description: builtin.description,
         body: builtin.body,
+        tools: builtin.tools ?? [],
         builtin: true,
         createdAt: now(),
       };
@@ -210,13 +221,14 @@ export class MemoryStore implements RunStore {
     });
   }
 
-  async createSkill(input: { name: string; description?: string; body: string }): Promise<Skill> {
+  async createSkill(input: { name: string; description?: string; body: string; tools?: string[] }): Promise<Skill> {
     const skill: Skill = {
       id: randomUUID(),
       slug: slugify(input.name),
       name: input.name,
       description: input.description ?? '',
       body: input.body,
+      tools: input.tools ?? [],
       builtin: false,
       createdAt: now(),
     };
@@ -224,7 +236,7 @@ export class MemoryStore implements RunStore {
     return skill;
   }
 
-  async updateSkill(id: string, patch: Partial<Pick<Skill, 'name' | 'description' | 'body'>>): Promise<Skill | undefined> {
+  async updateSkill(id: string, patch: Partial<Pick<Skill, 'name' | 'description' | 'body' | 'tools'>>): Promise<Skill | undefined> {
     const current = this.skills.get(id);
     if (!current) return undefined;
     const next: Skill = { ...current, ...patch };

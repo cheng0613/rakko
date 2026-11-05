@@ -142,6 +142,8 @@ export const skills = pgTable(
     name: text('name').notNull(),
     description: text('description').notNull(),
     body: text('body').notNull(),
+    /** 该技能允许使用的工具名；空数组表示不限制 */
+    tools: jsonb('tools').notNull().default([]),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [uniqueIndex('skills_slug_uq').on(table.slug)],

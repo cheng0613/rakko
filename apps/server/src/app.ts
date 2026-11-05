@@ -546,6 +546,24 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
     const controller = new AbortController();
     controllers.set(run.id, controller);
 
+    // 挂载的技能可以收窄工具集：声明了 tools 的技能取交集
+    const [allSkills, settings] = await Promise.all([store.listSkills(), store.getSettings()]);
+    const restricted = allSkills
+      .filter((skill) => settings.enabledSkills.includes(skill.slug) && skill.tools.length > 0)
+      .map((skill) => new Set(skill.tools));
+
+    let allowTool: ((name: string) => boolean) | undefined;
+    if (restricted.length > 0) {
+      const allowed = new Set(restricted[0]);
+      for (const set of restricted.slice(1)) {
+        for (const name of [...allowed]) if (!set.has(name)) allowed.delete(name);
+      }
+      allowTool = (name: string) => allowed.has(name);
+      const note = ['', '## 本次可用的工具', `只允许：${[...allowed].join('、')}（由挂载的技能限制）`].join('\n');
+      const first = messages[0];
+      if (first && first.role === 'system') messages[0] = { ...first, content: first.content + note };
+    }
+
     const finish = async (state: RunState, error?: string): Promise<void> => {
       await flushSegment();
       // 成功/取消都要把 error 清空：否则中途被误标过错的运行会一直挂着旧错误
@@ -757,7 +775,10 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
         });
       }
 
-      const outcome = await loop.run({ runId: run.id, tier, messages, signal: controller.signal }, hooks);
+      const outcome = await loop.run(
+        { runId: run.id, tier, messages, signal: controller.signal, ...(allowTool ? { allowTool } : {}) },
+        hooks,
+      );
 
       if (canceled.has(run.id)) {
         await finish('canceled');

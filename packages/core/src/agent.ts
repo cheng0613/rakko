@@ -28,6 +28,8 @@ export interface AgentRequest {
   tier: ModelTier;
   messages: ChatMessage[];
   signal?: AbortSignal;
+  /** 本次运行允许的工具（挂载的技能可能收窄它） */
+  allowTool?: (name: string) => boolean;
 }
 
 export interface AgentOutcome {
@@ -38,22 +40,27 @@ export interface AgentOutcome {
 
 export interface AgentLoopOptions {
   maxSteps?: number;
+  /** 只允许这些工具（由挂载的技能决定）；不传就是全部 */
+  allowTool?: (name: string) => boolean;
 }
 
 export class AgentLoop {
   private readonly gateway: ProviderGateway;
   private readonly tools: ToolRegistry;
   private readonly maxSteps: number;
+  private readonly allowTool: (name: string) => boolean;
 
   constructor(gateway: ProviderGateway, tools: ToolRegistry, options: AgentLoopOptions = {}) {
     this.gateway = gateway;
     this.tools = tools;
     this.maxSteps = options.maxSteps ?? 6;
+    this.allowTool = options.allowTool ?? (() => true);
   }
 
   async run(request: AgentRequest, hooks: AgentHooks): Promise<AgentOutcome> {
     const messages: ChatMessage[] = [...request.messages];
-    const definitions = this.tools.definitions();
+    const allow = request.allowTool ?? this.allowTool;
+    const definitions = this.tools.definitions().filter((tool) => allow(tool.name));
 
     let tier = request.tier;
     let text = '';
@@ -89,6 +96,14 @@ export class AgentLoop {
 
       for (const call of calls) {
         const tool = this.tools.get(call.name);
+        if (tool && !allow(call.name)) {
+          // 越权也要留痕：先让上层记一条 tool_call，再回一条失败结果
+          const blocked = { ok: false, output: `技能没启用 ${call.name}，换一个不越权的做法`, durationMs: 0 };
+          await hooks.onToolCall(call, tool);
+          await hooks.onToolResult(call, blocked);
+          messages.push({ role: 'tool', toolCallId: call.id, name: call.name, content: JSON.stringify(blocked) });
+          continue;
+        }
         if (!tool) {
           // 未知工具也要回一条 tool 消息，否则模型会一直等
           messages.push({

@@ -1,0 +1,8 @@
+存储：Postgres，应用迁移中…
+存储：Postgres 就绪（九张表已建，默认用户已就位）
+模型：https://tokenhub.tencentmaas.com/v1
+  标准档 deepseek-v4-pro · 快档 deepseek/deepseek-flash
+工作区：C:\Users\chiaki\Desktop\Rakko
+工具：read_file(low) list_dir(low) write_file(high) shell(high) grep(low) apply_patch(high) http(medium)
+  审批超时 600s · 最多 12 轮
+rakko-api 已启动：http://127.0.0.1:8787

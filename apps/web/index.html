@@ -923,6 +923,7 @@
             <label class="field"><span>名字</span><input id="skillName" placeholder="我的规矩" /></label>
             <label class="field"><span>一句话（可选）</span><input id="skillDesc" placeholder="什么时候该用" /></label>
             <label class="field"><span>规则</span><textarea id="skillBody" rows="4" placeholder="每次先复述需求，再给方案。"></textarea></label>
+            <label class="field"><span>限制工具（逗号分隔，留空不限制）</span><input id="skillTools" placeholder="read_file, list_dir, grep" /></label>
             <div class="auto-form-actions">
               <span class="muted">最多同时挂 3 个，每个截 1500 字</span>
               <button class="btn" id="skillCancel">取消</button>
@@ -2500,6 +2501,9 @@
 
       card.append(make('h3', undefined, item.name));
       if (item.description) card.append(make('p', 'mem-desc', item.description));
+      if (Array.isArray(item.tools) && item.tools.length > 0) {
+        card.append(make('p', 'mem-desc', '限用工具：' + item.tools.join(' · ')));
+      }
       card.append(make('p', 'mem-body', item.body));
 
       const foot = make('div', 'mem-foot');
@@ -2546,15 +2550,17 @@
     const name = $('#skillName').value.trim();
     const description = $('#skillDesc').value.trim();
     const body = $('#skillBody').value.trim();
+    const tools = $('#skillTools').value.split(',').map((item) => item.trim()).filter(Boolean);
     if (!name || !body) {
       toast('名字和规则都要填');
       return;
     }
     try {
-      await api('/v1/skills', { method: 'POST', body: JSON.stringify({ name, description, body }) });
+      await api('/v1/skills', { method: 'POST', body: JSON.stringify({ name, description, body, ...(tools.length > 0 ? { tools } : {}) }) });
       $('#skillName').value = '';
       $('#skillDesc').value = '';
       $('#skillBody').value = '';
+      $('#skillTools').value = '';
       $('#skillForm').hidden = true;
       await loadSkills();
       toast('建好了，记得挂上');

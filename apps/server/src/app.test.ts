@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 import { createDb, migrateDb } from '@rakko/db';
-import { createBuiltinTools, ProviderGateway, ToolRegistry } from '@rakko/core';
+import { createBuiltinTools, createSecondToolset, ProviderGateway, ToolRegistry } from '@rakko/core';
 import type { ModelProvider, ProviderChunk, ProviderRequest } from '@rakko/core';
 
 import { createApp, FAKE_MODELS, type AppOptions } from './app.js';
@@ -745,7 +745,7 @@ test('技能：内置三个、可挂载、挂上之后进系统提示', async ()
   const app = createApp({ store, gateway });
 
   const listed = (await app.inject({ method: 'GET', url: '/v1/skills' })).json();
-  assert.equal(listed.items.length, 3);
+  assert.equal(listed.items.length, 4);
   assert.ok(listed.items.every((item: { builtin: boolean; enabled: boolean }) => item.builtin && !item.enabled));
 
   const review = listed.items.find((item: { slug: string }) => item.slug === 'code-review');
@@ -774,5 +774,49 @@ test('技能：内置三个、可挂载、挂上之后进系统提示', async ()
   assert.equal(created.json().builtin, false);
   assert.equal((await app.inject({ method: 'DELETE', url: `/v1/skills/${review.id}` })).statusCode, 409);
   assert.equal((await app.inject({ method: 'DELETE', url: `/v1/skills/${created.json().id}` })).statusCode, 200);
+  await app.close();
+});
+
+test('技能可以收窄工具集：挂上「只读模式」就写不了文件', async () => {
+  const asked: string[][] = [];
+  const provider: ModelProvider = {
+    id: 'tool-peek',
+    async *stream(request) {
+      // 记下模型看到的工具清单
+      asked.push((request.tools ?? []).map((tool) => tool.name));
+      yield { kind: 'tool_call', callId: 'c1', name: 'write_file', args: { path: 'x.txt', content: 'y' } };
+      yield { kind: 'done', finishReason: 'tool_use' };
+    },
+  };
+
+  const store = new MemoryStore();
+  const gateway = new ProviderGateway({ provider, models: FAKE_MODELS, firstChunkTimeoutMs: 2_000 });
+
+  const workspace = await mkdtemp(path.join(tmpdir(), 'rakko-skill-tools-'));
+  const tools = new ToolRegistry({ workspace });
+  for (const tool of createBuiltinTools({ workspace })) tools.register(tool);
+  for (const tool of createSecondToolset({ workspace })) tools.register(tool);
+  const app = createApp({ store, gateway, tools, workspace });
+
+  const skills = (await app.inject({ method: 'GET', url: '/v1/skills' })).json();
+  const readOnly = skills.items.find((item: { slug: string }) => item.slug === 'read-only');
+  assert.ok(readOnly, '内置应该有一个「只读模式」');
+  assert.deepEqual(readOnly.tools, ['read_file', 'list_dir', 'grep']);
+
+  await app.inject({ method: 'PATCH', url: `/v1/skills/${readOnly.id}`, payload: { enabled: true } });
+
+  const thread = (await app.inject({ method: 'POST', url: '/v1/threads', payload: {} })).json();
+  const run = (await app.inject({ method: 'POST', url: '/v1/runs', payload: { threadId: thread.id, prompt: '帮我把结论写进文件' } })).json();
+  await waitFor(app, run.id, (body) => body.state === 'succeeded' || body.state === 'failed');
+
+  // 模型看到的工具清单里不该有写文件/跑命令
+  const firstCall = asked[0] ?? [];
+  assert.deepEqual([...firstCall].sort(), ['grep', 'list_dir', 'read_file']);
+
+  // 越权调用会被挡回来，而不是真的写盘
+  const items = await store.listMessages(thread.id);
+  const results = items.filter((item) => item.kind === 'tool_result');
+  assert.ok(results.length >= 1);
+  assert.match(String(results[0]?.payload?.output ?? ''), /技能没启用 write_file/);
   await app.close();
 });

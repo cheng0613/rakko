@@ -43,6 +43,7 @@ const toSkill = (row: typeof skills.$inferSelect): Skill => ({
   name: row.name,
   description: row.description,
   body: row.body,
+  tools: Array.isArray(row.tools) ? (row.tools as string[]) : [],
   builtin: row.userId === null,
   createdAt: row.createdAt.toISOString(),
 });
@@ -134,6 +135,7 @@ export class PostgresStore implements RunStore {
           name: builtin.name,
           description: builtin.description,
           body: builtin.body,
+          tools: builtin.tools ?? [],
         })
         .onConflictDoNothing({ target: skills.slug });
     }
@@ -363,7 +365,7 @@ export class PostgresStore implements RunStore {
     return rows.map(toSkill);
   }
 
-  async createSkill(input: { name: string; description?: string; body: string }): Promise<Skill> {
+  async createSkill(input: { name: string; description?: string; body: string; tools?: string[] }): Promise<Skill> {
     const slug = input.name
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, '-')
@@ -377,19 +379,21 @@ export class PostgresStore implements RunStore {
         name: input.name,
         description: input.description ?? '',
         body: input.body,
+        tools: input.tools ?? [],
       })
       .returning();
     if (!row) throw new Error('建技能失败');
     return toSkill(row);
   }
 
-  async updateSkill(id: string, patch: Partial<Pick<Skill, 'name' | 'description' | 'body'>>): Promise<Skill | undefined> {
+  async updateSkill(id: string, patch: Partial<Pick<Skill, 'name' | 'description' | 'body' | 'tools'>>): Promise<Skill | undefined> {
     const [row] = await this.db
       .update(skills)
       .set({
         ...(patch.name !== undefined ? { name: patch.name } : {}),
         ...(patch.description !== undefined ? { description: patch.description } : {}),
         ...(patch.body !== undefined ? { body: patch.body } : {}),
+        ...(patch.tools !== undefined ? { tools: patch.tools } : {}),
       })
       .where(and(eq(skills.id, id), eq(skills.userId, this.requireUserId())))
       .returning();

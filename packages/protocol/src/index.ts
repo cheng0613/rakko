@@ -197,6 +197,8 @@ export const skillSchema = z.object({
   body: z.string(),
   /** 内置技能不可删，但可以关掉 */
   builtin: z.boolean(),
+  /** 这个技能允许的工具名；空数组 = 不限制 */
+  tools: z.array(z.string()).default([]),
   createdAt: at,
 });
 export type Skill = z.infer<typeof skillSchema>;
@@ -205,6 +207,8 @@ export const createSkillInput = z.object({
   name: z.string().trim().min(1).max(60),
   description: z.string().trim().max(200).optional(),
   body: z.string().min(1).max(8000),
+  /** 只允许这些工具；不给就不限制 */
+  tools: z.array(z.string().trim().min(1)).max(20).optional(),
 });
 export type CreateSkillInput = z.infer<typeof createSkillInput>;
 
@@ -212,6 +216,7 @@ export const updateSkillInput = z.object({
   name: z.string().trim().min(1).max(60).optional(),
   description: z.string().trim().max(200).optional(),
   body: z.string().min(1).max(8000).optional(),
+  tools: z.array(z.string().trim().min(1)).max(20).optional(),
 });
 export type UpdateSkillInput = z.infer<typeof updateSkillInput>;
 
