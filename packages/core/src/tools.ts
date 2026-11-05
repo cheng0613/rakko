@@ -60,6 +60,11 @@ export class ToolRegistry {
     return this;
   }
 
+  /** 热重载时先摘掉旧的插件工具 */
+  unregister(name: string): boolean {
+    return this.tools.delete(name);
+  }
+
   get(name: string): ToolSpec | undefined {
     return this.tools.get(name);
   }

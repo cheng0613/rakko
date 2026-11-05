@@ -933,6 +933,24 @@
         </div>
 
         <div class="grid two" id="skillList"></div>
+
+        <div class="card" style="margin-top:16px">
+          <div class="auto-top">
+            <div class="ico">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M14.7 6.3a4 4 0 0 1-5.4 5.4L4 17v3h3l5.3-5.3a4 4 0 0 1 5.4-5.4l-2.6 2.6-2-2 2.6-2.6Z"/></svg>
+            </div>
+            <div style="min-width:0">
+              <h3 style="margin:0;font-size:13.5px;font-weight:560">工具插件</h3>
+              <p class="muted" id="pluginDir" style="margin:1px 0 0;font-size:11.8px;word-break:break-all">—</p>
+            </div>
+            <button class="btn" id="pluginReload" style="margin-left:auto">重新加载</button>
+          </div>
+          <div id="pluginList" style="display:flex;flex-direction:column;gap:2px;margin-top:10px"></div>
+          <div id="pluginErrors" style="display:flex;flex-direction:column;gap:6px;margin-top:8px"></div>
+          <p class="muted" id="pluginHint" style="margin:10px 0 0;font-size:11.5px">
+            把 .mjs 放进上面这个目录就会自动挂上；改文件会自动重载，不用重启。
+          </p>
+        </div>
       </section>
 
       <section class="view" id="view-memory">
@@ -1140,6 +1158,7 @@
     automations: [],
     memories: [],
     skills: [],
+    plugins: null,
   };
 
   /** 历史里最后一条助手消息，恢复运行时把新事件接在它后面 */
@@ -2159,6 +2178,7 @@
       ui.title.textContent = '技能';
       ui.sub.textContent = '挂上的技能会进每次运行的系统提示';
       void loadSkills();
+      void loadPlugins();
     } else {
       ui.title.textContent = state.threadId ? (state.threads.find((t) => t.id === state.threadId)?.title || '对话') : '对话';
       ui.sub.textContent = state.health ? (state.health.tools ? state.health.tools.length + ' 个工具' : '') + ' · ' + state.health.store + ' 存储' : '长任务会自己接着做，你可以随时插入新的指令';
@@ -2577,6 +2597,61 @@
       toast('建好了，记得挂上');
     } catch (error) {
       toast('保存失败：' + error.message);
+    }
+  });
+
+  /* ---------------- 工具插件 ---------------- */
+
+  const renderPlugins = () => {
+    const info = state.plugins;
+    const list = $('#pluginList');
+    const errors = $('#pluginErrors');
+    list.innerHTML = '';
+    errors.innerHTML = '';
+
+    if (!info) {
+      $('#pluginDir').textContent = '这个实例没有启用插件目录';
+      return;
+    }
+
+    $('#pluginDir').textContent = info.directory ?? '（未配置）';
+    $('#pluginHint').hidden = (info.tools?.length ?? 0) > 0;
+
+    for (const tool of info.tools ?? []) {
+      const row = make('div', 'set-row');
+      const txt = make('div', 'txt');
+      txt.append(make('b', undefined, tool.name));
+      txt.append(make('span', undefined, tool.description));
+      row.append(txt);
+      row.append(make('span', 'tag', tool.risk));
+      row.append(make('span', 'tag ' + (tool.requiresApproval ? 'danger' : 'mint'), tool.requiresApproval ? '需审批' : '直接执行'));
+      list.append(row);
+    }
+
+    for (const error of info.errors ?? []) {
+      const row = make('div', 'note');
+      row.append(make('span', 'tag danger', '跳过'));
+      row.append(make('span', undefined, `${error.file}：${error.reason}`));
+      errors.append(row);
+    }
+  };
+
+  const loadPlugins = async () => {
+    try {
+      state.plugins = await api('/v1/plugins');
+      renderPlugins();
+    } catch (error) {
+      toast('读插件失败：' + error.message);
+    }
+  };
+
+  $('#pluginReload').addEventListener('click', async () => {
+    try {
+      state.plugins = await api('/v1/plugins/reload', { method: 'POST' });
+      renderPlugins();
+      toast(`已重载：${state.plugins.tools.length} 个插件工具`);
+    } catch (error) {
+      toast('重载失败：' + error.message);
     }
   });
 

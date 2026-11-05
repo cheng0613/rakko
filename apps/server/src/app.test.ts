@@ -1,12 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 import { createDb, migrateDb } from '@rakko/db';
-import { createBuiltinTools, createSecondToolset, ProviderGateway, ToolRegistry } from '@rakko/core';
+import { createBuiltinTools, createSecondToolset, PluginHost, ProviderGateway, ToolRegistry } from '@rakko/core';
 import type { ModelProvider, ProviderChunk, ProviderRequest } from '@rakko/core';
 
 import { createApp, FAKE_MODELS, type AppOptions } from './app.js';
@@ -837,5 +837,57 @@ test('挂载的技能限制工具时，/health 会说出来', async () => {
 
   const after = (await app.inject({ method: 'GET', url: '/health' })).json();
   assert.deepEqual([...after.restrictedTools].sort(), ['grep', 'list_dir', 'read_file']);
+  await app.close();
+});
+
+test('插件接口：列表 + 手动重载能拿到新文件', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'rakko-plugin-api-'));
+  await writeFile(
+    path.join(dir, 'first.mjs'),
+    "export const name = 'first_tool';\nexport const description = '第一个插件';\nexport async function run() { return 'one'; }\n",
+    'utf8',
+  );
+
+  const store = new MemoryStore();
+  const workspace = await mkdtemp(path.join(tmpdir(), 'rakko-plugin-ws-'));
+  const tools = new ToolRegistry({ workspace });
+  for (const tool of createBuiltinTools({ workspace })) tools.register(tool);
+
+  const plugins = new PluginHost(tools, { directory: dir });
+  await plugins.reload();
+
+  const app = createApp({ store, tools, workspace, plugins });
+
+  const listed = (await app.inject({ method: 'GET', url: '/v1/plugins' })).json();
+  assert.equal(listed.directory, dir);
+  assert.deepEqual(listed.tools.map((tool: { name: string }) => tool.name), ['first_tool']);
+  assert.equal(listed.errors.length, 0);
+
+  // 新增一个插件再手动重载
+  await writeFile(
+    path.join(dir, 'second.mjs'),
+    "export const name = 'second_tool';\nexport const description = '第二个插件';\nexport async function run() { return 'two'; }\n",
+    'utf8',
+  );
+  const reloaded = (await app.inject({ method: 'POST', url: '/v1/plugins/reload' })).json();
+  assert.deepEqual(reloaded.tools.map((tool: { name: string }) => tool.name).sort(), ['first_tool', 'second_tool']);
+
+  // 注册表里也该有它
+  const health = (await app.inject({ method: 'GET', url: '/health' })).json();
+  assert.ok(health.tools.some((tool: { name: string }) => tool.name === 'second_tool'));
+
+  plugins.close();
+  await app.close();
+});
+
+test('没有插件宿主时，接口给出明确回应而不是 500', async () => {
+  const app = makeApp();
+  const listed = (await app.inject({ method: 'GET', url: '/v1/plugins' })).json();
+  assert.equal(listed.directory, null);
+  assert.deepEqual(listed.tools, []);
+
+  const reload = await app.inject({ method: 'POST', url: '/v1/plugins/reload' });
+  assert.equal(reload.statusCode, 400);
+  assert.equal(reload.json().error, 'plugins_unavailable');
   await app.close();
 });

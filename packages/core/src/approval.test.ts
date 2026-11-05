@@ -33,7 +33,7 @@ test('拒绝会带上理由，工具不该执行', async () => {
 });
 
 test('等不到人就自动拒绝，运行不会烂在那里', async () => {
-  const gate = new ApprovalGate({ timeoutMs: 40 });
+  const gate = new ApprovalGate({ timeoutMs: 120 });
   const decision = await request(gate, 'c9');
   assert.equal(decision.decision, 'deny');
   assert.match(decision.reason ?? '', /等不到审批/);

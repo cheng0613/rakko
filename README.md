@@ -129,6 +129,13 @@ export async function run(args, context) {
 - 默认要审批，可以靠「允许这类」一次性放行；
 - 仓库里带了一个能用的示例：`examples/tools/git-log.mjs`（拷到 `~/.rakko/tools/` 即可）。
 
+**热重载**：宿主目录里任何 `.mjs` / `.js` 变动都会触发重载（400ms 去抖），
+摘掉旧的、挂上新的，内置工具不动；因为 ESM 按 URL 缓存，重载时给文件 URL 加了查询串，
+改完保存就能拿到新代码，不用重启服务。加载失败只会记一条错误，下一轮改动还会再试。
+
+**插件管理页**：技能页底部「工具插件」——显示目录、已加载的工具（风险 / 是否要审批）、
+被跳过的文件与原因，还有一个「重新加载」按钮（`POST /v1/plugins/reload`）。
+
 技能与插件的关系：插件加工具，技能限制工具。挂上「只读模式」时，插件工具同样会被挡 ——
 因为限制是作用在整张工具表上的。
 
@@ -427,6 +434,8 @@ agent 的文件工具锁在工作区里，读这个目录会直接 `路径越界
 ```
 GET  /health                                   服务、provider、模型、熔断、工具、等待中的审批
 GET  /v1/usage                                 配额（次数制，来自 usage_ledger）
+GET  /v1/plugins                               插件目录、已加载工具、加载错误
+POST /v1/plugins/reload                        手动重载插件
 GET  /v1/skills                                技能列表（含 enabled）
 POST /v1/skills                                新建技能（可带 tools 限制）
 PATCH /v1/skills/:id                           改内容，或 { enabled } 挂载/关闭

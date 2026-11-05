@@ -2,7 +2,7 @@ import { createDb, migrateDb } from '@rakko/db';
 import { homedir } from 'node:os';
 import path from 'node:path';
 
-import { createBuiltinTools, createSecondToolset, FakeProvider, loadToolPlugins, OpenAICompatibleProvider, ProviderGateway, ToolRegistry } from '@rakko/core';
+import { createBuiltinTools, createSecondToolset, FakeProvider, OpenAICompatibleProvider, PluginHost, ProviderGateway, ToolRegistry } from '@rakko/core';
 
 import { createApp, FAKE_MODELS } from './app.js';
 import { loadAgentSettings, loadProviderSettings } from './config.js';
@@ -61,16 +61,21 @@ for (const tool of createSecondToolset({
   tools.register(tool);
 }
 
-// 工具插件：用户自己的 .mjs，放在 ~/.rakko/tools（默认要审批）
+// 工具插件：用户自己的 .mjs，放在 ~/.rakko/tools（默认要审批，改文件自动重载）
 const pluginDir = process.env.RAKKO_TOOLS_DIR ?? path.join(homedir(), '.rakko', 'tools');
-const plugins = await loadToolPlugins(pluginDir);
-for (const tool of plugins.tools) tools.register(tool);
-if (plugins.tools.length > 0) {
-  console.log(`工具插件：${plugins.tools.map((tool) => tool.name).join('、')}（${pluginDir}）`);
-}
-for (const error of plugins.errors) {
-  console.error(`工具插件跳过 ${error.file}：${error.reason}`);
-}
+const plugins = new PluginHost(tools, {
+  directory: pluginDir,
+  onReload: (info) => {
+    const names = info.tools.map((tool) => tool.name).join('、') || '（无）';
+    console.log(`工具插件已重载：${names}`);
+    for (const error of info.errors) console.error(`工具插件跳过 ${error.file}：${error.reason}`);
+  },
+});
+const pluginInfo = await plugins.reload();
+console.log(`工具插件目录：${pluginDir}（${pluginInfo.tools.length} 个，改文件自动重载）`);
+if (pluginInfo.tools.length > 0) console.log(`  已加载：${pluginInfo.tools.map((tool) => tool.name).join('、')}`);
+for (const error of pluginInfo.errors) console.error(`工具插件跳过 ${error.file}：${error.reason}`);
+plugins.watch();
 
 console.log(`工作区：${agentSettings.workspace}`);
 console.log(`工具：${tools.list().map((tool) => `${tool.name}(${tool.risk})`).join(' ')}
@@ -83,11 +88,13 @@ const app = createApp({
   workspace: agentSettings.workspace,
   approvalTimeoutMs: agentSettings.approvalTimeoutMs,
   maxSteps: agentSettings.maxSteps,
+  plugins,
 });
 
 const shutdown = async (signal: string): Promise<void> => {
   console.log(`收到 ${signal}，正在退出…`);
   await app.close();
+  plugins.close();
   await store.close();
   process.exit(0);
 };

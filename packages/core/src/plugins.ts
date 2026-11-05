@@ -34,6 +34,9 @@ export interface LoadedPlugins {
 
 const RISKS: RiskLevel[] = ['low', 'medium', 'high'];
 
+/** 同一毫秒内多次重载也要拿到不同的 URL */
+let reloadSeq = 0;
+
 interface PluginModule {
   name?: unknown;
   description?: unknown;
@@ -59,7 +62,9 @@ export async function loadToolPlugins(directory: string): Promise<LoadedPlugins>
     const full = path.join(directory, file);
     let module: PluginModule;
     try {
-      module = (await import(pathToFileURL(full).href)) as PluginModule;
+      // ESM 按 URL 缓存；加查询串才能让热重载真的拿到新代码
+      const url = pathToFileURL(full).href + `?v=${Date.now().toString(36)}-${reloadSeq++}`;
+      module = (await import(url)) as PluginModule;
     } catch (error) {
       errors.push({ file, reason: `加载失败：${error instanceof Error ? error.message : String(error)}` });
       continue;

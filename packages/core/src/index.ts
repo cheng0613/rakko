@@ -47,6 +47,7 @@ export { ToolRegistry, type ApprovalOutcome, type ToolContext, type ToolResult, 
 export { createBuiltinTools, type BuiltinToolsOptions } from './tools/builtin.js';
 export { createSecondToolset, type HttpToolOptions, type SecondToolsetOptions } from './tools/network.js';
 export { loadToolPlugins, type LoadedPlugins, type ToolPluginError } from './plugins.js';
+export { PluginHost, type PluginHostInfo, type PluginHostOptions } from './plugin-host.js';
 export {
   ApprovalGate,
   type ApprovalDecision,

@@ -14,6 +14,7 @@ import {
   type ChatMessage,
   type ModelProvider,
   type ModelTier,
+  type PluginHost,
 } from '@rakko/core';
 import {
   approvalDecisionSchema,
@@ -54,6 +55,8 @@ export interface AppOptions {
   maxSteps?: number;
   /** 自动化巡检间隔，测试里调小 */
   automationIntervalMs?: number;
+  /** 工具插件宿主；不存在时 /v1/plugins 返回空 */
+  plugins?: PluginHost;
 }
 
 export function createApp(options: AppOptions = {}): FastifyInstance {
@@ -264,6 +267,19 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
     const started = await runAutomation(automation);
     if (!started) return reply.code(429).send({ error: 'quota_exceeded', message: '本周次数已用完，这次自动化没有启动' });
     return reply.code(202).send({ threadId: started.thread.id, runId: started.run.id });
+  });
+
+  app.get('/v1/plugins', async () =>
+    options.plugins
+      ? options.plugins.info()
+      : { directory: null, tools: [], errors: [], reloadedAt: null },
+  );
+
+  app.post('/v1/plugins/reload', async (_request, reply) => {
+    if (!options.plugins) {
+      return reply.code(400).send({ error: 'plugins_unavailable', message: '这个实例没有启用插件目录' });
+    }
+    return options.plugins.reload();
   });
 
   app.get('/v1/usage', async () => store.usage());
