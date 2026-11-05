@@ -12,7 +12,7 @@ import { and, asc, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import type { DbHandle } from '@rakko/db';
 import { messages, runEvents, runs, threads, usageLedger, users } from '@rakko/db';
 import { currentPeriod, decideQuota, periodStart, planLimit, type QuotaDecision } from '@rakko/core';
-import type { Message, Run, RunEvent, RunState, Thread, Usage } from '@rakko/protocol';
+import type { Message, MessageKind, Run, RunEvent, RunState, Thread, Usage } from '@rakko/protocol';
 
 import type { AppendMessageInput, CreateRunInput, Listener, RunPatch, RunStore } from './store.js';
 
@@ -29,7 +29,9 @@ const toMessage = (row: typeof messages.$inferSelect): Message => ({
   id: row.id,
   threadId: row.threadId,
   role: row.role as Message['role'],
+  kind: row.kind as MessageKind,
   text: row.text,
+  payload: (row.payload as Record<string, unknown> | null) ?? null,
   runId: row.runId,
   createdAt: row.createdAt.toISOString(),
 });
@@ -51,6 +53,8 @@ export interface PostgresStoreOptions {
   /** 本地单用户模式：首次启动自动建这个账号 */
   email?: string;
   plan?: string;
+  /** 配额用超了是降级还是拦下 */
+  degradeOnExceed?: boolean;
 }
 
 export class PostgresStore implements RunStore {
@@ -58,6 +62,7 @@ export class PostgresStore implements RunStore {
   private readonly handle: DbHandle;
   private readonly email: string;
   private readonly plan: string;
+  private readonly degradeOnExceed: boolean;
   private readonly listeners = new Map<string, Set<Listener>>();
   private readonly seqCache = new Map<string, number>();
   private userId: string | null = null;
@@ -66,6 +71,7 @@ export class PostgresStore implements RunStore {
     this.handle = handle;
     this.email = options.email ?? process.env.RAKKO_USER_EMAIL ?? 'local@rakko.app';
     this.plan = options.plan ?? process.env.RAKKO_PLAN ?? 'pro';
+    this.degradeOnExceed = options.degradeOnExceed ?? true;
   }
 
   private get db(): DbHandle['db'] {
@@ -140,7 +146,9 @@ export class PostgresStore implements RunStore {
       .values({
         threadId: input.threadId,
         role: input.role,
+        kind: input.kind ?? 'text',
         text: input.text,
+        payload: input.payload ?? null,
         runId: input.runId ?? null,
         // seq 交给数据库算：唯一索引 (thread_id, seq) 会在并发时挡住重复
         seq: sql`coalesce((select max(${messages.seq}) from ${messages} where ${messages.threadId} = ${input.threadId}), 0) + 1`,
@@ -251,7 +259,7 @@ export class PostgresStore implements RunStore {
       used,
       remaining: Math.max(0, limit - used),
       periodStart: periodStart(),
-      degradeOnExceed: true,
+      degradeOnExceed: this.degradeOnExceed,
     };
   }
 

@@ -13,6 +13,40 @@ import { MemoryStore } from './store.js';
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** 读一段 SSE（到点就断开），用来验证续传 */
+const readSse = async (
+  url: string,
+  headers: Record<string, string> = {},
+  timeoutMs = 600,
+): Promise<Array<{ type: string }>> => {
+  const events: Array<{ type: string }> = [];
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, { headers, signal: controller.signal });
+    const reader = response.body?.getReader();
+    if (!reader) return events;
+    const decoder = new TextDecoder();
+    let buffer = '';
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const parts = buffer.split(/\n\n/);
+      buffer = parts.pop() ?? '';
+      for (const part of parts) {
+        const line = part.split(/\n/).find((row) => row.startsWith('data: '));
+        if (line) events.push(JSON.parse(line.slice(6)) as { type: string });
+      }
+    }
+  } catch {
+    /* 到点断开属正常 */
+  } finally {
+    clearTimeout(timer);
+  }
+  return events;
+};
+
 /** 默认给一个空工具表：不传工具时假 provider 就只回答、不调工具 */
 const makeApp = (options: AppOptions = {}) =>
   createApp({ tools: new ToolRegistry({ workspace: process.cwd() }), ...options });
@@ -234,5 +268,81 @@ test('界面由服务端自己吐出来，同源不用跨域', async () => {
   assert.match(response.body, /Rakko/);
   assert.match(response.body, /run\.approval_requested/, '界面要认得审批事件');
   assert.doesNotMatch(response.body, /src="\.\//, '单文件界面不应该引用同目录资源');
+  await app.close();
+});
+
+test('一次运行把文字、工具、审批全落进 messages，重开会话才能重放', async () => {
+  const { app, store } = await approvalApp();
+  const runId = await startRun(app);
+
+  const paused = await waitFor(app, runId, (body) => body.state === 'waiting_approval');
+  const callId = (paused.pendingApprovals?.[0] as { callId: string }).callId;
+  await app.inject({ method: 'POST', url: `/v1/runs/${runId}/approvals/${callId}`, payload: { decision: 'allow' } });
+  await waitFor(app, runId, (body) => body.state === 'succeeded');
+
+  const run = await store.getRun(runId);
+  const items = await store.listMessages(run!.threadId);
+  assert.deepEqual(
+    items.map((item) => item.kind),
+    ['text', 'tool_call', 'approval', 'approval_decision', 'tool_result', 'text'],
+  );
+
+  assert.equal(items[0]?.role, 'user');
+  const toolCall = items.find((item) => item.kind === 'tool_call');
+  assert.equal(toolCall?.payload?.name, 'write_file');
+  assert.deepEqual(toolCall?.payload?.args, { path: 'note.txt', content: '批准了' });
+
+  const decision = items.find((item) => item.kind === 'approval_decision');
+  assert.equal(decision?.payload?.decision, 'allow');
+
+  const result = items.find((item) => item.kind === 'tool_result');
+  assert.equal(result?.payload?.ok, true);
+
+  // 回答是分段落的，不是一整坨
+  const texts = items.filter((item) => item.kind === 'text' && item.role === 'assistant');
+  assert.equal(texts.length, 1);
+  assert.match(texts[0]?.text ?? '', /写好了/);
+  await app.close();
+});
+
+test('配额用超且不允许降级时直接拦下（429）', async () => {
+  const store = new MemoryStore({ limit: 120, used: 120, degradeOnExceed: false });
+  const app = makeApp({ store });
+
+  const thread = (await app.inject({ method: 'POST', url: '/v1/threads', payload: {} })).json();
+  const response = await app.inject({ method: 'POST', url: '/v1/runs', payload: { threadId: thread.id, prompt: '还能跑吗' } });
+
+  assert.equal(response.statusCode, 429);
+  assert.equal(response.json().error, 'quota_exceeded');
+  assert.match(response.json().message, /次数已用完/);
+  await app.close();
+});
+
+test('内存实现默认从 0 次开始，不再假装已经用过 62 次', async () => {
+  const store = new MemoryStore();
+  const usage = await store.usage();
+  assert.equal(usage.used, 0);
+  assert.equal(usage.remaining, usage.limit);
+});
+
+test('SSE 带 Last-Event-ID 只补没看过的事件', async () => {
+  const app = makeApp();
+  const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+  const thread = (await app.inject({ method: 'POST', url: '/v1/threads', payload: {} })).json();
+  const run = (await app.inject({ method: 'POST', url: '/v1/runs', payload: { threadId: thread.id, prompt: '跑一下' } })).json();
+  for (let i = 0; i < 60; i += 1) {
+    const body = (await app.inject({ method: 'GET', url: `/v1/runs/${run.id}` })).json();
+    if (body.state === 'succeeded') break;
+    await sleep(20);
+  }
+
+  const url = `${base}/v1/runs/${run.id}/events`;
+  const all = await readSse(url, {}, 500);
+  assert.ok(all.length >= 4, '至少要有 started/state/delta/done');
+
+  const resumed = await readSse(url, { 'last-event-id': '3' }, 500);
+  assert.equal(resumed.length, all.length - 3);
+  assert.deepEqual(resumed.map((event) => event.type), all.slice(3).map((event) => event.type));
   await app.close();
 });

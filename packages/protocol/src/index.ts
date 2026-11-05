@@ -93,11 +93,30 @@ export type Thread = z.infer<typeof threadSchema>;
 export const messageRoleSchema = z.enum(['user', 'assistant', 'system', 'tool']);
 export type MessageRole = z.infer<typeof messageRoleSchema>;
 
+/**
+ * 会话里的一条记录。text 只是其中一种：
+ * 工具调用、工具结果、审批请求、审批结论、降级提示都要能重放，否则重开会话就只剩文字。
+ */
+export const MESSAGE_KINDS = [
+  'text',
+  'tool_call',
+  'tool_result',
+  'approval',
+  'approval_decision',
+  'notice',
+] as const;
+
+export const messageKindSchema = z.enum(MESSAGE_KINDS);
+export type MessageKind = (typeof MESSAGE_KINDS)[number];
+
 export const messageSchema = z.object({
   id,
   threadId: id,
   role: messageRoleSchema,
+  kind: messageKindSchema,
   text: z.string(),
+  /** 非文本消息的结构化内容：工具参数、结果、审批结论等 */
+  payload: z.record(z.string(), z.unknown()).nullable(),
   runId: id.nullable(),
   createdAt: at,
 });

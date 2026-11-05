@@ -62,7 +62,11 @@ export const messages = pgTable(
       .references(() => threads.id, { onDelete: 'cascade' }),
     /** user | assistant | system | tool */
     role: text('role').notNull(),
+    /** text | tool_call | tool_result | approval | approval_decision | notice */
+    kind: text('kind').notNull().default('text'),
     text: text('text').notNull(),
+    /** 非文本消息的结构化内容 */
+    payload: jsonb('payload'),
     runId: uuid('run_id'),
     seq: integer('seq').notNull(),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),

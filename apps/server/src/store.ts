@@ -7,13 +7,16 @@
 
 import { randomUUID } from 'node:crypto';
 
-import { currentPeriod, decideQuota, periodStart, planLimit, type QuotaDecision } from '@rakko/core';
-import type { Message, MessageRole, Run, RunEvent, Thread, Usage } from '@rakko/protocol';
+import { currentPeriod, decideQuota, periodStart, planLimit, type QuotaDecision, type QuotaState } from '@rakko/core';
+import type { Message, MessageKind, MessageRole, Run, RunEvent, Thread, Usage } from '@rakko/protocol';
 
 export interface AppendMessageInput {
   threadId: string;
   role: MessageRole;
   text: string;
+  /** 默认 text；工具调用与审批也走同一张表，重会话才能重放 */
+  kind?: MessageKind;
+  payload?: Record<string, unknown> | null;
   runId?: string | null;
 }
 
@@ -55,15 +58,29 @@ export interface RunStore {
 
 const now = (): string => new Date().toISOString();
 
+export interface MemoryStoreOptions {
+  limit?: number;
+  used?: number;
+  degradeOnExceed?: boolean;
+}
+
 /** 进程内实现：形状与 Postgres 版一致，进程重启即清空。 */
 export class MemoryStore implements RunStore {
   readonly kind = 'memory' as const;
+  private quota: QuotaState;
+
+  constructor(options: MemoryStoreOptions = {}) {
+    this.quota = {
+      limit: options.limit ?? planLimit('pro'),
+      used: options.used ?? 0,
+      degradeOnExceed: options.degradeOnExceed ?? true,
+    };
+  }
   private readonly threads = new Map<string, Thread>();
   private readonly runs = new Map<string, Run>();
   private readonly messages = new Map<string, Message[]>();
   private readonly events = new Map<string, RunEvent[]>();
   private readonly listeners = new Map<string, Set<Listener>>();
-  private quota = { limit: planLimit('pro'), used: 62, degradeOnExceed: true };
 
   async ready(): Promise<void> {}
 
@@ -98,7 +115,9 @@ export class MemoryStore implements RunStore {
       id: randomUUID(),
       threadId: input.threadId,
       role: input.role,
+      kind: input.kind ?? 'text',
       text: input.text,
+      payload: input.payload ?? null,
       runId: input.runId ?? null,
       createdAt: now(),
     };

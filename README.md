@@ -172,7 +172,10 @@ node --env-file=.env apps/server/dist/index.js   # 然后开 http://127.0.0.1:87
 几个刻意的做法：
 
 - **seq 由数据库算**（`coalesce(max(seq),0)+1` + 唯一索引兜底），进程不维护计数器；
-- **事件先落库再推送**，SSE 断线重连才能只靠 `Last-Event-ID` 续上；
+- **事件先落库再推送**，SSE 断线重连只靠 `Last-Event-ID` 续上（服务端按事件序号过滤补发，不是重放全部）；
+- **会话是可重放的**：`messages` 有 `kind` + `payload`，`text / tool_call / tool_result / approval / approval_decision / notice`
+  六种记录按 `seq` 排；助手文字分「段」落库（遇到卡片就封口），重开会话时工具卡与审批卡回到原位，
+  运行失败也不会丢掉已经说出口的话；
 - **配额只认 `usage_ledger` 的求和**，用户改不动这个数；
 - 迁移目录按模块相对路径定位，从哪个目录起服务都不会找错。
 
@@ -186,7 +189,7 @@ POST /v1/threads                               新建会话
 GET  /v1/threads/:id/messages                  会话消息
 POST /v1/runs                                  发起运行（202，返回 tier/degraded；配额不足时 429）
 GET  /v1/runs/:id                              运行状态 + pendingApprovals
-GET  /v1/runs/:id/events                       SSE 事件流，带 id 可续传
+GET  /v1/runs/:id/events                       SSE 事件流，带 id；重连带 Last-Event-ID 只补没看过的
 POST /v1/runs/:id/approvals/:callId            审批：{"decision":"allow"|"deny","reason":"…"}
 POST /v1/runs/:id/cancel                       取消运行（会把等待中的审批一并作废）
 ```

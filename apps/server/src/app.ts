@@ -179,14 +179,23 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
       'x-accel-buffering': 'no',
     });
 
-    let seq = 0;
-    const write = (event: RunEvent): void => {
-      seq += 1;
+    // 事件 id = 该运行的第几条事件（从 1 起），断线重连靠 Last-Event-ID 只补没看过的
+    const lastSeen = Number(request.headers['last-event-id'] ?? 0) || 0;
+    const write = (event: RunEvent, seq: number): void => {
       reply.raw.write(`id: ${seq}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
     };
 
-    for (const event of await store.eventsOf(id)) write(event);
-    const unsubscribe = store.subscribe(id, write);
+    reply.raw.write('retry: 3000\n\n');
+    const replay = await store.eventsOf(id);
+    for (const [index, event] of replay.entries()) {
+      if (index + 1 > lastSeen) write(event, index + 1);
+    }
+
+    let seq = replay.length;
+    const unsubscribe = store.subscribe(id, (event) => {
+      seq += 1;
+      write(event, seq);
+    });
 
     const heartbeat = setInterval(() => reply.raw.write(': ping\n\n'), 15_000);
     timers.add(heartbeat);
@@ -207,16 +216,40 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
     controllers.set(run.id, controller);
 
     const finish = async (state: RunState, error?: string): Promise<void> => {
+      await flushSegment();
       await store.patchRun(run.id, { state, finishedAt: at(), ...(error ? { error } : {}) });
       await emit({ type: 'run.state', runId: run.id, at: at(), state });
       await emit({ type: 'run.done', runId: run.id, at: at(), state });
+    };
+
+    /**
+     * 助手文字是分成「段」落库的：遇到工具卡、审批、提示就封口。
+     * 这样重开会话时，卡片还能待在该待的位置；失败时也不会丢掉已经说出口的话。
+     */
+    let segment = '';
+    const flushSegment = async (): Promise<void> => {
+      const text = segment;
+      segment = '';
+      if (!text.trim()) return;
+      await store.appendMessage({ threadId: run.threadId, role: 'assistant', kind: 'text', text, runId: run.id });
+    };
+    const record = async (
+      kind: 'tool_call' | 'tool_result' | 'approval' | 'approval_decision' | 'notice',
+      role: 'assistant' | 'tool' | 'system',
+      payload: Record<string, unknown>,
+      text = '',
+    ): Promise<void> => {
+      await store.appendMessage({ threadId: run.threadId, role, kind, text, payload, runId: run.id });
     };
 
     try {
       await store.patchRun(run.id, { state: 'running' });
       await emit({ type: 'run.started', runId: run.id, at: at() });
       await emit({ type: 'run.state', runId: run.id, at: at(), state: 'running' });
-      if (notice) await emit({ type: 'run.delta', runId: run.id, at: at(), text: `（${notice}）\n` });
+      if (notice) {
+        await record('notice', 'system', { reason: 'quota', detail: notice, from: 'standard', to: 'fast' }, notice);
+        await emit({ type: 'run.fallback', runId: run.id, at: at(), from: 'standard', to: 'fast', reason: notice });
+      }
 
       const outcome = await loop.run(
         {
@@ -228,11 +261,19 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
         {
           onChunk: async (chunk) => {
             if (chunk.kind === 'delta') {
+              segment += chunk.text;
               await emit({ type: 'run.delta', runId: run.id, at: at(), text: chunk.text });
             } else if (chunk.kind === 'reasoning') {
               await emit({ type: 'run.reasoning', runId: run.id, at: at(), text: chunk.text });
             } else if (chunk.kind === 'fallback') {
               await store.patchRun(run.id, { model: gateway.models[chunk.to] });
+              await flushSegment();
+              await record('notice', 'system', {
+                reason: 'fallback',
+                detail: chunk.reason,
+                from: chunk.from,
+                to: chunk.to,
+              }, chunk.reason);
               await emit({
                 type: 'run.fallback',
                 runId: run.id,
@@ -241,11 +282,12 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
                 to: chunk.to,
                 reason: chunk.reason,
               });
-              await emit({ type: 'run.delta', runId: run.id, at: at(), text: `（${chunk.reason}）\n` });
             }
           },
 
           onToolCall: async (call) => {
+            await flushSegment();
+            await record('tool_call', 'assistant', { callId: call.id, name: call.name, args: call.args });
             await emit({
               type: 'run.tool_call',
               runId: run.id,
@@ -257,6 +299,13 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
           },
 
           onToolResult: async (call, result) => {
+            await record('tool_result', 'tool', {
+              callId: call.id,
+              name: call.name,
+              ok: result.ok,
+              output: result.output,
+              durationMs: result.durationMs,
+            });
             await emit({
               type: 'run.tool_result',
               runId: run.id,
@@ -268,7 +317,14 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
           },
 
           approve: async (call, tool) => {
+            await flushSegment();
             await store.patchRun(run.id, { state: 'waiting_approval' });
+            await record('approval', 'system', {
+              callId: call.id,
+              name: call.name,
+              risk: tool.risk,
+              args: call.args,
+            });
             await emit({
               type: 'run.approval_requested',
               runId: run.id,
@@ -287,6 +343,11 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
               args: call.args,
             });
 
+            await record('approval_decision', 'system', {
+              callId: call.id,
+              decision: decision.decision,
+              ...(decision.reason ? { reason: decision.reason } : {}),
+            });
             await emit({
               type: 'run.approval_decided',
               runId: run.id,
@@ -315,7 +376,6 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
         });
       }
 
-      await store.appendMessage({ threadId: run.threadId, role: 'assistant', text: outcome.text, runId: run.id });
       await store.chargeRun(run);
       await finish('succeeded');
     } catch (error) {

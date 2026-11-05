@@ -16,14 +16,15 @@ if (databaseUrl) {
   const handle = createDb(databaseUrl, { max: Number(process.env.DB_POOL ?? 10) });
   console.log('存储：Postgres，应用迁移中…');
   await migrateDb(handle);
-  const postgres = new PostgresStore(handle);
+  const postgres = new PostgresStore(handle, { degradeOnExceed: loadAgentSettings().degradeOnExceed });
   await postgres.ready();
   store = postgres;
   console.log('存储：Postgres 就绪（九张表已建，默认用户已就位）');
   const recovered = await postgres.recoverOrphans();
   if (recovered > 0) console.log(`存储：清理了 ${recovered} 个上次没跑完的运行`);
 } else {
-  store = new MemoryStore();
+  const policy = loadAgentSettings();
+  store = new MemoryStore({ degradeOnExceed: policy.degradeOnExceed });
   console.log('存储：内存（未配置 DATABASE_URL，重启即清空）');
 }
 

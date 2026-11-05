@@ -1044,6 +1044,27 @@
     requestAnimationFrame(() => { ui.messages.scrollTop = ui.messages.scrollHeight; });
   };
 
+  /** 开一条助手消息（头像 + who + body），实时与历史共用 */
+  const openAssistant = (createdAt) => {
+    const row = make('div', 'msg agent');
+    row.append(make('div', 'avatar agent', 'R'));
+    const body = make('div', 'body');
+    const who = make('div', 'who');
+    const whoText = make('span', undefined, clock(createdAt || new Date().toISOString()));
+    who.append(make('b', undefined, 'Rakko'), make('span', 'dot'), whoText);
+    body.append(who);
+    row.append(body);
+    ui.messages.append(row);
+    return { row, body, whoText, parts: [], current: null, reasoning: null, startedAt: Date.now() };
+  };
+
+  const appendParagraph = (turn, text) => {
+    const el = make('p');
+    el.innerHTML = md(text);
+    turn.body.append(el);
+  };
+
+  /* 历史：按消息类型重放 —— 工具卡、审批卡都待回原位，而不是只剩文字 */
   const renderHistory = () => {
     ui.messages.innerHTML = '';
     if (state.messages.length === 0) {
@@ -1051,47 +1072,61 @@
       return;
     }
     showLanding(false);
+
+    let turn = null;
+    const cards = new Map();
+    const gates = new Map();
+    const ensureTurn = (createdAt) => {
+      if (!turn) turn = openAssistant(createdAt);
+      return turn;
+    };
+
     for (const message of state.messages) {
-      if (message.role === 'user') {
-        const row = make('div', 'msg user');
-        row.append(make('div', 'avatar sm', 'C'));
-        const body = make('div', 'body');
-        const bubble = make('div', 'ububble');
-        bubble.textContent = message.text;
-        body.append(bubble);
-        row.append(body);
-        ui.messages.append(row);
-      } else if (message.role === 'assistant') {
-        const row = make('div', 'msg agent');
-        row.append(make('div', 'avatar agent', 'R'));
-        const body = make('div', 'body');
-        const who = make('div', 'who');
-        who.append(make('b', undefined, 'Rakko'), make('span', 'dot'), make('span', undefined, clock(message.createdAt)));
-        const text = make('div');
-        text.innerHTML = md(message.text);
-        body.append(who, text);
-        row.append(body);
-        ui.messages.append(row);
+      const payload = message.payload || {};
+
+      if (message.kind === 'text' && message.role === 'user') {
+        pushUserBubble(message.text, false, message.createdAt);
+        turn = null;
+      } else if (message.kind === 'text' && message.role === 'assistant') {
+        appendParagraph(ensureTurn(message.createdAt), message.text);
+      } else if (message.kind === 'tool_call') {
+        // 兼容早期行：那时用 id 而不是 callId
+        payload.callId = payload.callId || payload.id;
+        const meta = toolMeta(payload.name);
+        cards.set(payload.callId, addTool(
+          ensureTurn(message.createdAt),
+          { callId: payload.callId, name: payload.name, args: payload.args || {} },
+          meta ? meta.risk : 'low',
+          meta ? meta.approval : false,
+          { count: false },
+        ));
+      } else if (message.kind === 'tool_result') {
+        cards.get(payload.callId)?.settle(payload.ok, payload.output);
+      } else if (message.kind === 'approval') {
+        gates.set(payload.callId, addApproval(
+          ensureTurn(message.createdAt),
+          { callId: payload.callId, name: payload.name, args: payload.args || {} },
+          payload.risk || 'high',
+          new Date(message.createdAt).getTime() + 10 * 60 * 1000,
+          () => {},
+          { interactive: false },
+        ));
+      } else if (message.kind === 'approval_decision') {
+        gates.get(payload.callId)?.settle(
+          payload.decision,
+          payload.reason ? (payload.decision === 'allow' ? '已允许：' + payload.reason : '已拒绝：' + payload.reason) : undefined,
+        );
+      } else if (message.kind === 'notice') {
+        addNote(ensureTurn(message.createdAt), message.text || payload.detail || '已切换模型', 'fallback');
       }
     }
+
     scrollBottom();
   };
 
   const createTurn = () => {
     showLanding(false);
-    const row = make('div', 'msg agent');
-    row.append(make('div', 'avatar agent', 'R'));
-    const body = make('div', 'body');
-    const who = make('div', 'who');
-    const whoText = make('span', undefined, clock(new Date().toISOString()));
-    who.append(make('b', undefined, 'Rakko'), make('span', 'dot'), whoText);
-    body.append(who);
-    row.append(body);
-    ui.messages.append(row);
-    scrollBottom();
-
-    const turn = { row, body, whoText, parts: [], current: null, reasoning: null, startedAt: Date.now() };
-    return turn;
+    return openAssistant();
   };
 
   const ensurePart = (turn) => {
@@ -1161,7 +1196,7 @@
   /* 工具卡：设计稿的 .tool / .tool-head / .tool-body / .trow */
   const toolIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M14.7 6.3a4 4 0 0 1-5.4 5.4L4 17v3h3l5.3-5.3a4 4 0 0 1 5.4-5.4l-2.6 2.6-2-2 2.6-2.6Z"/></svg>';
 
-  const addTool = (turn, call, risk, approval) => {
+  const addTool = (turn, call, risk, approval, options = {}) => {
     const card = make('div', 'tool');
     const head = make('div', 'tool-head');
     head.insertAdjacentHTML('beforeend', toolIcon);
@@ -1189,8 +1224,10 @@
     turn.body.append(card);
     closePart(turn);
     scrollBottom();
-    state.toolCalls += 1;
-    renderCtx();
+    if (options.count !== false) {
+      state.toolCalls += 1;
+      renderCtx();
+    }
 
     return {
       card,
@@ -1208,7 +1245,8 @@
   };
 
   /* 审批卡：设计稿里的 .gate 一族（与 design.html 同源，改稿要同步） */
-  const addApproval = (turn, call, risk, expiresAt, onDecide) => {
+  const addApproval = (turn, call, risk, expiresAt, onDecide, options = {}) => {
+    const interactive = options.interactive !== false;
     const card = make('div', 'gate');
     const head = make('div', 'gate-head');
     head.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><rect x="4" y="10" width="16" height="10" rx="3"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>';
@@ -1232,6 +1270,11 @@
     const acts = make('div', 'gate-acts');
     const allow = make('button', 'btn primary', '允许这次');
     const deny = make('button', 'btn danger', '拒绝');
+    if (!interactive) {
+      allow.disabled = true;
+      deny.disabled = true;
+      countdown.textContent = '已结束';
+    }
     acts.append(allow, deny);
     const tip = make('div', 'gate-tip', '允许只对这一次生效；拒绝不会让任务失败，我会读到理由并换个做法。');
 
@@ -1241,14 +1284,14 @@
     scrollBottom();
 
     let settled = false;
-    const timer = setInterval(() => {
+    const timer = interactive ? setInterval(() => {
       const left = new Date(expiresAt).getTime() - Date.now();
       if (!isFinite(left)) { countdown.textContent = '—'; return; }
       if (left <= 0) { countdown.textContent = '到点'; return; }
       const m = Math.floor(left / 60000);
       const s = Math.floor((left % 60000) / 1000);
       countdown.textContent = m > 0 ? m + ':' + String(s).padStart(2, '0') : s + 's';
-    }, 1000);
+    }, 1000) : null;
 
     const settle = (decision, note) => {
       if (settled) return;
@@ -1264,16 +1307,20 @@
       res.append(make('span', undefined, note || (decision === 'allow' ? '你允许了这次调用' : '你拒绝了这次调用')));
       card.append(res);
       countdown.textContent = '';
-      state.pending = Math.max(0, state.pending - 1);
-      renderCtx();
+      if (interactive) {
+        state.pending = Math.max(0, state.pending - 1);
+        renderCtx();
+      }
     };
 
     allow.addEventListener('click', () => { settle('allow'); onDecide('allow'); });
     deny.addEventListener('click', () => { settle('deny'); onDecide('deny'); });
 
-    state.pending += 1;
-    renderCtx();
-    setRunState('等你确认', call.name + ' · 需要你点一下', false);
+    if (interactive) {
+      state.pending += 1;
+      renderCtx();
+      setRunState('等你确认', call.name + ' · 需要你点一下', false);
+    }
 
     return { settle };
   };
@@ -1435,7 +1482,7 @@
     return thread;
   };
 
-  const pushUserBubble = (text) => {
+  const pushUserBubble = (text, remember = true, createdAt) => {
     showLanding(false);
     const row = make('div', 'msg user');
     row.append(make('div', 'avatar sm', 'C'));
@@ -1445,7 +1492,9 @@
     body.append(bubble);
     row.append(body);
     ui.messages.append(row);
-    state.messages.push({ role: 'user', text, createdAt: new Date().toISOString() });
+    if (remember) {
+      state.messages.push({ role: 'user', kind: 'text', text, createdAt: createdAt || new Date().toISOString() });
+    }
     scrollBottom();
   };
 
