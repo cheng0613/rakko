@@ -7,11 +7,19 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node -e \"console.log('desktop: 壳层没有单元测试，用 pnpm --filter @rakko/desktop smoke 验证')\"",
+    "test": "node -e \"console.log('desktop: 壳层没有单元测试，用 smoke 验证')\"",
+    "icons": "node scripts/make-icons.mjs",
+    "bundle:server": "esbuild ../../apps/server/dist/index.js --bundle --platform=node --format=esm --outfile=build/server.mjs --log-level=warning --banner:js=\"import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);\"",
     "start": "electron .",
-    "smoke": "electron . --smoke"
+    "smoke": "electron . --smoke",
+    "pack:dir": "pnpm build && pnpm bundle:server && electron-builder --config electron-builder.config.cjs --win --dir",
+    "pack:win": "pnpm build && pnpm bundle:server && electron-builder --config electron-builder.config.cjs --win"
   },
   "devDependencies": {
-    "electron": "33.4.11"
-  }
+    "electron": "33.4.11",
+    "pngjs": "7.0.0",
+    "esbuild": "^0.28.2",
+    "electron-builder": "^25.1.8"
+  },
+  "author": "Rakko"
 }

@@ -1,4 +1,5 @@
 import { readFile } from 'node:fs/promises';
+import path from 'node:path';
 
 import Fastify, { type FastifyInstance } from 'fastify';
 
@@ -86,7 +87,10 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
    * 界面是自包含单文件，由服务端直接吐出，同源就没有跨域问题。
    * 不缓存：改完 HTML 刷新就能看到，不用重启（M0 阶段这比省一次读盘重要）。
    */
-  const webFile = new URL('../../web/index.html', import.meta.url);
+  // 打包后界面不在 ../web，用 RAKKO_WEB_DIR 指过去
+  const webFile = process.env.RAKKO_WEB_DIR
+    ? path.join(process.env.RAKKO_WEB_DIR, 'index.html')
+    : new URL('../../web/index.html', import.meta.url);
   app.get('/', async (_request, reply) => {
     try {
       const html = await readFile(webFile, 'utf8');

@@ -179,9 +179,25 @@ node --env-file=.env apps/server/dist/index.js   # 然后开 http://127.0.0.1:87
 
 ```bash
 pnpm --filter @rakko/desktop build
-pnpm --filter @rakko/desktop start     # 窗口 1440×900，最小 1080×720
-pnpm --filter @rakko/desktop smoke     # 无人值守冒烟：加载、截图、打印标题、退出
+pnpm --filter @rakko/desktop start        # 窗口 1440×900，最小 1080×720
+pnpm --filter @rakko/desktop smoke        # 无人值守冒烟：加载 → 截图 → 打印标题 → 退出
+pnpm --filter @rakko/desktop icons        # 从 build/icon.svg 生成 16–512 与 icon.ico
+pnpm --filter @rakko/desktop pack:win     # 出 NSIS 安装包到 release/
 ```
+
+打包要点：
+
+- 服务打成一个 ESM 单文件 `build/server.mjs`（esbuild，3.1MB），和 `migrations`、`web` 一起进
+  `resources/`；壳用 `RAKKO_WEB_DIR` / `RAKKO_MIGRATIONS_DIR` 指过去，所以离线也能起；
+- 图标按设计稿分工：主 mark 是 C 环，**≤32px 换成爪印**（环 + 点在 16px 会糊成一团），
+  16/24/32/48/64/128/256/512 一次生成，Windows 用 `icon.ico`；
+- 配置放在 `%APPDATA%Rakko.env`（壳会读），打包后默认工作区是 `%APPDATA%Rakkoworkspace`，
+  不往安装目录写文件；
+- 单实例锁：双击两次只开一个窗口，第二个直接退出并让第一个前置；
+- 窗口大小/位置记在 `%APPDATA%Rakkowindow-state.json`，换过屏幕会退回居中而不是丢到看不见的地方;
+- 内网拉不到 GitHub 时给 bins 镜像：`ELECTRON_BUILDER_BINARIES_MIRROR=https://registry.npmmirror.com/-/binary/electron-builder-binaries/`。
+
+**仍未做**：代码签名与公证、自动更新、托盘/菜单、macOS 与 Linux 的产物。
 
 启动顺序：先探 `/health`，服务没起就用 Electron 自带的 node
 （`ELECTRON_RUN_AS_NODE=1`）把 `apps/server` 拉起来，等健康检查通过再开窗口；
