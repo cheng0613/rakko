@@ -14,7 +14,8 @@
     "verify": "pnpm typecheck && pnpm test && pnpm build",
     "stack:up": "docker compose up -d --build",
     "stack:down": "docker compose down",
-    "task": "node scripts/task-run.mjs"
+    "task": "node scripts/task-run.mjs",
+    "task:bootstrap": "node scripts/task-run.mjs bootstrap"
   },
   "devDependencies": {
     "@types/node": "^22.15.3",

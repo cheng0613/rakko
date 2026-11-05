@@ -228,6 +228,11 @@ pnpm task quota-export --dry           # 只看拼好的提示（含验收标准
 pnpm task quota-export                 # 跑：自动审批 + 独立验收 + 写报告
 pnpm task quota-export --check-only    # 不跑 agent，只复检验收
 pnpm task quota-export --update-snapshots   # 确认行为变更后，重写快照基线
+
+pnpm task bootstrap            # 换机器 / 丢了资产：从远端恢复并校验校验和
+pnpm task bootstrap --from <git url | 目录>
+pnpm task verify               # 只校验当前资产
+pnpm task seal                 # 确认改动后重写清单（发布前）
 ```
 
 **验收资产在仓库外**：`~/.rakko-acceptance/`（它自己是个 git 仓库，路径可用 `RAKKO_ACCEPTANCE_DIR` 覆盖）。
@@ -247,6 +252,21 @@ agent 的文件工具锁在工作区里，读这个目录会直接 `路径越界
 ```
 
 之前它读过 `tasks/checks` 并**照着检查脚本改产品文案**去迎合测试；挪出工作区之后这条路就断了。
+
+**资产有校验和**：验收目录里有一份 `acceptance.json`，记录 `checks/` 与 `snapshots/` 每个文件的 sha256
+（按换行归一化算，CRLF / LF 不影响）。每次跑任务卡之前都会校验：清单缺了、文件少了、内容变了，
+一律拒绝开跑并告诉你怎么办。换机器时用 `pnpm task bootstrap` 从 git 远端（或目录）恢复：
+
+```
+从 git 恢复：file:///…/.rakko-acceptance
+已恢复 3 个文件到 ~/.rakko-acceptance
+✓ checks/concurrent-append.mjs
+✓ checks/quota-export.mjs
+✓ snapshots/quota-export.json
+清单校验通过
+```
+
+改一个字节再校验，会立刻红；带着被改过的资产跑任务卡，直接拒绝。
 
 一张卡长这样（`tasks/<id>.task.json`）：
 

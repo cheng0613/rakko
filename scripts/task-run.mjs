@@ -33,6 +33,15 @@ const checkOnly = process.argv.includes('--check-only');
 const updateSnapshots = process.argv.includes('--update-snapshots');
 const SERVER = (process.env.RAKKO_SERVER ?? 'http://127.0.0.1:8787').replace(/\/$/, '');
 
+if (id === 'bootstrap' || id === 'seal' || id === 'verify') {
+  // pnpm task bootstrap [--from …] / seal / verify 都交给资产脚本
+  const { spawnSync } = await import('node:child_process');
+  const args = process.argv.slice(3);
+  const mode = id === 'bootstrap' ? [] : [`--${id}`];
+  const result = spawnSync(process.execPath, [path.join(ROOT, 'scripts', 'acceptance-bootstrap.mjs'), ...mode, ...args], { stdio: 'inherit' });
+  process.exit(result.status ?? 1);
+}
+
 if (!id) {
   const files = (await readdir(TASKS_DIR).catch(() => [])).filter((name) => name.endsWith('.task.json'));
   console.log('用法：node scripts/task-run.mjs <task-id> [--dry] [--check-only] [--update-snapshots]\n');
@@ -90,6 +99,47 @@ function runShell(command, cwd = ROOT) {
       },
     );
   });
+}
+
+/** 验收资产必须在清单里且没被改过，否则不跑 */
+async function verifyAssets({ allowMissingSnapshot = false } = {}) {
+  const { createHash } = await import('node:crypto');
+  const manifestPath = path.join(VAULT, 'acceptance.json');
+  let manifest;
+  try {
+    manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
+  } catch {
+    throw new Error(`验收清单缺失：${manifestPath}
+先跑 pnpm task bootstrap 恢复资产`);
+  }
+
+  const wanted = new Set();
+  for (const item of card.accept ?? []) if (item.check) wanted.add(`checks/${item.check}`);
+  if (card.boundaries?.snapshots?.length) wanted.add(`snapshots/${card.id}.json`);
+
+  for (const rel of wanted) {
+    const expected = manifest.files?.[rel];
+    const full = path.join(VAULT, rel);
+    let actual = null;
+    try {
+      actual = createHash('sha256').update(await readFile(full)).digest('hex');
+    } catch {
+      actual = null;
+    }
+
+    if (expected === undefined) {
+      if (allowMissingSnapshot && rel.startsWith('snapshots/')) continue;
+      throw new Error(`验收资产没有登记在清单里：${rel}
+先跑 pnpm task bootstrap --seal`);
+    }
+    if (actual === null) throw new Error(`验收资产缺失：${full}
+先跑 pnpm task bootstrap`);
+    if (actual !== expected) {
+      throw new Error(`验收资产校验不通过：${rel}
+可能被改过；先 pnpm task bootstrap 恢复，或确认变更后 --seal`);
+    }
+  }
+  console.log('✓ 验收资产校验通过（清单一致）');
 }
 
 const api = async (p, options = {}) => {
@@ -265,10 +315,25 @@ async function runAcceptance({ state, error = null, runId = null, threadId = nul
 }
 
 if (checkOnly || updateSnapshots) {
-  process.exit(await runAcceptance({ state: 'succeeded', runId: null, threadId: null, calls: [], answer: null }));
+  try {
+    await verifyAssets({ allowMissingSnapshot: updateSnapshots });
+  } catch (error) {
+    console.error(`✗ ${error.message}`);
+    process.exit(1);
+  }
+  const code = await runAcceptance({ state: 'succeeded', runId: null, threadId: null, calls: [], answer: null });
+  if (updateSnapshots) console.log('\n基线变了：确认无误后跑 pnpm task seal 更新清单');
+  process.exit(code);
 }
 
 /* ---------------- 跑 agent ---------------- */
+
+try {
+  await verifyAssets();
+} catch (error) {
+  console.error(`✗ ${error.message}`);
+  process.exit(1);
+}
 
 console.log(`任务卡：${card.id} · ${card.title}`);
 console.log(`服务：${SERVER}`);
