@@ -9,9 +9,8 @@
   "accept": [
     {
       "name": "行为正确",
-      "cmd": "node tasks/checks/<你自己写的检查>.mjs",
-      "expectExitCode": 0,
-      "note": "独立检查：不依赖 agent 自己的测试，直接调用被测代码或压边界"
+      "check": "<vault 里的检查脚本>.mjs",
+      "note": "放在 ~/.rakko-acceptance/checks/，agent 读不到"
     },
     {
       "name": "相关测试全绿",
@@ -20,10 +19,40 @@
     }
   ],
   "boundaries": {
-    "concurrency": [20, 40],
+    "concurrency": [
+      20,
+      40
+    ],
+    "snapshots": [
+      {
+        "name": "某纯函数的行为",
+        "module": "@rakko/core",
+        "export": "decideQuota",
+        "cases": [
+          {
+            "args": [
+              {
+                "limit": 120,
+                "used": 62,
+                "degradeOnExceed": true
+              }
+            ]
+          }
+        ]
+      }
+    ],
     "mustNotChange": [
-      { "file": "packages/core/src/quota.ts", "contains": "必须原样保留的一行" }
+      {
+        "file": "packages/core/src/quota.ts",
+        "contains": "必须原样保留的一行"
+      }
     ]
   },
-  "autoApprove": ["read_file", "list_dir", "grep", "apply_patch", "shell"]
+  "autoApprove": [
+    "read_file",
+    "list_dir",
+    "grep",
+    "apply_patch",
+    "shell"
+  ]
 }

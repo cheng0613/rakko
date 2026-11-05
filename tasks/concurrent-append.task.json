@@ -9,9 +9,8 @@
   "accept": [
     {
       "name": "20 / 40 并发都正确",
-      "cmd": "node tasks/checks/concurrent-append.mjs",
-      "expectExitCode": 0,
-      "note": "独立压测：并发 20 与 40，要求全部成功、seq 无重复、条数对得上"
+      "check": "concurrent-append.mjs",
+      "note": "工作区外的压测脚本"
     },
     {
       "name": "server 测试全绿",

@@ -223,11 +223,30 @@ apply_patch 加一个纯函数 → 补测试 → 跑测试）。第一轮崩在�
 任务卡把「活」和「怎么算做完」写在同一个文件里，执行器只认卡，不认它的自评。
 
 ```bash
-pnpm task                      # 列出所有任务卡
-pnpm task quota-export --dry   # 只看拼好的提示（含验收标准）
-pnpm task quota-export         # 跑：自动审批 + 独立验收 + 写报告
-pnpm task quota-export --check-only   # 不跑 agent，只复检验收（改完代码想快速核对）
+pnpm task                              # 列出所有任务卡
+pnpm task quota-export --dry           # 只看拼好的提示（含验收标准）
+pnpm task quota-export                 # 跑：自动审批 + 独立验收 + 写报告
+pnpm task quota-export --check-only    # 不跑 agent，只复检验收
+pnpm task quota-export --update-snapshots   # 确认行为变更后，重写快照基线
 ```
+
+**验收资产在仓库外**：`~/.rakko-acceptance/`（它自己是个 git 仓库，路径可用 `RAKKO_ACCEPTANCE_DIR` 覆盖）。
+
+```
+~/.rakko-acceptance/
+  checks/      验收脚本（并发压测、行为断言……）
+  snapshots/   行为快照基线
+  reports/     每次运行的报告（不进 git）
+```
+
+agent 的文件工具锁在工作区里，读这个目录会直接 `路径越界` —— 实测：
+
+```
+→ read_file {"path":"C:\Users\chiaki\.rakko-acceptance\checks\quota-export.mjs"}
+← fail 路径越界：… 不在工作区 C:\Users\chiaki\Desktop\Rakko
+```
+
+之前它读过 `tasks/checks` 并**照着检查脚本改产品文案**去迎合测试；挪出工作区之后这条路就断了。
 
 一张卡长这样（`tasks/<id>.task.json`）：
 
@@ -251,13 +270,18 @@ pnpm task quota-export --check-only   # 不跑 agent，只复检验收（改完�
 }
 ```
 
-三条规矩：
+四条规矩：
 
-1. **验收由执行器跑**（`accept` 里的命令），agent 自己写的测试再绿也不算过；
+1. **验收由执行器跑**（`accept`），agent 自己写的测试再绿也不算过；
 2. **边界写死**（`boundaries.concurrency`），上次那个「重试 5 次」就是只测了 5 并发才漏的；
-3. **`mustNotChange` 会被机检**（文件里必须还包含某段文本）—— 防止它改文案去迎合测试。
+3. **`mustNotChange` 机检文本**（文件里必须还包含某段文本）—— 防止它改文案迎合测试；
+4. **`boundaries.snapshots` 机检行为**（调用真实导出，比对输入输出快照）—— 文本没动、行为变了也能抓到。
 
-报告落在 `tasks/reports/<id>-<时间>.json`（不进 git），有任何一项不达标就以 1 退出，能直接进 CI。
+快照怎么用：卡里写 `{ module, export, cases: [{ args }] }`，第一次跑 `--update-snapshots` 建基线；
+之后任何一次行为变化都会红并打印「第 N 例：之前 → 现在」。实测把 `decideQuota` 的降级理由从
+「改用快速模型」改成「换成快速模型」，验收命令与文本守卫全绿，快照红 —— 这正是它要抓的。
+
+报告落在 `~/.rakko-acceptance/reports/<id>-<时间>.json`，有任何一项不达标就以 1 退出，能直接进 CI。
 
 ## 存储
 

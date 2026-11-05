@@ -11,13 +11,12 @@
       "name": "core 测试全绿",
       "cmd": "pnpm --filter @rakko/core test",
       "expectExitCode": 0,
-      "note": "先跑这个：它内部会先 build，验收脚本才能 import 到最新的 dist"
+      "note": "先跑这个：它内部会 build，验收脚本才能读到最新 dist"
     },
     {
       "name": "公开入口能用",
-      "cmd": "node tasks/checks/quota-export.mjs",
-      "expectExitCode": 0,
-      "note": "专门检查 import '@rakko/core' 能拿到 describeQuota 且三种状态文案正确"
+      "check": "quota-export.mjs",
+      "note": "工作区外的验收脚本：从包入口导入并校验三种文案"
     }
   ],
   "boundaries": {
@@ -33,6 +32,85 @@
       {
         "file": "packages/core/src/quota.ts",
         "contains": "本周次数已用完，新任务将被拦截"
+      }
+    ],
+    "snapshots": [
+      {
+        "name": "describeQuota 三种状态",
+        "module": "@rakko/core",
+        "export": "describeQuota",
+        "cases": [
+          {
+            "args": [
+              {
+                "limit": 120,
+                "used": 62,
+                "degradeOnExceed": true
+              }
+            ]
+          },
+          {
+            "args": [
+              {
+                "limit": 120,
+                "used": 120,
+                "degradeOnExceed": true
+              }
+            ]
+          },
+          {
+            "args": [
+              {
+                "limit": 120,
+                "used": 130,
+                "degradeOnExceed": false
+              }
+            ]
+          },
+          {
+            "args": [
+              {
+                "limit": 30,
+                "used": 0,
+                "degradeOnExceed": false
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "decideQuota 决策（文本之外的连带行为）",
+        "module": "@rakko/core",
+        "export": "decideQuota",
+        "cases": [
+          {
+            "args": [
+              {
+                "limit": 120,
+                "used": 62,
+                "degradeOnExceed": true
+              }
+            ]
+          },
+          {
+            "args": [
+              {
+                "limit": 120,
+                "used": 120,
+                "degradeOnExceed": true
+              }
+            ]
+          },
+          {
+            "args": [
+              {
+                "limit": 120,
+                "used": 130,
+                "degradeOnExceed": false
+              }
+            ]
+          }
+        ]
       }
     ]
   },
