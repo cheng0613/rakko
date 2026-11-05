@@ -40,6 +40,14 @@ export function decideQuota(state: QuotaState): QuotaDecision {
   return { kind: 'block', remaining: 0, reason: '本周次数已用完，下月 1 日重置' };
 }
 
+/** 一句中文描述当前配额状态，给 UI 层直接展示。 */
+export function describeQuota(state: QuotaState): string {
+  const remaining = remainingQuota(state);
+  if (remaining > 0) return `剩余 ${remaining} 次，可继续运行`;
+  if (state.degradeOnExceed) return '本周次数已用完，将降级到快速模型继续';
+  return '本周次数已用完，新任务将被拦截';
+}
+
 /** 只有真正跑起来的运行才计数：排队中取消不扣次。 */
 export function shouldChargeRun(state: RunState): boolean {
   return state !== 'canceled';
