@@ -133,6 +133,8 @@ export const updateAppInput = z.object({
   name: z.string().trim().min(1).max(40).optional(),
   description: z.string().trim().max(200).optional(),
   spec: z.unknown().optional(),
+  /** 应用自己的对话线程：底部输入框把话发到这里 */
+  threadId: id.nullable().optional(),
 });
 export type UpdateAppInput = z.infer<typeof updateAppInput>;
 

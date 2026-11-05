@@ -92,7 +92,7 @@ export interface RunStore {
   listApps(): Promise<App[]>;
   getApp(id: string): Promise<App | null>;
   createApp(input: { name: string; description?: string; spec: unknown; threadId?: string }): Promise<App>;
-  updateApp(id: string, patch: { name?: string; description?: string; spec?: unknown }): Promise<App | null>;
+  updateApp(id: string, patch: { name?: string; description?: string; spec?: unknown; threadId?: string | null }): Promise<App | null>;
   deleteApp(id: string): Promise<boolean>;
   /** 技能：可挂载的规则块 */
   listSkills(): Promise<Skill[]>;
@@ -755,7 +755,7 @@ export class MemoryStore implements RunStore {
     return app;
   }
 
-  async updateApp(id: string, patch: { name?: string; description?: string; spec?: unknown }): Promise<App | null> {
+  async updateApp(id: string, patch: { name?: string; description?: string; spec?: unknown; threadId?: string | null }): Promise<App | null> {
     const current = this.apps.get(id);
     if (!current) return null;
     const next: App = {
@@ -763,6 +763,7 @@ export class MemoryStore implements RunStore {
       ...(patch.name !== undefined ? { name: patch.name } : {}),
       ...(patch.description !== undefined ? { description: patch.description } : {}),
       ...(patch.spec !== undefined ? { spec: patch.spec } : {}),
+      ...(patch.threadId !== undefined ? { threadId: patch.threadId } : {}),
       updatedAt: now(),
     };
     this.apps.set(id, next);

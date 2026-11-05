@@ -116,11 +116,16 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
       if (problem) return JSON.stringify({ ok: false, error: `界面不合法：${problem}` });
 
       try {
-        const app = await store.createApp({
-          name,
-          ...(typeof input.description === 'string' ? { description: input.description.trim().slice(0, 200) } : {}),
-          spec: input.spec,
-        });
+        const description = typeof input.description === 'string' ? input.description.trim().slice(0, 200) : undefined;
+        const existing = (await store.listApps()).find((item) => item.name === name);
+        if (existing) {
+          await store.updateApp(existing.id, {
+            ...(description !== undefined ? { description } : {}),
+            spec: input.spec,
+          });
+          return JSON.stringify({ ok: true, app: { id: existing.id, name: existing.name }, updated: true, hint: '同名应用已更新' });
+        }
+        const app = await store.createApp({ name, ...(description !== undefined ? { description } : {}), spec: input.spec });
         return JSON.stringify({ ok: true, app: { id: app.id, name: app.name }, hint: '已经存成应用，左侧「应用」里能看到' });
       } catch (error) {
         return JSON.stringify({ ok: false, error: `存应用失败：${error instanceof Error ? error.message : String(error)}` });

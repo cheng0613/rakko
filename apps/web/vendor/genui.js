@@ -133,6 +133,8 @@ var RakkoGenUI = (() => {
     if (action?.set) for (const key of Object.keys(action.set)) into.add(key);
     const filter = node.props.filterBy;
     if (filter?.key) into.add(filter.key);
+    const fields = node.props.fields;
+    if (Array.isArray(fields)) for (const field of fields) into.add(field.key);
     for (const child of node.children ?? []) collectStateKeys(child, into);
     return into;
   }

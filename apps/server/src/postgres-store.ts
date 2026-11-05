@@ -272,7 +272,7 @@ export class PostgresStore implements RunStore {
     return toApp(row);
   }
 
-  async updateApp(id: string, patch: { name?: string; description?: string; spec?: unknown }): Promise<App | null> {
+  async updateApp(id: string, patch: { name?: string; description?: string; spec?: unknown; threadId?: string | null }): Promise<App | null> {
     const userId = this.requireUserId();
     const [row] = await this.db
       .update(apps)
@@ -280,6 +280,7 @@ export class PostgresStore implements RunStore {
         ...(patch.name !== undefined ? { name: patch.name } : {}),
         ...(patch.description !== undefined ? { description: patch.description } : {}),
         ...(patch.spec !== undefined ? { spec: patch.spec } : {}),
+        ...(patch.threadId !== undefined ? { threadId: patch.threadId } : {}),
         updatedAt: new Date(),
       })
       .where(and(eq(apps.userId, userId), eq(apps.id, id)))

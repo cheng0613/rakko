@@ -806,13 +806,26 @@
   .app-card .app-meta{display:flex;align-items:center;gap:8px;font-size:10.5px;color:var(--faint);margin-top:auto}
   .app-card .app-del{margin-left:auto;background:none;border:0;color:var(--faint);font-size:11px;cursor:pointer;padding:0}
   .app-card .app-del:hover{color:var(--danger)}
-  .app-shell{position:fixed;inset:0;z-index:72;display:flex;align-items:stretch;justify-content:center;background:rgba(0,0,0,.22);padding:24px}
+  /* 应用窗口做成手机那样竖长的一条：界面在上，跟 agent 说话在下 */
+  .app-shell{position:fixed;inset:0;z-index:72;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.28);padding:16px}
   .app-shell[hidden]{display:none}
-  .app-window{width:min(960px,100%);background:var(--bg);border:1px solid var(--line);border-radius:20px;display:flex;flex-direction:column;overflow:hidden}
-  .app-window-head{display:flex;align-items:flex-start;gap:10px;padding:16px 20px;border-bottom:1px solid var(--line)}
-  .app-window-head h3{margin:0;font-size:15px;font-weight:590}
-  .app-window-head p{margin:2px 0 0;font-size:11.5px;color:var(--muted)}
-  .app-window-body{flex:1;overflow:auto;padding:18px 20px 24px}
+  .app-window{width:min(430px,100%);height:calc(100vh - 32px);max-height:900px;background:var(--bg);border:1px solid var(--line);border-radius:26px;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 24px 60px -30px rgba(0,0,0,.45)}
+  .app-window-head{display:flex;align-items:flex-start;gap:10px;padding:14px 16px 12px;border-bottom:1px solid var(--line);flex:none}
+  .app-window-head h3{margin:0;font-size:14.5px;font-weight:590}
+  .app-window-head p{margin:2px 0 0;font-size:11px;color:var(--muted)}
+  .app-window-body{flex:1;overflow:auto;padding:14px 16px 10px}
+  .app-log{flex:none;max-height:34%;overflow:auto;border-top:1px solid var(--line);padding:8px 14px 0;display:flex;flex-direction:column;gap:6px}
+  .app-log:empty{display:none}
+  .app-line{font-size:12px;line-height:1.55;color:var(--text-2);white-space:pre-wrap;word-break:break-word}
+  .app-line.me{color:var(--muted)}
+  .app-line.me::before{content:'你 · ';color:var(--faint);font-size:10.5px}
+  .app-line.sys{color:var(--faint);font-size:11px}
+  .app-line.err{color:var(--danger);font-size:11.5px}
+  .app-composer{flex:none;display:flex;gap:8px;align-items:flex-end;padding:10px 12px 14px;border-top:1px solid var(--line)}
+  .app-composer textarea{flex:1;font:inherit;font-size:12.5px;line-height:1.5;max-height:88px;min-height:36px;resize:none;border:1px solid var(--line);border-radius:16px;background:var(--surface);color:var(--text);padding:8px 12px;outline:none}
+  .app-composer textarea:focus{border-color:var(--accent)}
+  .app-composer button{flex:none;width:36px;height:36px;border-radius:50%;border:0;background:var(--accent);color:var(--accent-ink);font-size:15px;cursor:pointer}
+  .app-composer button:disabled{opacity:.5;cursor:default}
 
   /* 生成式界面：跟正文同一套字色与线，别让它看起来像插件 */
   .genui{display:flex;flex-direction:column;gap:10px;margin:10px 0 4px}
@@ -2339,15 +2352,17 @@
   /* ---------------- 小应用 ---------------- */
   const openAppShell = async (id) => {
     try {
-      const app = await api('/v1/apps/' + id);
+      let app = await api('/v1/apps/' + id);
+
       const shell = document.createElement('div');
       shell.className = 'app-shell';
-
       const win = gEl('div', 'app-window');
+
       const head = gEl('div', 'app-window-head');
       const headText = gEl('div');
-      headText.append(gEl('h3', undefined, app.name));
-      headText.append(gEl('p', undefined, app.description || '从对话里沉淀下来的小应用'));
+      const title = gEl('h3', undefined, app.name);
+      const sub = gEl('p', undefined, app.description || '从对话里沉淀下来的小应用');
+      headText.append(title, sub);
       const close = gEl('button', 'btn quiet', '关闭');
       close.type = 'button';
       close.style.marginLeft = 'auto';
@@ -2355,16 +2370,144 @@
       head.append(headText, close);
 
       const body = gEl('div', 'app-window-body');
-      body.append(gEl('div', 'muted', '正在加载…'));
-      win.append(head, body);
+      const log = gEl('div', 'app-log');
+
+      const form = gEl('form', 'app-composer');
+      const box = document.createElement('textarea');
+      box.rows = 1;
+      box.placeholder = '让它改这个应用，或问点什么…';
+      const send = gEl('button', undefined, '↑');
+      send.type = 'submit';
+      form.append(box, send);
+
+      win.append(head, body, log, form);
       shell.append(win);
       shell.addEventListener('click', (event) => {
         if (event.target === shell) shell.remove();
       });
       document.body.append(shell);
 
-      body.innerHTML = '';
-      mountGenui(body, app.spec);
+      const drawApp = () => {
+        body.innerHTML = '';
+        mountGenui(body, app.spec);
+      };
+      drawApp();
+
+      const line = (text, cls) => {
+        log.append(gEl('div', 'app-line' + (cls ? ' ' + cls : ''), text));
+        log.scrollTop = log.scrollHeight;
+      };
+
+      /** 界面被 agent 改过就重画；靠 updatedAt 判断，不看内容 */
+      const refreshApp = async () => {
+        const next = await api('/v1/apps/' + app.id);
+        if (next.updatedAt === app.updatedAt) return false;
+        app = next;
+        title.textContent = next.name;
+        sub.textContent = next.description || '从对话里沉淀下来的小应用';
+        drawApp();
+        line('界面已更新', 'sys');
+        return true;
+      };
+
+      /** 把话发给它：跑一轮，把输出抄到下面的对话里，界面跟着更新 */
+      const drive = async (text) => {
+        if (!text) return;
+        line(text, 'me');
+        send.disabled = true;
+        box.disabled = true;
+        try {
+          if (!app.threadId) {
+            const thread = await api('/v1/threads', {
+              method: 'POST',
+              body: JSON.stringify({ title: app.name + ' · 对话' }),
+            });
+            app = await api('/v1/apps/' + app.id, {
+              method: 'PATCH',
+              body: JSON.stringify({ threadId: thread.id }),
+            });
+          }
+
+          // 这个会话是「应用自己」的：把应用身份与当前界面告诉它，它才知道要改什么
+          const spec = JSON.stringify(app.spec);
+          const context =
+            '【当前应用：' + app.name + '】' +
+            (app.description ? '（' + app.description + '）' : '') +
+            '\n当前界面（genui 组件树）：' +
+            (spec.length > 4000 ? spec.slice(0, 4000) + '…' : spec) +
+            '\n\n请按我的要求修改这个应用，改完用 save_app 保存，name 仍然是「' + app.name + '」。' +
+            '界面要能自己用起来（表格/按钮/表单），不要只放一段说明文字。' +
+            '\n\n我的要求：';
+
+          const run = await api('/v1/runs', {
+            method: 'POST',
+            body: JSON.stringify({ threadId: app.threadId, prompt: context + text }),
+          });
+
+          const startedAt = Date.now();
+          let cursor = 0;
+          let lastTextAt = 0;
+          for (;;) {
+            await sleep(1000);
+            const state = await api('/v1/runs/' + run.id);
+            const messages = await api('/v1/threads/' + app.threadId + '/messages?limit=20');
+            for (const message of messages.items || []) {
+              if (message.seq <= cursor) continue;
+              cursor = message.seq;
+              if (message.kind === 'text' && message.role === 'assistant' && message.text.trim()) {
+                line(message.text.trim());
+                lastTextAt = Date.now();
+              } else if (message.kind === 'tool_result' && message.payload && message.payload.name === 'render_ui') {
+                const slot = gEl('div');
+                log.append(slot);
+                renderGenuiResult(slot, message.payload.output);
+              } else if (message.kind === 'tool_result' && message.payload && message.payload.name === 'save_app') {
+                const changed = await refreshApp();
+                if (!changed) line('应用已保存', 'sys');
+              }
+            }
+
+            if (state.state === 'waiting_approval') {
+              line('这次它要动工具，需要你允许 —— 到左边的对话里点一下', 'err');
+              break;
+            }
+            if (['succeeded', 'failed', 'canceled'].includes(state.state)) {
+              if (state.state === 'failed') line(state.error || '这次没跑完', 'err');
+              if (Date.now() - lastTextAt > 1500) await refreshApp();
+              break;
+            }
+            if (Date.now() - startedAt > 180000) {
+              line('等太久了，先停在这儿', 'err');
+              break;
+            }
+          }
+        } catch (error) {
+          line('出错了：' + error.message, 'err');
+        } finally {
+          send.disabled = false;
+          box.disabled = false;
+          box.focus();
+        }
+      };
+
+      box.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' && !event.shiftKey) {
+          event.preventDefault();
+          form.requestSubmit();
+        }
+      });
+      form.addEventListener('submit', (event) => {
+        event.preventDefault();
+        const text = box.value.trim();
+        box.value = '';
+        box.style.height = 'auto';
+        void drive(text);
+      });
+      box.addEventListener('input', () => {
+        box.style.height = 'auto';
+        box.style.height = Math.min(88, box.scrollHeight) + 'px';
+      });
+      setTimeout(() => box.focus(), 150);
     } catch (error) {
       toast('打不开这个应用：' + error.message);
     }
@@ -2575,7 +2718,10 @@
               item.textContent = String(option);
               input.append(item);
             }
-            input.value = ctx.state[field.key] !== undefined ? String(ctx.state[field.key]) : String((field.options || [''])[0]);
+            const options = (field.options || []).map(String);
+            const current = ctx.state[field.key] === undefined ? '' : String(ctx.state[field.key]);
+            // 状态里可能是 ''（筛选的初始值），落不到任何选项上就会显示成空白
+            input.value = options.includes(current) ? current : (options[0] || '');
             ctx.state[field.key] = input.value;
           } else {
             input.type = field.type === 'number' ? 'number' : 'text';

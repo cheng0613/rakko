@@ -155,6 +155,8 @@ export function collectStateKeys(node: GenNode, into: Set<string> = new Set()): 
   if (action?.set) for (const key of Object.keys(action.set)) into.add(key);
   const filter = node.props.filterBy as RowFilter | undefined;
   if (filter?.key) into.add(filter.key);
+  const fields = node.props.fields as FormField[] | undefined;
+  if (Array.isArray(fields)) for (const field of fields) into.add(field.key);
   for (const child of node.children ?? []) collectStateKeys(child, into);
   return into;
 }

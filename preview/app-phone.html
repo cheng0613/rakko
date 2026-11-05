@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Rakko · 本次对话的界面</title>
+<style>
+  :root{
+    --bg:#f5f5f7; --surface:#ffffff; --surface-2:#f2f2f7; --surface-3:#e5e5ea;
+    --line:rgba(60,60,67,.16); --line-strong:rgba(60,60,67,.26);
+    --text:#1d1d1f; --text-2:#3a3a3c; --muted:#6e6e73; --faint:#a1a1a6;
+    --accent:#0071e3; --accent-ink:#fff; --accent-soft:rgba(0,113,227,.1);
+    --mint:#34c759; --orange:#ff9500; --danger:#ff3b30;
+    --mono:"SF Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC","Microsoft YaHei",sans-serif;
+    --ease:cubic-bezier(.32,.72,0,1);
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#000; --surface:#1c1c1e; --surface-2:#2c2c2e; --surface-3:#3a3a3c;
+      --line:rgba(84,84,88,.5); --line-strong:rgba(120,120,128,.55);
+      --text:#f5f5f7; --text-2:#c7c7cc; --muted:#98989f; --faint:#6e6e73;
+      --accent:#0a84ff; --accent-soft:rgba(10,132,255,.15);
+      --mint:#30d158; --orange:#ff9f0a; --danger:#ff453a;
+    }
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{height:100%;margin:0}
+  body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;line-height:1.55;
+       display:flex;align-items:center;justify-content:center;padding:0}
+  .phone{width:min(430px,100%);height:100%;max-height:100%;background:var(--bg);display:flex;flex-direction:column;overflow:hidden}
+  @media (min-width:520px){
+    body{padding:24px}
+    .phone{height:min(900px,calc(100vh - 48px));border:1px solid var(--line);border-radius:28px;
+           box-shadow:0 30px 70px -40px rgba(0,0,0,.45)}
+  }
+
+  header{flex:none;padding:16px 18px 12px;border-bottom:1px solid var(--line);display:flex;align-items:flex-start;gap:10px}
+  header h1{margin:0;font-size:15px;font-weight:590;letter-spacing:-.01em}
+  header p{margin:3px 0 0;font-size:11.5px;color:var(--muted)}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--mint);margin-top:6px;flex:none}
+
+  .app{flex:1;overflow:auto;padding:14px 16px 12px;display:flex;flex-direction:column;gap:12px;-webkit-overflow-scrolling:touch}
+  .card{border:1px solid var(--line);border-radius:16px;background:var(--surface);padding:13px 14px}
+  .card h2{margin:0 0 9px;font-size:12px;font-weight:590;color:var(--text)}
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  .text{font-size:13px;line-height:1.6;color:var(--text-2)}
+  .muted{color:var(--muted);font-size:11.5px}
+
+  table{width:100%;border-collapse:collapse;font-size:12.5px}
+  th{text-align:left;font-weight:560;color:var(--muted);font-size:11px;padding:6px 6px;border-bottom:1px solid var(--line-strong)}
+  td{padding:7px 6px;border-bottom:1px solid var(--line);color:var(--text-2);vertical-align:top}
+  tr:last-child td{border-bottom:0}
+  th:last-child,td:last-child{white-space:nowrap;text-align:right}
+  .runs td:nth-child(2){max-width:132px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .ok{color:var(--mint)} .bad{color:var(--danger)}
+  .caption{font-size:11px;color:var(--faint);margin-top:7px}
+
+  .btn{border:1px solid var(--line-strong);background:var(--surface-2);color:var(--text);
+       border-radius:99px;padding:5px 13px;font-size:12px;cursor:pointer;font-family:inherit}
+  .btn[data-on="1"]{background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}
+
+  .callout{border-left:2px solid var(--orange);background:var(--surface-2);border-radius:0 10px 10px 0;
+           padding:9px 12px;font-size:12.5px;line-height:1.6;color:var(--text-2)}
+
+  label.field{display:flex;flex-direction:column;gap:5px}
+  label.field span{font-size:11px;color:var(--muted)}
+  select,input{font:inherit;font-size:13px;padding:8px 10px;border-radius:11px;border:1px solid var(--line);
+               background:var(--bg);color:var(--text);outline:none;width:100%}
+  select:focus,input:focus{border-color:var(--accent)}
+
+  .log{flex:none;max-height:32%;overflow:auto;border-top:1px solid var(--line);padding:10px 16px 0;
+       display:flex;flex-direction:column;gap:7px}
+  .log:empty{display:none}
+  .line{font-size:12px;line-height:1.55;color:var(--text-2);white-space:pre-wrap;word-break:break-word}
+  .line.me{color:var(--muted)}
+  .line.me::before{content:'你 · ';color:var(--faint);font-size:10.5px}
+  .line.sys{color:var(--faint);font-size:11px}
+  .typing{color:var(--faint);font-size:11.5px}
+
+  form.composer{flex:none;display:flex;gap:8px;align-items:flex-end;padding:10px 12px calc(12px + env(safe-area-inset-bottom));
+                border-top:1px solid var(--line);background:var(--bg)}
+  form.composer textarea{flex:1;font:inherit;font-size:12.5px;line-height:1.5;max-height:88px;min-height:38px;resize:none;
+                border:1px solid var(--line);border-radius:18px;background:var(--surface);color:var(--text);
+                padding:9px 13px;outline:none}
+  form.composer textarea:focus{border-color:var(--accent)}
+  form.composer button{flex:none;width:38px;height:38px;border-radius:50%;border:0;background:var(--accent);
+                color:var(--accent-ink);font-size:16px;cursor:pointer}
+</style>
+</head>
+<body>
+<div class="phone">
+  <header>
+    <div class="dot"></div>
+    <div>
+      <h1>本次对话的界面</h1>
+      <p>把这次聊天里做出来的东西收进一个应用 · 静态预览</p>
+    </div>
+  </header>
+
+  <main class="app" id="app"></main>
+
+  <div class="log" id="log"></div>
+
+  <form class="composer" id="composer">
+    <textarea id="input" rows="1" placeholder="让它改这个应用，或问点什么…"></textarea>
+    <button type="submit" aria-label="发送">↑</button>
+  </form>
+</div>
+
+<script>
+(() => {
+  'use strict';
+
+  /* ---------- 数据：这次对话里产出的几块界面 ---------- */
+  const runs = [
+    ['16:51', '以后帮我写东西，先给结论…', '5 次', '5 分 0 秒', '成功'],
+    ['16:06', '随便聊两句：我偏爱先看结论…', '0 次', '3.3 s', '成功'],
+    ['15:48', '记一下：以后帮我写东西…', '16 次（失败 3）', '24 s', '失败'],
+    ['15:45', '以后帮我写东西，先给结论…', '10 次（失败 1）', '21 分 25 秒', '成功'],
+    ['15:43', '以后帮我写东西，先给结论…', '15 次（失败 1）', '39 s', '失败'],
+    ['14:40', '用 git_log 看一下最近 3 次提交', '2 次', '8.2 s', '成功'],
+  ];
+
+  const state = { result: '' };
+
+  const el = (tag, cls, text) => {
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text !== undefined) node.textContent = text;
+    return node;
+  };
+
+  const card = (title, children) => {
+    const box = el('section', 'card');
+    box.append(el('h2', undefined, title));
+    for (const child of children) box.append(child);
+    return box;
+  };
+
+  const table = (columns, rows, options = {}) => {
+    const wrap = el('div', options.className || '');
+    const table = el('table');
+    const head = el('thead');
+    const headRow = el('tr');
+    for (const column of columns) headRow.append(el('th', undefined, column));
+    head.append(headRow);
+
+    const body = el('tbody');
+    const value = state[options.key] || '';
+    const visible = value ? rows.filter((row) => row[options.field] === value) : rows;
+    for (const row of visible) {
+      const tr = el('tr');
+      row.forEach((cellText, index) => {
+        const td = el('td', undefined, cellText);
+        if (options.statusColumn === index) {
+          td.className = cellText === '成功' ? 'ok' : cellText === '失败' ? 'bad' : '';
+        }
+        tr.append(td);
+      });
+      body.append(tr);
+    }
+
+    table.append(head, body);
+    wrap.append(table);
+    if (options.caption) wrap.append(el('div', 'caption', options.caption));
+    return wrap;
+  };
+
+  const chip = (label, key, value) => {
+    const button = el('button', 'btn', label);
+    button.type = 'button';
+    button.dataset.on = String(state[key] || '') === value ? '1' : '0';
+    button.addEventListener('click', () => {
+      state[key] = value;
+      render();
+    });
+    return button;
+  };
+
+  /* ---------- 渲染 ---------- */
+  const app = document.getElementById('app');
+  const render = () => {
+    app.innerHTML = '';
+
+    app.append(card('这次对话做出来的东西', [
+      table(['能力', '现在能做什么'], [
+        ['生成式界面', '回答可以是表格、卡片、图表、按钮、表单'],
+        ['本地筛选', '点按钮只在本地重排，不花配额'],
+        ['小应用', '把界面存下来，以后打开就能用'],
+        ['应用内对话', '在应用下面说话，它直接改这个应用'],
+      ], { caption: '四件事都在这一条对话里完成' }),
+    ]));
+
+    app.append(card('运行概览', [
+      el('div', 'row', ''),
+      Object.assign(el('div', 'text'), { }),
+    ]));
+
+    // 概览的三行数字（没用 innerHTML，随手拼）
+    const overview = app.lastElementChild;
+    overview.querySelector('.row')?.remove();
+    const stats = el('div', 'row');
+    for (const [label, value] of [['成功率', '87%'], ['中位', '32 s'], ['p90', '3 分 56 秒']]) {
+      const box = el('div');
+      box.append(el('div', 'muted', label));
+      const number = el('div', 'text', value);
+      number.style.fontSize = '15px';
+      number.style.fontWeight = '590';
+      box.append(number);
+      stats.append(box);
+    }
+    overview.insertBefore(stats, overview.children[1]);
+
+    overview.append(table(['时间', '任务', '工具', '耗时', '结果'], runs, {
+      className: 'runs',
+      key: 'result',
+      field: 4,
+      statusColumn: 4,
+      caption: '点下面的按钮筛选，只动本地，不发请求',
+    }));
+
+    const filters = el('div', 'row');
+    filters.style.marginTop = '9px';
+    filters.append(chip('全部', 'result', ''), chip('只看失败', 'result', '失败'), chip('只看成功', 'result', '成功'));
+    overview.append(filters);
+
+    app.append(card('这条对话里最该知道的一句话', [
+      el('div', 'callout', '工具失败基本都集中在 apply_patch —— 模型给的行号对不上；失败后它会自己重试一次，还不行就停下来问你。'),
+    ]));
+
+    const form = el('form');
+    const field = el('label', 'field');
+    field.append(el('span', undefined, '想让它处理什么'));
+    const select = document.createElement('select');
+    for (const option of ['工具失败率', '慢的运行', '记忆质量', '界面样式']) {
+      const item = document.createElement('option');
+      item.value = option;
+      item.textContent = option;
+      select.append(item);
+    }
+    field.append(select);
+    const submit = el('button', 'btn', '交给它');
+    submit.type = 'submit';
+    submit.style.marginTop = '9px';
+    form.append(field, submit);
+    form.addEventListener('submit', (event) => {
+      event.preventDefault();
+      send('针对「' + select.value + '」，先说我打算怎么改，再动手');
+    });
+    app.append(card('让它接着做', [form]));
+  };
+
+  /* ---------- 底部对话：静态预览里用脚本模拟回复 ---------- */
+  const log = document.getElementById('log');
+  const input = document.getElementById('input');
+  const composer = document.getElementById('composer');
+
+  const line = (text, cls) => {
+    log.append(el('div', 'line' + (cls ? ' ' + cls : ''), text));
+    log.scrollTop = log.scrollHeight;
+  };
+
+  const send = async (text) => {
+    if (!text) return;
+    line(text, 'me');
+    const thinking = el('div', 'typing', '正在想…');
+    log.append(thinking);
+    log.scrollTop = log.scrollHeight;
+
+    await new Promise((resolve) => setTimeout(resolve, 900));
+    thinking.remove();
+
+    if (/失败/.test(text)) {
+      state.result = '失败';
+      render();
+      line('把筛选切到「只看失败」了，两条卡住的运行都在上面。要不要我挑一条重跑？', '');
+      line('界面已更新', 'sys');
+    } else if (/慢|耗/.test(text)) {
+      line('最慢的三次都是撞到 12 轮上限停下来的：21 分 25 秒、10 分 26 秒、5 分整。要我把上限调高，或者让它在第 10 轮先汇报一次进度？', '');
+    } else {
+      line('收到。我会先改界面里的「' + text.slice(0, 24) + '」那块，改完用同名保存，界面会当场刷新。', '');
+    }
+  };
+
+  composer.addEventListener('submit', (event) => {
+    event.preventDefault();
+    const text = input.value.trim();
+    input.value = '';
+    input.style.height = 'auto';
+    send(text);
+  });
+
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && !event.shiftKey) {
+      event.preventDefault();
+      composer.requestSubmit();
+    }
+  });
+  input.addEventListener('input', () => {
+    input.style.height = 'auto';
+    input.style.height = Math.min(88, input.scrollHeight) + 'px';
+  });
+
+  render();
+  line('这是这次对话产出的界面，下面可以直接跟它说话 —— 试试点「只看失败」，或者问「最慢的几次是怎么回事」。', 'sys');
+})();
+</script>
+</body>
+</html>
