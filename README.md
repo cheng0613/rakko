@@ -107,6 +107,31 @@ docker compose up -d --build                     # db + api 全容器化，api �
 **能力边界**：技能只能收窄工具，**不能新增工具**。工具集本身固定七个，
 要加能力得先加工具，再让技能去限制它。
 
+## 工具插件
+
+技能能收窄工具，插件能**新增**工具。插件就是一个 `.mjs` 文件，放在 `~/.rakko/tools/`
+（`RAKKO_TOOLS_DIR` 可改），重启服务即生效：
+
+```js
+export const name = 'git_log';
+export const description = '看最近几次提交';
+export const risk = 'low';              // low | medium | high，默认 medium
+export const requiresApproval = false;   // 默认 true —— 插件是你自己的代码，默认要点头
+export const parameters = { type: 'object', properties: { count: { type: 'integer' } } };
+
+export async function run(args, context) {
+  return '给模型看的文本结果';           // context.workspace 是工作区根目录
+}
+```
+
+- 参数用 JSON Schema 直接给模型，校验交给插件自己（抛错会变成一条失败的工具结果）；
+- **坏插件只跳过自己**：语法错、缺 `run`、name 不合法、description 为空 → 记一条日志继续启动；
+- 默认要审批，可以靠「允许这类」一次性放行；
+- 仓库里带了一个能用的示例：`examples/tools/git-log.mjs`（拷到 `~/.rakko/tools/` 即可）。
+
+技能与插件的关系：插件加工具，技能限制工具。挂上「只读模式」时，插件工具同样会被挡 ——
+因为限制是作用在整张工具表上的。
+
 ## 记忆
 
 侧栏「记忆」：四类跨会话的东西 —— 关于我 / 偏好纠正 / 项目 / 参考。

@@ -1339,10 +1339,21 @@
       box.append(make('span', 'muted', '还没有挂载工具'));
       return;
     }
+
+    const restricted = state.health?.restrictedTools;
     for (const tool of tools) {
-      const chip = make('span', 'tag' + (tool.approval ? '' : ' accent'), tool.name);
-      chip.title = tool.risk + (tool.approval ? ' · 需审批' : ' · 直接执行');
+      const blocked = Array.isArray(restricted) && !restricted.includes(tool.name);
+      const chip = make('span', 'tag' + (blocked ? '' : tool.approval ? '' : ' accent'), tool.name);
+      chip.title = tool.risk + (tool.approval ? ' · 需审批' : ' · 直接执行') + (blocked ? ' · 被技能禁用' : '');
+      if (blocked) chip.style.opacity = '.4';
       box.append(chip);
+    }
+
+    if (Array.isArray(restricted)) {
+      const note = make('div', 'muted', `技能限制：仅 ${restricted.length} 个可用`);
+      note.style.cssText = 'font-size:11px;margin-top:6px;width:100%';
+      note.title = restricted.join('、');
+      box.append(note);
     }
   };
 

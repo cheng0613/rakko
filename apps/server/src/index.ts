@@ -1,5 +1,8 @@
 import { createDb, migrateDb } from '@rakko/db';
-import { createBuiltinTools, createSecondToolset, FakeProvider, OpenAICompatibleProvider, ProviderGateway, ToolRegistry } from '@rakko/core';
+import { homedir } from 'node:os';
+import path from 'node:path';
+
+import { createBuiltinTools, createSecondToolset, FakeProvider, loadToolPlugins, OpenAICompatibleProvider, ProviderGateway, ToolRegistry } from '@rakko/core';
 
 import { createApp, FAKE_MODELS } from './app.js';
 import { loadAgentSettings, loadProviderSettings } from './config.js';
@@ -56,6 +59,17 @@ for (const tool of createSecondToolset({
   http: { allowPrivate: agentSettings.httpAllowPrivate },
 })) {
   tools.register(tool);
+}
+
+// 工具插件：用户自己的 .mjs，放在 ~/.rakko/tools（默认要审批）
+const pluginDir = process.env.RAKKO_TOOLS_DIR ?? path.join(homedir(), '.rakko', 'tools');
+const plugins = await loadToolPlugins(pluginDir);
+for (const tool of plugins.tools) tools.register(tool);
+if (plugins.tools.length > 0) {
+  console.log(`工具插件：${plugins.tools.map((tool) => tool.name).join('、')}（${pluginDir}）`);
+}
+for (const error of plugins.errors) {
+  console.error(`工具插件跳过 ${error.file}：${error.reason}`);
 }
 
 console.log(`工作区：${agentSettings.workspace}`);

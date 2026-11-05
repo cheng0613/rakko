@@ -6,3 +6,6 @@ dist/
 .env.local
 .DS_Store
 coverage/
+
+# 本机运行产物（日志、预览网关）
+.local/

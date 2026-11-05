@@ -397,10 +397,14 @@ test('重启后停在等待审批的运行能接着批，把工具跑完', { ski
   const app2 = createApp({ store: store2, gateway, tools, workspace, approvalTimeoutMs: 60_000 });
   await app2.ready();
 
-  const resumed = (await app2.inject({ method: 'GET', url: `/v1/runs/${run.id}` })).json();
-  assert.equal(resumed.state, 'waiting_approval');
-  assert.equal(resumed.pendingApprovals.length, 1);
-  assert.equal(resumed.pendingApprovals[0].name, 'write_file');
+  // 恢复是异步的（要先算工具策略），等审批挂上去再断言
+  const resumed = await waitFor(
+    app2,
+    run.id,
+    (body) => body.state === 'waiting_approval' && (body.pendingApprovals?.length ?? 0) > 0,
+  );
+  assert.equal(resumed.pendingApprovals?.length, 1);
+  assert.equal((resumed.pendingApprovals?.[0] as { name: string }).name, 'write_file');
 
   const decided = await app2.inject({
     method: 'POST', url: `/v1/runs/${run.id}/approvals/call_resume`, payload: { decision: 'allow' },
@@ -818,5 +822,20 @@ test('技能可以收窄工具集：挂上「只读模式」就写不了文件',
   const results = items.filter((item) => item.kind === 'tool_result');
   assert.ok(results.length >= 1);
   assert.match(String(results[0]?.payload?.output ?? ''), /技能没启用 write_file/);
+  await app.close();
+});
+
+test('挂载的技能限制工具时，/health 会说出来', async () => {
+  const app = makeApp();
+
+  const before = (await app.inject({ method: 'GET', url: '/health' })).json();
+  assert.equal(before.restrictedTools, undefined);
+
+  const skills = (await app.inject({ method: 'GET', url: '/v1/skills' })).json();
+  const readOnly = skills.items.find((item: { slug: string }) => item.slug === 'read-only');
+  await app.inject({ method: 'PATCH', url: `/v1/skills/${readOnly.id}`, payload: { enabled: true } });
+
+  const after = (await app.inject({ method: 'GET', url: '/health' })).json();
+  assert.deepEqual([...after.restrictedTools].sort(), ['grep', 'list_dir', 'read_file']);
   await app.close();
 });

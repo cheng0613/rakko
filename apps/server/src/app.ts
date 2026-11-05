@@ -83,7 +83,10 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
   const controllers = new Map<string, AbortController>();
   const canceled = new Set<string>();
 
-  app.get('/health', async () => ({
+  app.get('/health', async () => {
+    const policy = await resolveToolPolicy();
+
+    return {
     ok: true,
     service: 'rakko-api',
     version: '0.2.0',
@@ -93,8 +96,10 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
     store: store.kind,
     workspace,
     tools: tools.list().map((tool) => ({ name: tool.name, risk: tool.risk, approval: tool.requiresApproval })),
-    pendingApprovals: gate.size,
-  }));
+    ...(policy.restricted ? { restrictedTools: policy.restricted } : {}),
+      pendingApprovals: gate.size,
+    };
+  });
 
   /**
    * 界面是自包含单文件，由服务端直接吐出，同源就没有跨域问题。
@@ -547,19 +552,10 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
     controllers.set(run.id, controller);
 
     // 挂载的技能可以收窄工具集：声明了 tools 的技能取交集
-    const [allSkills, settings] = await Promise.all([store.listSkills(), store.getSettings()]);
-    const restricted = allSkills
-      .filter((skill) => settings.enabledSkills.includes(skill.slug) && skill.tools.length > 0)
-      .map((skill) => new Set(skill.tools));
-
-    let allowTool: ((name: string) => boolean) | undefined;
-    if (restricted.length > 0) {
-      const allowed = new Set(restricted[0]);
-      for (const set of restricted.slice(1)) {
-        for (const name of [...allowed]) if (!set.has(name)) allowed.delete(name);
-      }
-      allowTool = (name: string) => allowed.has(name);
-      const note = ['', '## 本次可用的工具', `只允许：${[...allowed].join('、')}（由挂载的技能限制）`].join('\n');
+    const policy = await resolveToolPolicy();
+    const allowTool = policy.allowTool;
+    if (policy.restricted) {
+      const note = ['', '## 本次可用的工具', `只允许：${policy.restricted.join('、')}（由挂载的技能限制）`].join('\n');
       const first = messages[0];
       if (first && first.role === 'system') messages[0] = { ...first, content: first.content + note };
     }
@@ -818,6 +814,21 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
     const history = trimHistory(buildHistory(await store.listMessages(run.threadId)));
     const systemPrompt = buildSystemPrompt() + (await buildSkillSection()) + (await buildMemorySection());
     await executeRun(run, tier, [{ role: 'system', content: systemPrompt }, ...history], null, notice);
+  }
+
+  /** 挂载的技能若声明了 tools，就取交集；restricted 为 null 表示不限制 */
+  async function resolveToolPolicy(): Promise<{ allowTool?: (name: string) => boolean; restricted: string[] | null }> {
+    const [allSkills, settings] = await Promise.all([store.listSkills(), store.getSettings()]);
+    const restricting = allSkills
+      .filter((skill) => settings.enabledSkills.includes(skill.slug) && skill.tools.length > 0)
+      .map((skill) => new Set(skill.tools));
+    if (restricting.length === 0) return { restricted: null };
+
+    const allowed = new Set(restricting[0]);
+    for (const set of restricting.slice(1)) {
+      for (const name of [...allowed]) if (!set.has(name)) allowed.delete(name);
+    }
+    return { allowTool: (name: string) => allowed.has(name), restricted: [...allowed] };
   }
 
   /** 把挂载中的技能拼成系统提示的一段：最多 3 个、每个 1500 字 */

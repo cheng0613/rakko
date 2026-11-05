@@ -21,7 +21,10 @@ export interface ToolSpec {
   risk: RiskLevel;
   /** 高风险工具默认要人点一下 */
   requiresApproval: boolean;
-  parameters: z.ZodType;
+  /** 内置工具用 zod 校验 */
+  parameters?: z.ZodType;
+  /** 插件工具直接给 JSON Schema，自己校参数 */
+  jsonSchema?: unknown;
   run: (args: never, context: ToolContext) => Promise<string>;
 }
 
@@ -65,12 +68,12 @@ export class ToolRegistry {
     return [...this.tools.values()];
   }
 
-  /** 发给模型的描述，参数用 zod 转 JSON Schema，避免手写两份。 */
+  /** 发给模型的描述：zod 的转成 JSON Schema，插件的原样透传。 */
   definitions(): ToolDefinition[] {
     return this.list().map((tool) => ({
       name: tool.name,
       description: tool.description,
-      parameters: z.toJSONSchema(tool.parameters, { io: 'input' }),
+      parameters: tool.parameters ? z.toJSONSchema(tool.parameters, { io: 'input' }) : (tool.jsonSchema ?? { type: 'object' }),
     }));
   }
 
@@ -83,7 +86,8 @@ export class ToolRegistry {
       return { ok: false, output: `没有名为 ${call.name} 的工具。可用工具：${[...this.tools.keys()].join('、')}`, durationMs: 0 };
     }
 
-    const parsed = tool.parameters.safeParse(call.args);
+    // 插件没有 zod，就交给它自己校（run 里抛错会变成工具失败）
+    const parsed = tool.parameters ? tool.parameters.safeParse(call.args) : { success: true as const, data: call.args };
     if (!parsed.success) {
       const detail = parsed.error.issues.map((issue) => `${issue.path.join('.') || '(root)'}: ${issue.message}`).join('; ');
       return { ok: false, output: `参数不合法：${detail}`, durationMs: 0 };
