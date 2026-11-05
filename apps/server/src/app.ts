@@ -1,4 +1,5 @@
 import { readFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
 import Fastify, { type FastifyInstance } from 'fastify';
@@ -16,6 +17,7 @@ import {
   type ModelProvider,
   type ModelTier,
   type PluginHost,
+  type ToolSpec,
 } from '@rakko/core';
 import {
   approvalDecisionSchema,
@@ -24,6 +26,7 @@ import {
   createAutomationInput,
   createMemoryInput,
   createSkillInput,
+  createAppInput,
   createThreadInput,
   forkThreadInput,
   messagesQuery,
@@ -31,6 +34,7 @@ import {
   updateMemoryInput,
   updateSkillInput,
   TERMINAL_STATES,
+  updateAppInput,
   updateSettingsInput,
   updateThreadInput,
   type Message,
@@ -42,6 +46,7 @@ import {
 import { describeCron, selectDue, validateCron } from './automation.js';
 import { extractMemories } from './memory-extract.js';
 import { summarizeTrace } from './trace.js';
+import { validateTree } from '@rakko/genui';
 import { MemoryStore, type PendingCall, type RunStore } from './store.js';
 
 const invalid = (issues: unknown[]) => ({ error: 'invalid_request', message: '请求体不合法', issues });
@@ -81,10 +86,54 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
     });
 
   const workspace = options.workspace ?? process.cwd();
+  /**
+   * 让 agent 自己把对话里的东西沉淀成一个应用。
+   * 和 render_ui 的区别：render_ui 画完就过去了，save_app 会留下来，下次能直接打开。
+   */
+  const saveAppTool: ToolSpec = {
+    name: 'save_app',
+    description:
+      '把这次对话里做出来的界面存成一个「小应用」，以后不用重新聊就能打开用。' +
+      '传 name（不超过 20 字）、description（一句话）、spec（组件树，和 render_ui 的格式一致）。' +
+      '界面上要能自己用起来：放按钮/表单/筛选，别只放一段说明文字。',
+    risk: 'medium',
+    requiresApproval: false,
+    jsonSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string' },
+        description: { type: 'string' },
+        spec: { type: 'object' },
+      },
+      required: ['name', 'spec'],
+    },
+    run: async (args) => {
+      const input = args as { name?: unknown; description?: unknown; spec?: unknown };
+      const name = typeof input.name === 'string' ? input.name.trim().slice(0, 40) : '';
+      if (!name) return JSON.stringify({ ok: false, error: 'name 不能为空' });
+
+      const problem = validSpec(input.spec);
+      if (problem) return JSON.stringify({ ok: false, error: `界面不合法：${problem}` });
+
+      try {
+        const app = await store.createApp({
+          name,
+          ...(typeof input.description === 'string' ? { description: input.description.trim().slice(0, 200) } : {}),
+          spec: input.spec,
+        });
+        return JSON.stringify({ ok: true, app: { id: app.id, name: app.name }, hint: '已经存成应用，左侧「应用」里能看到' });
+      } catch (error) {
+        return JSON.stringify({ ok: false, error: `存应用失败：${error instanceof Error ? error.message : String(error)}` });
+      }
+    },
+  };
+
   const tools = options.tools ?? new ToolRegistry({ workspace });
   if (!options.tools) {
     for (const tool of createBuiltinTools({ workspace })) tools.register(tool);
   }
+  // save_app 依赖 store，属于服务端能力，不管有没有传 tools 都要有
+  if (!tools.get('save_app')) tools.register(saveAppTool);
 
   const gate = new ApprovalGate({ timeoutMs: options.approvalTimeoutMs ?? 10 * 60_000 });
   /** 用户点过「允许这类」的工具；启动时从设置里读回来 */
@@ -122,6 +171,23 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
   const webFile = process.env.RAKKO_WEB_DIR
     ? path.join(process.env.RAKKO_WEB_DIR, 'index.html')
     : new URL('../../web/index.html', import.meta.url);
+  // 生成式界面的浏览器版校验器（与 packages/genui 同一份源码打出来的）
+  const webDir = process.env.RAKKO_WEB_DIR
+    ? process.env.RAKKO_WEB_DIR
+    : path.dirname(fileURLToPath(new URL('../../web/index.html', import.meta.url)));
+  app.get('/vendor/:file', async (request, reply) => {
+    const { file } = request.params as { file: string };
+    if (!/^[a-z0-9._-]+.js$/i.test(file)) {
+      return reply.code(404).send({ error: 'not_found', message: '没有这个文件' });
+    }
+    try {
+      const body = await readFile(path.join(webDir, 'vendor', file), 'utf8');
+      return reply.type('application/javascript; charset=utf-8').header('cache-control', 'no-store').send(body);
+    } catch {
+      return reply.code(404).send({ error: 'not_found', message: '没有这个文件' });
+    }
+  });
+
   app.get('/', async (_request, reply) => {
     try {
       const html = await readFile(webFile, 'utf8');
@@ -503,6 +569,51 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
 
     const events = await store.eventsOf(id);
     return { run, events, summary: summarizeTrace(run, events) };
+  });
+
+  /* ---------------- 小应用 ---------------- */
+
+  /** 树必须过白名单 —— 存进去的东西，打开时要能原样画出来 */
+  const validSpec = (spec: unknown): string | null => {
+    const parsed = validateTree(spec);
+    return parsed.ok ? null : parsed.reason;
+  };
+
+  app.get('/v1/apps', async () => ({ items: await store.listApps() }));
+
+  app.get('/v1/apps/:id', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const app = await store.getApp(id);
+    if (!app) return reply.code(404).send({ error: 'app_not_found', message: '应用不存在' });
+    return app;
+  });
+
+  app.post('/v1/apps', async (request, reply) => {
+    const parsed = createAppInput.safeParse(request.body ?? {});
+    if (!parsed.success) return reply.code(400).send(invalid(parsed.error.issues));
+    const problem = validSpec(parsed.data.spec);
+    if (problem) return reply.code(400).send({ error: 'invalid_spec', message: `界面不合法：${problem}` });
+    return reply.code(201).send(await store.createApp(parsed.data));
+  });
+
+  app.patch('/v1/apps/:id', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const parsed = updateAppInput.safeParse(request.body ?? {});
+    if (!parsed.success) return reply.code(400).send(invalid(parsed.error.issues));
+    if (parsed.data.spec !== undefined) {
+      const problem = validSpec(parsed.data.spec);
+      if (problem) return reply.code(400).send({ error: 'invalid_spec', message: `界面不合法：${problem}` });
+    }
+    const updated = await store.updateApp(id, parsed.data);
+    if (!updated) return reply.code(404).send({ error: 'app_not_found', message: '应用不存在' });
+    return updated;
+  });
+
+  app.delete('/v1/apps/:id', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const removed = await store.deleteApp(id);
+    if (!removed) return reply.code(404).send({ error: 'app_not_found', message: '应用不存在' });
+    return { ok: true };
   });
 
   /** 跨运行概览：最近 N 条 + 成功率 / 分位耗时 / 工具失败榜 */

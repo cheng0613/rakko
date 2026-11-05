@@ -5,10 +5,11 @@ import { getTableColumns, getTableName } from 'drizzle-orm';
 
 import { TABLES } from './schema.js';
 
-test('持久化面固定为十一张表（九张基础表 + 知识图谱两张）', () => {
-  assert.equal(TABLES.length, 11);
+test('持久化面固定为十二张表（九张基础表 + 知识图谱两张 + 应用一张）', () => {
+  assert.equal(TABLES.length, 12);
   const names = TABLES.map((table) => getTableName(table)).sort();
   assert.deepEqual(names, [
+    'apps',
     'automations',
     'kg_edges',
     'kg_nodes',

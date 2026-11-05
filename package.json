@@ -7,7 +7,7 @@
     "node": ">=22"
   },
   "scripts": {
-    "build": "turbo run build",
+    "build": "turbo run build && node scripts/build-genui-browser.mjs",
     "typecheck": "turbo run typecheck",
     "test": "turbo run test",
     "dev": "turbo run dev --parallel",
@@ -24,7 +24,8 @@
     "typescript": "^5.9.3",
     "@rakko/core": "workspace:^",
     "@rakko/db": "workspace:^",
-    "@rakko/server": "workspace:^"
+    "@rakko/server": "workspace:^",
+    "esbuild": "^0.28.2"
   },
   "pnpm": {
     "onlyBuiltDependencies": [

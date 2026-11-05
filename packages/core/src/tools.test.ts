@@ -102,7 +102,7 @@ test('命令失败时把退出码与输出一起交回模型', async () => {
 test('发给模型的工具描述是 JSON Schema，不用手写两份', async () => {
   const { registry } = await makeRegistry();
   const definitions = registry.definitions();
-  assert.equal(definitions.length, 4);
+  assert.equal(definitions.length, 5, '4 个文件工具 + render_ui');
 
   const readFile = definitions.find((tool) => tool.name === 'read_file');
   assert.ok(readFile);

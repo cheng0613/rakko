@@ -109,6 +109,33 @@ export const MESSAGE_KINDS = [
 export const messageKindSchema = z.enum(MESSAGE_KINDS);
 export type MessageKind = (typeof MESSAGE_KINDS)[number];
 
+/** 小应用：一份 genui 树 + 名字，打开就能用，不用重新对话 */
+export const appSchema = z.object({
+  id,
+  name: z.string(),
+  description: z.string(),
+  spec: z.unknown(),
+  threadId: id.nullable(),
+  createdAt: at,
+  updatedAt: at,
+});
+export type App = z.infer<typeof appSchema>;
+
+export const createAppInput = z.object({
+  name: z.string().trim().min(1).max(40),
+  description: z.string().trim().max(200).optional(),
+  spec: z.unknown(),
+  threadId: id.optional(),
+});
+export type CreateAppInput = z.infer<typeof createAppInput>;
+
+export const updateAppInput = z.object({
+  name: z.string().trim().min(1).max(40).optional(),
+  description: z.string().trim().max(200).optional(),
+  spec: z.unknown().optional(),
+});
+export type UpdateAppInput = z.infer<typeof updateAppInput>;
+
 export const messageSchema = z.object({
   id,
   threadId: id,

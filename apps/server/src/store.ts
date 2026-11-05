@@ -10,7 +10,7 @@ import { randomUUID } from 'node:crypto';
 import { currentPeriod, decideQuota, entityKey, normalizeEntityName, periodStart, planLimit, type QuotaDecision, type QuotaState } from '@rakko/core';
 
 import { buildOverview, type RunOverviewRow, type RunsOverview, type ToolTally } from './overview.js';
-import type { Automation, Graph, Memory, MemoryStatus, Message, MessageKind, MessageRole, RiskLevel, Run, RunEvent, Settings, Skill, Thread, Usage } from '@rakko/protocol';
+import type { App, Automation, Graph, Memory, MemoryStatus, Message, MessageKind, MessageRole, RiskLevel, Run, RunEvent, Settings, Skill, Thread, Usage } from '@rakko/protocol';
 
 export interface AppendMessageInput {
   threadId: string;
@@ -88,6 +88,12 @@ export interface RunStore {
   latestRunForThread(threadId: string): Promise<Run | undefined>;
   /** 跨运行的概览：最近 limit 条 + 成功率 / 分位耗时 / 最爱出错的工具 */
   runsOverview(limit: number): Promise<RunsOverview>;
+  /** 小应用：从对话里沉淀下来的界面 */
+  listApps(): Promise<App[]>;
+  getApp(id: string): Promise<App | null>;
+  createApp(input: { name: string; description?: string; spec: unknown; threadId?: string }): Promise<App>;
+  updateApp(id: string, patch: { name?: string; description?: string; spec?: unknown }): Promise<App | null>;
+  deleteApp(id: string): Promise<boolean>;
   /** 技能：可挂载的规则块 */
   listSkills(): Promise<Skill[]>;
   createSkill(input: { name: string; description?: string; body: string; tools?: string[] }): Promise<Skill>;
@@ -673,7 +679,10 @@ export class MemoryStore implements RunStore {
 
   async runsOverview(limit: number): Promise<RunsOverview> {
     const rows: RunOverviewRow[] = [...this.runs.values()]
-      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+      // 同一毫秒建的两条运行，靠插入顺序兜底，否则「最新的在前」会随机
+      .map((run, index) => ({ run, index }))
+      .sort((a, b) => b.run.createdAt.localeCompare(a.run.createdAt) || b.index - a.index)
+      .map((item) => item.run)
       .slice(0, limit)
       .map((run) => {
         const events = this.events.get(run.id) ?? [];
@@ -719,6 +728,49 @@ export class MemoryStore implements RunStore {
       .slice(0, 5);
 
     return buildOverview(rows, topTools);
+  }
+
+  private readonly apps = new Map<string, App>();
+
+  async listApps(): Promise<App[]> {
+    return [...this.apps.values()].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+
+  async getApp(id: string): Promise<App | null> {
+    return this.apps.get(id) ?? null;
+  }
+
+  async createApp(input: { name: string; description?: string; spec: unknown; threadId?: string }): Promise<App> {
+    const at = now();
+    const app: App = {
+      id: randomUUID(),
+      name: input.name,
+      description: input.description ?? '',
+      spec: input.spec,
+      threadId: input.threadId ?? null,
+      createdAt: at,
+      updatedAt: at,
+    };
+    this.apps.set(app.id, app);
+    return app;
+  }
+
+  async updateApp(id: string, patch: { name?: string; description?: string; spec?: unknown }): Promise<App | null> {
+    const current = this.apps.get(id);
+    if (!current) return null;
+    const next: App = {
+      ...current,
+      ...(patch.name !== undefined ? { name: patch.name } : {}),
+      ...(patch.description !== undefined ? { description: patch.description } : {}),
+      ...(patch.spec !== undefined ? { spec: patch.spec } : {}),
+      updatedAt: now(),
+    };
+    this.apps.set(id, next);
+    return next;
+  }
+
+  async deleteApp(id: string): Promise<boolean> {
+    return this.apps.delete(id);
   }
 
   async publish(event: RunEvent): Promise<void> {

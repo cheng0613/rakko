@@ -243,6 +243,26 @@ export const usageLedger = pgTable(
   (table) => [index('usage_user_period_idx').on(table.userId, table.period)],
 );
 
+/** 小应用：从对话里沉淀出来的可反复打开的界面（结构就是一份 genui 树） */
+export const apps = pgTable(
+  'apps',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    name: text('name').notNull(),
+    description: text('description').notNull().default(''),
+    /** genui 组件树；打开时按它渲染，不是代码 */
+    spec: jsonb('spec').notNull(),
+    /** 从哪个会话来的，方便回看上下文 */
+    threadId: uuid('thread_id').references(() => threads.id, { onDelete: 'set null' }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [uniqueIndex('apps_user_name_uq').on(table.userId, table.name)],
+);
+
 export const threadsRelations = relations(threads, ({ many }) => ({
   messages: many(messages),
   runs: many(runs),
@@ -266,6 +286,7 @@ export const TABLES = [
   usageLedger,
   kgNodes,
   kgEdges,
+  apps,
 ] as const;
 
 export type User = typeof users.$inferSelect;
@@ -279,3 +300,4 @@ export type Memory = typeof memories.$inferSelect;
 export type UsageLedgerRow = typeof usageLedger.$inferSelect;
 export type KgNode = typeof kgNodes.$inferSelect;
 export type KgEdge = typeof kgEdges.$inferSelect;
+export type App = typeof apps.$inferSelect;

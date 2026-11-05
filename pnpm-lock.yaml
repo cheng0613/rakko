@@ -178,6 +178,9 @@ importers:
       '@types/node':
         specifier: ^22.15.3
         version: 22.20.5
+      esbuild:
+        specifier: ^0.28.2
+        version: 0.28.2
       tsx:
         specifier: ^4.20.6
         version: 4.23.15
@@ -211,6 +214,9 @@ importers:
       '@rakko/db':
         specifier: workspace:^
         version: link:../../packages/db
+      '@rakko/genui':
+        specifier: workspace:^
+        version: link:../../packages/genui
       '@rakko/protocol':
         specifier: workspace:^
         version: link:../../packages/protocol
@@ -226,6 +232,9 @@ importers:
 
   packages/core:
     dependencies:
+      '@rakko/genui':
+        specifier: workspace:^
+        version: link:../genui
       '@rakko/protocol':
         specifier: workspace:^
         version: link:../protocol

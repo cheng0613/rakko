@@ -10,9 +10,9 @@
 import { and, asc, desc, eq, ilike, inArray, isNotNull, isNull, lt, or, sql } from 'drizzle-orm';
 
 import type { DbHandle } from '@rakko/db';
-import { automations, kgEdges, kgNodes, memories, messages, runEvents, runs, skills, threads, usageLedger, users } from '@rakko/db';
+import { apps, automations, kgEdges, kgNodes, memories, messages, runEvents, runs, skills, threads, usageLedger, users } from '@rakko/db';
 import { currentPeriod, decideQuota, periodStart, planLimit, type QuotaDecision } from '@rakko/core';
-import type { Automation, Graph, KgEdge, KgNode, Memory, MemoryKind, MemoryStatus, Message, MessageKind, RiskLevel, Run, RunEvent, RunState, Settings, Skill, Thread, Usage } from '@rakko/protocol';
+import type { App, Automation, Graph, KgEdge, KgNode, Memory, MemoryKind, MemoryStatus, Message, MessageKind, RiskLevel, Run, RunEvent, RunState, Settings, Skill, Thread, Usage } from '@rakko/protocol';
 
 import { entityKey, normalizeEntityName, toVectorLiteral } from '@rakko/core';
 
@@ -50,6 +50,16 @@ const toMessage = (row: typeof messages.$inferSelect): Message => ({
   payload: (row.payload as Record<string, unknown> | null) ?? null,
   runId: row.runId,
   createdAt: row.createdAt.toISOString(),
+});
+
+const toApp = (row: typeof apps.$inferSelect): App => ({
+  id: row.id,
+  name: row.name,
+  description: row.description,
+  spec: row.spec,
+  threadId: row.threadId,
+  createdAt: row.createdAt.toISOString(),
+  updatedAt: row.updatedAt.toISOString(),
 });
 
 const toKgNode = (row: typeof kgNodes.$inferSelect): KgNode => ({
@@ -230,6 +240,62 @@ export class PostgresStore implements RunStore {
    * 跨运行概览。列表用一条 SQL 出（事件表按 run_id 聚合，不把几千条事件读进来），
    * 工具成败单独数一条 —— 只有它需要把 tool_call 和 tool_result 按 callId 配上对。
    */
+  async listApps(): Promise<App[]> {
+    const userId = this.requireUserId();
+    const rows = await this.db.select().from(apps).where(eq(apps.userId, userId)).orderBy(desc(apps.updatedAt));
+    return rows.map(toApp);
+  }
+
+  async getApp(id: string): Promise<App | null> {
+    const userId = this.requireUserId();
+    const [row] = await this.db
+      .select()
+      .from(apps)
+      .where(and(eq(apps.userId, userId), eq(apps.id, id)))
+      .limit(1);
+    return row ? toApp(row) : null;
+  }
+
+  async createApp(input: { name: string; description?: string; spec: unknown; threadId?: string }): Promise<App> {
+    const userId = this.requireUserId();
+    const [row] = await this.db
+      .insert(apps)
+      .values({
+        userId,
+        name: input.name,
+        description: input.description ?? '',
+        spec: input.spec,
+        threadId: input.threadId ?? null,
+      })
+      .returning();
+    if (!row) throw new Error('建应用失败');
+    return toApp(row);
+  }
+
+  async updateApp(id: string, patch: { name?: string; description?: string; spec?: unknown }): Promise<App | null> {
+    const userId = this.requireUserId();
+    const [row] = await this.db
+      .update(apps)
+      .set({
+        ...(patch.name !== undefined ? { name: patch.name } : {}),
+        ...(patch.description !== undefined ? { description: patch.description } : {}),
+        ...(patch.spec !== undefined ? { spec: patch.spec } : {}),
+        updatedAt: new Date(),
+      })
+      .where(and(eq(apps.userId, userId), eq(apps.id, id)))
+      .returning();
+    return row ? toApp(row) : null;
+  }
+
+  async deleteApp(id: string): Promise<boolean> {
+    const userId = this.requireUserId();
+    const rows = await this.db
+      .delete(apps)
+      .where(and(eq(apps.userId, userId), eq(apps.id, id)))
+      .returning({ id: apps.id });
+    return rows.length > 0;
+  }
+
   async runsOverview(limit: number): Promise<RunsOverview> {
     const userId = this.requireUserId();
 

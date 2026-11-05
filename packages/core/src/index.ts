@@ -46,6 +46,7 @@ export {
 export { ToolRegistry, type ApprovalOutcome, type ToolContext, type ToolResult, type ToolSpec } from './tools.js';
 export { createBuiltinTools, type BuiltinToolsOptions } from './tools/builtin.js';
 export { createSecondToolset, type HttpToolOptions, type SecondToolsetOptions } from './tools/network.js';
+export { createRenderUiTool } from './tools/genui.js';
 export { loadToolPlugins, type LoadedPlugins, type ToolPluginError } from './plugins.js';
 export { PluginHost, type PluginHostInfo, type PluginHostOptions } from './plugin-host.js';
 export { entityKey, normalizeEntityName } from './entity.js';

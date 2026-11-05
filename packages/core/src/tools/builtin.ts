@@ -81,11 +81,14 @@ export interface BuiltinToolsOptions {
   shellTimeoutMs?: number;
 }
 
+import { createRenderUiTool } from './genui.js';
+
 export function createBuiltinTools(options: BuiltinToolsOptions): ToolSpec[] {
   const { workspace } = options;
   const shellTimeoutMs = options.shellTimeoutMs ?? 20_000;
 
   return [
+    createRenderUiTool(),
     {
       name: 'read_file',
       description: '读取工作区里一个文本文件的内容。路径必须是相对工作区的路径。',

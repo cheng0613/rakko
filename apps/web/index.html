@@ -797,6 +797,57 @@
   .run-row .rr.bad{color:var(--danger)}
   .run-row .rr.mid{color:var(--orange)}
   .run-row .hint{color:var(--danger);font-size:10.5px;white-space:nowrap}
+  /* 应用：一块块卡片，点开是整屏 */
+  .apps-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px}
+  .app-card{display:flex;flex-direction:column;gap:8px;border:1px solid var(--line);border-radius:16px;background:var(--surface);padding:14px 16px;cursor:pointer;text-align:left;position:relative}
+  .app-card:hover{border-color:var(--accent)}
+  .app-card h4{margin:0;font-size:13.5px;font-weight:590}
+  .app-card p{margin:0;font-size:12px;line-height:1.55;color:var(--muted);min-height:34px}
+  .app-card .app-meta{display:flex;align-items:center;gap:8px;font-size:10.5px;color:var(--faint);margin-top:auto}
+  .app-card .app-del{margin-left:auto;background:none;border:0;color:var(--faint);font-size:11px;cursor:pointer;padding:0}
+  .app-card .app-del:hover{color:var(--danger)}
+  .app-shell{position:fixed;inset:0;z-index:72;display:flex;align-items:stretch;justify-content:center;background:rgba(0,0,0,.22);padding:24px}
+  .app-shell[hidden]{display:none}
+  .app-window{width:min(960px,100%);background:var(--bg);border:1px solid var(--line);border-radius:20px;display:flex;flex-direction:column;overflow:hidden}
+  .app-window-head{display:flex;align-items:flex-start;gap:10px;padding:16px 20px;border-bottom:1px solid var(--line)}
+  .app-window-head h3{margin:0;font-size:15px;font-weight:590}
+  .app-window-head p{margin:2px 0 0;font-size:11.5px;color:var(--muted)}
+  .app-window-body{flex:1;overflow:auto;padding:18px 20px 24px}
+
+  /* 生成式界面：跟正文同一套字色与线，别让它看起来像插件 */
+  .genui{display:flex;flex-direction:column;gap:10px;margin:10px 0 4px}
+  .g-card{border:1px solid var(--line);border-radius:14px;background:var(--surface);padding:12px 14px}
+  .g-card-title{font-size:12px;font-weight:590;margin-bottom:8px}
+  .g-text{font-size:13px;line-height:1.6;color:var(--text-2)}
+  .g-md{font-size:13px;line-height:1.7;color:var(--text-2)}
+  .g-md p{margin:0 0 8px}
+  .g-md p:last-child{margin:0}
+  .g-stack{display:flex;flex-direction:column;gap:8px}
+  .g-row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  .g-list{margin:0;padding-left:18px;font-size:13px;line-height:1.6;color:var(--text-2);display:flex;flex-direction:column;gap:4px}
+  .g-table{width:100%;border-collapse:collapse;font-size:12.5px}
+  .g-table th{text-align:left;font-weight:560;color:var(--muted);font-size:11px;padding:6px 8px;border-bottom:1px solid var(--line-strong)}
+  .g-table td{padding:7px 8px;border-bottom:1px solid var(--line);color:var(--text-2)}
+  .g-table tr:last-child td{border-bottom:0}
+  .g-caption{font-size:11px;color:var(--faint);margin-top:6px}
+  .g-btn{border:1px solid var(--line-strong);background:var(--surface-2);border-radius:99px;padding:5px 13px;font-size:12px;color:var(--text);cursor:pointer}
+  .g-btn:hover{border-color:var(--accent);color:var(--accent)}
+  .g-btn[data-on="1"]{background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}
+  .g-form{display:flex;flex-direction:column;gap:9px}
+  .g-field{display:flex;flex-direction:column;gap:4px}
+  .g-field span{font-size:11px;color:var(--muted)}
+  .g-field input,.g-field select{font:inherit;font-size:13px;padding:7px 10px;border-radius:10px;border:1px solid var(--line);background:var(--bg);color:var(--text)}
+  .g-field input:focus,.g-field select:focus{outline:none;border-color:var(--accent)}
+  .g-callout{border-left:2px solid var(--accent);background:var(--surface-2);border-radius:0 10px 10px 0;padding:9px 12px;font-size:12.5px;line-height:1.6;color:var(--text-2)}
+  .g-callout[data-tone="warn"]{border-color:var(--orange)}
+  .g-callout[data-tone="danger"]{border-color:var(--danger)}
+  .g-code{font-family:var(--mono);font-size:11.5px;background:var(--surface-2);border:1px solid var(--line);border-radius:10px;padding:10px 12px;overflow:auto;white-space:pre-wrap;margin:0}
+  .g-bars{display:flex;flex-direction:column;gap:6px}
+  .g-bar{display:grid;grid-template-columns:96px minmax(0,1fr) 56px;gap:8px;align-items:center;font-size:11.5px;color:var(--text-2)}
+  .g-bar i{display:block;height:6px;border-radius:99px;background:var(--accent);opacity:.85}
+  .g-bar b{font-weight:400;color:var(--muted);text-align:right;font-family:var(--mono);font-size:10.5px}
+  .g-err{font-size:11.5px;color:var(--danger)}
+
   .retry .trace-open{margin-left:auto}
   .retry .trace-open + .btn{margin-left:8px}
 
@@ -848,6 +899,10 @@
       <button class="nav-item" data-nav="memory">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3 8.5 4.5L12 12 3.5 7.5 12 3Z"/><path d="m3.5 12 8.5 4.5L20.5 12"/><path d="m3.5 16.5 8.5 4.5 8.5-4.5"/></svg>
         记忆
+      </button>
+      <button class="nav-item" data-nav="apps">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5.5A1.5 1.5 0 0 1 5.5 4h5A1.5 1.5 0 0 1 12 5.5V11a1.5 1.5 0 0 1-1.5 1.5h-5A1.5 1.5 0 0 1 4 11z"/><path d="M12 13.5A1.5 1.5 0 0 1 13.5 12h5A1.5 1.5 0 0 1 20 13.5v5A1.5 1.5 0 0 1 18.5 20h-5A1.5 1.5 0 0 1 12 18.5z"/></svg>
+        应用
       </button>
       <button class="nav-item" data-nav="skills">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="2"/><rect x="14" y="3" width="7" height="7" rx="2"/><rect x="3" y="14" width="7" height="7" rx="2"/><rect x="14" y="14" width="7" height="7" rx="2"/></svg>
@@ -1111,6 +1166,18 @@
         </div>
       </section>
 
+      <section class="view" id="view-apps">
+        <div class="auto-toolbar">
+          <span class="muted" id="appsSummary">从对话里沉淀下来的小应用：打开就能用，不用重新聊</span>
+          <button class="btn" id="appsRefresh">刷新</button>
+        </div>
+        <div class="apps-grid" id="appsGrid"></div>
+        <div id="appsEmpty" class="card" hidden style="text-align:center;padding:32px 16px">
+          <p style="margin:0 0 6px;font-size:14px;font-weight:560">还没有应用</p>
+          <p class="muted" style="margin:0;font-size:12.5px">在对话里让它「把这个做成一个小应用」，它就会出现在这里。</p>
+        </div>
+      </section>
+
       <section class="view" id="view-settings">
         <div class="grid" style="grid-template-columns:minmax(0,1fr);max-width:860px;gap:14px">
           <article class="card">
@@ -1196,6 +1263,8 @@
 </div>
 <div id="toast"></div>
 
+<!-- 生成式界面的白名单校验与插值：由 scripts/build-genui-browser.mjs 从 packages/genui 打出来 -->
+<script src="/vendor/genui.js"></script>
 <script>
 (() => {
   'use strict';
@@ -1603,16 +1672,25 @@
       } else if (message.kind === 'tool_call') {
         // 兼容早期行：那时用 id 而不是 callId
         payload.callId = payload.callId || payload.id;
-        const meta = toolMeta(payload.name);
-        cards.set(payload.callId, addTool(
-          trackTurn(message.createdAt, message.runId, message.id),
-          { callId: payload.callId, name: payload.name, args: payload.args || {} },
-          meta ? meta.risk : 'low',
-          meta ? meta.approval : false,
-          { count: false },
-        ));
+        if (payload.name === 'render_ui') {
+          // 生成式界面不画工具卡，结果直接当正文画出来
+          genuiHosts.set(payload.callId, trackTurn(message.createdAt, message.runId, message.id));
+        } else {
+          const meta = toolMeta(payload.name);
+          cards.set(payload.callId, addTool(
+            trackTurn(message.createdAt, message.runId, message.id),
+            { callId: payload.callId, name: payload.name, args: payload.args || {} },
+            meta ? meta.risk : 'low',
+            meta ? meta.approval : false,
+            { count: false },
+          ));
+        }
       } else if (message.kind === 'tool_result') {
-        cards.get(payload.callId)?.settle(payload.ok, payload.output);
+        if (payload.name === 'render_ui') {
+          renderGenuiResult(genuiHosts.get(payload.callId), payload.output);
+        } else {
+          cards.get(payload.callId)?.settle(payload.ok, payload.output);
+        }
       } else if (message.kind === 'approval') {
         // 重启后这次运行还挂在 waiting_approval 时，历史里的这张卡就是当前要处理的那张
         const isPending = payload.callId === state.pendingCallId;
@@ -2258,9 +2336,332 @@
     box.setSelectionRange(box.value.length, box.value.length);
   };
 
+  /* ---------------- 小应用 ---------------- */
+  const openAppShell = async (id) => {
+    try {
+      const app = await api('/v1/apps/' + id);
+      const shell = document.createElement('div');
+      shell.className = 'app-shell';
+
+      const win = gEl('div', 'app-window');
+      const head = gEl('div', 'app-window-head');
+      const headText = gEl('div');
+      headText.append(gEl('h3', undefined, app.name));
+      headText.append(gEl('p', undefined, app.description || '从对话里沉淀下来的小应用'));
+      const close = gEl('button', 'btn quiet', '关闭');
+      close.type = 'button';
+      close.style.marginLeft = 'auto';
+      close.addEventListener('click', () => shell.remove());
+      head.append(headText, close);
+
+      const body = gEl('div', 'app-window-body');
+      body.append(gEl('div', 'muted', '正在加载…'));
+      win.append(head, body);
+      shell.append(win);
+      shell.addEventListener('click', (event) => {
+        if (event.target === shell) shell.remove();
+      });
+      document.body.append(shell);
+
+      body.innerHTML = '';
+      mountGenui(body, app.spec);
+    } catch (error) {
+      toast('打不开这个应用：' + error.message);
+    }
+  };
+
+  const renderApps = (items) => {
+    const grid = $('#appsGrid');
+    const empty = $('#appsEmpty');
+    if (!grid) return;
+    grid.innerHTML = '';
+    if (empty) empty.hidden = items.length > 0;
+    if (items.length === 0) return;
+
+    for (const app of items) {
+      const card = document.createElement('button');
+      card.className = 'app-card';
+      card.type = 'button';
+      card.append(gEl('h4', undefined, app.name));
+      card.append(gEl('p', undefined, app.description || '（没有说明）'));
+      const meta = gEl('div', 'app-meta');
+      meta.append(gEl('span', undefined, runTime(app.updatedAt)));
+      const del = gEl('button', 'app-del', '删除');
+      del.type = 'button';
+      del.addEventListener('click', async (event) => {
+        event.stopPropagation();
+        if (!confirm('删除应用「' + app.name + '」？')) return;
+        try {
+          await api('/v1/apps/' + app.id, { method: 'DELETE' });
+          await loadApps();
+          toast('已删除');
+        } catch (error) {
+          toast('删不掉：' + error.message);
+        }
+      });
+      meta.append(del);
+      card.append(meta);
+      card.addEventListener('click', () => void openAppShell(app.id));
+      grid.append(card);
+    }
+  };
+
+  const loadApps = async () => {
+    try {
+      const body = await api('/v1/apps');
+      renderApps(body.items || []);
+    } catch (error) {
+      toast('读不到应用：' + error.message);
+    }
+  };
+
+  /* ---------------- 生成式界面 ---------------- */
+  const genuiApi = () => window.RakkoGenUI || null;
+
+  const gEl = (tag, cls, text) => {
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text !== undefined) node.textContent = text;
+    return node;
+  };
+
+  /** 控件只做两件事：发一条消息，或改本地状态 */
+  const runGenuiAction = async (action, ctx) => {
+    const api = genuiApi();
+    if (!api) return;
+    const resolved = api.resolveAction(action || {}, ctx.state);
+    if (resolved.set) {
+      Object.assign(ctx.state, resolved.set);
+      ctx.rerender();
+    }
+    if (resolved.send) await sendGenuiMessage(resolved.send);
+  };
+
+  const submitGenuiForm = async (props, ctx) => {
+    const api = genuiApi();
+    if (!api) return;
+    const fields = Array.isArray(props.fields) ? props.fields : [];
+    const action = props.action || {};
+    const text = api.formMessage(fields, ctx.state, action.send);
+    if (!text) {
+      toast('先填一下再提交');
+      return;
+    }
+    if (action.set) {
+      Object.assign(ctx.state, action.set);
+      ctx.rerender();
+    }
+    await sendGenuiMessage(text);
+  };
+
+  const sendGenuiMessage = async (text) => {
+    if (state.running) {
+      toast('等这次运行结束再点');
+      return;
+    }
+    ui.input.value = text;
+    autoGrow();
+    await submit();
+  };
+
+  const renderGenuiNode = (node, ctx) => {
+    const api = genuiApi();
+    if (!api || !node || typeof node !== 'object') return null;
+    const props = node.props || {};
+    const fill = (value) => api.interpolate(String(value ?? ''), ctx.state);
+    const kids = () => (node.children || []).map((child) => renderGenuiNode(child, ctx)).filter(Boolean);
+
+    switch (node.component) {
+      case 'text':
+        return gEl('div', 'g-text', fill(props.text));
+      case 'markdown': {
+        const box = gEl('div', 'g-md');
+        box.innerHTML = md(fill(props.text));
+        return box;
+      }
+      case 'stack': {
+        const box = gEl('div', 'g-stack');
+        if (typeof props.gap === 'number') box.style.gap = props.gap + 'px';
+        box.append(...kids());
+        return box;
+      }
+      case 'row': {
+        const box = gEl('div', 'g-row');
+        box.append(...kids());
+        return box;
+      }
+      case 'card': {
+        const box = gEl('div', 'g-card');
+        if (props.title) box.append(gEl('div', 'g-card-title', fill(props.title)));
+        box.append(...kids());
+        return box;
+      }
+      case 'list': {
+        const box = gEl(props.ordered ? 'ol' : 'ul', 'g-list');
+        box.append(...kids());
+        return box;
+      }
+      case 'table': {
+        const columns = Array.isArray(props.columns) ? props.columns : [];
+        const rows = Array.isArray(props.rows) ? props.rows : [];
+        const visible = api.filterRows(columns, rows, props.filterBy, ctx.state);
+        const table = gEl('table', 'g-table');
+        const head = document.createElement('thead');
+        const headRow = document.createElement('tr');
+        for (const column of columns) headRow.append(gEl('th', undefined, column));
+        head.append(headRow);
+        const body = document.createElement('tbody');
+        for (const row of visible) {
+          const tr = document.createElement('tr');
+          for (const cell of Array.isArray(row) ? row : []) tr.append(gEl('td', undefined, String(cell)));
+          body.append(tr);
+        }
+        table.append(head, body);
+        const wrap = gEl('div');
+        wrap.append(table);
+        if (props.caption) wrap.append(gEl('div', 'g-caption', fill(props.caption)));
+        return wrap;
+      }
+      case 'chart': {
+        const data = Array.isArray(props.data) ? props.data : [];
+        const max = Math.max(1, ...data.map((item) => Number(item && item.value) || 0));
+        const bars = gEl('div', 'g-bars');
+        for (const item of data) {
+          const row = gEl('div', 'g-bar');
+          const track = document.createElement('span');
+          const bar = document.createElement('i');
+          bar.style.width = Math.round(((Number(item && item.value) || 0) / max) * 100) + '%';
+          track.append(bar);
+          row.append(
+            gEl('span', undefined, String((item && item.label) ?? '')),
+            track,
+            gEl('b', undefined, String((item && item.value) ?? '')),
+          );
+          bars.append(row);
+        }
+        return bars;
+      }
+      case 'code':
+        return gEl('pre', 'g-code', String(props.text ?? ''));
+      case 'callout': {
+        const box = gEl('div', 'g-callout', fill(props.text));
+        if (props.tone) box.dataset.tone = String(props.tone);
+        return box;
+      }
+      case 'button': {
+        const btn = gEl('button', 'g-btn', fill(props.label));
+        btn.type = 'button';
+        const action = props.action || {};
+        if (props.tone === 'primary') btn.dataset.on = '1';
+        // 筛选类按钮：状态值对上了就高亮，看起来像选中
+        if (action.set) {
+          const on = Object.entries(action.set).some(([key, value]) => String(ctx.state[key]) === String(value));
+          if (on) btn.dataset.on = '1';
+        }
+        btn.addEventListener('click', () => void runGenuiAction(action, ctx));
+        return btn;
+      }
+      case 'form': {
+        const fields = Array.isArray(props.fields) ? props.fields : [];
+        const form = gEl('form', 'g-form');
+        for (const field of fields) {
+          const wrap = gEl('label', 'g-field');
+          wrap.append(gEl('span', undefined, String(field.label || field.key)));
+          const input = document.createElement(field.type === 'select' ? 'select' : 'input');
+          if (field.type === 'select') {
+            for (const option of field.options || []) {
+              const item = document.createElement('option');
+              item.value = String(option);
+              item.textContent = String(option);
+              input.append(item);
+            }
+            input.value = ctx.state[field.key] !== undefined ? String(ctx.state[field.key]) : String((field.options || [''])[0]);
+            ctx.state[field.key] = input.value;
+          } else {
+            input.type = field.type === 'number' ? 'number' : 'text';
+            if (field.placeholder) input.placeholder = field.placeholder;
+            input.value = ctx.state[field.key] !== undefined ? String(ctx.state[field.key]) : '';
+          }
+          input.addEventListener('input', () => {
+            ctx.state[field.key] = field.type === 'number' ? Number(input.value) : input.value;
+          });
+          wrap.append(input);
+          form.append(wrap);
+        }
+        form.append(...kids());
+        const footer = gEl('div', 'g-row');
+        if (props.hint) footer.append(gEl('span', 'g-caption', fill(props.hint)));
+        const submit = gEl('button', 'g-btn', String(props.submitLabel || '提交'));
+        submit.type = 'submit';
+        footer.append(submit);
+        form.append(footer);
+        form.addEventListener('submit', (event) => {
+          event.preventDefault();
+          void submitGenuiForm(props, ctx);
+        });
+        return form;
+      }
+      default:
+        return null;
+    }
+  };
+
+  /** 把一棵（已校验的）树画进容器；筛选只重画这一块，不发请求 */
+  const mountGenui = (host, tree) => {
+    const api = genuiApi();
+    const box = gEl('div', 'genui');
+    host.append(box);
+    if (!api) {
+      box.append(gEl('div', 'g-err', '生成式界面没加载（缺少 /vendor/genui.js）'));
+      return;
+    }
+
+    const state = {};
+    for (const key of api.collectStateKeys(tree)) state[key] = '';
+    const ctx = { state, rerender: null };
+    const draw = () => {
+      box.innerHTML = '';
+      const node = renderGenuiNode(tree, ctx);
+      if (node) box.append(node);
+    };
+    ctx.rerender = draw;
+    draw();
+  };
+
+  /**
+   * 工具结果里带的是 { ok, tree } 或 { ok: false, error }。
+   * 这里刻意容错：界面画不出来是小事，不能让它把整页拖下水（之前它把 boot 拦在了 try 里，
+   * 一个渲染异常就让整个应用掉进演示模式）。
+   */
+  const renderGenuiResult = (host, output) => {
+    const target = host && typeof host.append === 'function' ? host : host && host.body ? host.body : null;
+    if (!target) return;
+
+    let parsed = null;
+    try {
+      parsed = JSON.parse(String(output ?? ''));
+    } catch {
+      parsed = null;
+    }
+
+    if (!parsed || parsed.ok !== true || !parsed.tree) {
+      const why = parsed && parsed.error ? parsed.error : '界面没画出来';
+      target.append(gEl('div', 'g-err', String(why)));
+      return;
+    }
+
+    try {
+      mountGenui(target, parsed.tree);
+    } catch (error) {
+      target.append(gEl('div', 'g-err', '界面渲染失败：' + error.message));
+    }
+  };
+
   /* ---------------- 事件处理 ---------------- */
   let currentTurn = null;
   const toolCards = new Map();
+  /** render_ui 的 callId → 画到哪个 turn 里 */
+  const genuiHosts = new Map();
   const approvalCards = new Map();
 
   const handleEvent = (event) => {
@@ -2278,6 +2679,11 @@
         appendAnswer(turn, event.text);
         break;
       case 'run.tool_call': {
+        if (event.name === 'render_ui') {
+          genuiHosts.set(event.callId, turn);
+          setRunState('运行中', '正在排版…', true);
+          break;
+        }
         const tool = toolMeta(event.name);
         const card = addTool(turn, event, tool ? tool.risk : 'low', tool ? tool.approval : false);
         toolCards.set(event.callId, card);
@@ -2304,7 +2710,14 @@
         break;
       }
       case 'run.tool_result':
-        toolCards.get(event.callId)?.settle(event.ok, event.output);
+        if (event.ok === false && genuiHosts.has(event.callId) === false) {
+          toolCards.get(event.callId)?.settle(event.ok, event.output);
+        } else if (genuiHosts.has(event.callId)) {
+          if (event.ok) renderGenuiResult(genuiHosts.get(event.callId), event.output);
+          else renderGenuiResult(genuiHosts.get(event.callId), '');
+        } else {
+          toolCards.get(event.callId)?.settle(event.ok, event.output);
+        }
         setRunState('运行中', '工具结果已回来', true);
         break;
       case 'run.fallback':
@@ -2698,6 +3111,7 @@
   const views = {
     chat: $('#view-chat'),
     tasks: $('#view-tasks'),
+    apps: $('#view-apps'),
     memory: $('#view-memory'),
     skills: $('#view-skills'),
     settings: $('#view-settings'),
@@ -2719,6 +3133,10 @@
       ui.sub.textContent = '到点就自己跑；点进去能看到它开的会话';
       void loadAutomations();
       void loadRuns();
+    } else if (name === 'apps') {
+      ui.title.textContent = '应用';
+      ui.sub.textContent = '从对话里沉淀下来的小应用，打开就能用';
+      void loadApps();
     } else if (name === 'memory') {
       ui.title.textContent = '记忆';
       ui.sub.textContent = '跨会话留下的偏好、项目与参考';
@@ -2944,6 +3362,7 @@
 
   $('#autoRefresh').addEventListener('click', () => void loadAutomations());
   $('#runsRefresh')?.addEventListener('click', () => void loadRuns());
+  $('#appsRefresh')?.addEventListener('click', () => void loadApps());
   $('#autoNew').addEventListener('click', () => {
     $('#autoForm').hidden = false;
     $('#autoName').focus();
@@ -3417,13 +3836,38 @@
       return;
     }
 
-    try {
-      const health = await Promise.race([
+    // 页面刚加载时主线程忙，短超时会假超时，于是「服务好好的」也掉进演示模式。
+    // 给足时间，超时再试一次；只有真连不上才降级。
+    const probe = (ms) =>
+      Promise.race([
         api('/health'),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('连接超时')), 1500)),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('连接超时')), ms)),
       ]);
-      state.health = health;
-      setMode('real', '');
+    let health = null;
+    let healthError = null;
+    try {
+      health = await probe(6000);
+    } catch {
+      try {
+        health = await probe(6000);
+      } catch (error) {
+        healthError = error;
+      }
+    }
+
+    if (!health) {
+      setMode('demo', '连不上 ' + API.replace(/^https?:\/\//, '') + (healthError && healthError.message ? '（' + healthError.message + '）' : ''));
+      renderToolChips([]);
+      renderCtx();
+      if (params.get('auto') !== '0') setTimeout(() => demo.run('读一下 README，把结论记成一条笔记。'), 500);
+      return;
+    }
+
+    state.health = health;
+    setMode('real', '');
+
+    // 进来了以后的初始化出错，只提示，不把整个界面打回演示模式
+    try {
       state.lastModel = health.models ? health.models.standard : '—';
       ui.sub.textContent = (health.tools ? health.tools.length + ' 个工具' : '') + ' · ' + health.store + ' 存储';
       $('#ctxStore').textContent = health.store === 'postgres' ? 'Postgres' : '内存';
@@ -3446,6 +3890,8 @@
 
       const wantedView = params.get('view');
       if (wantedView && wantedView in views) setView(wantedView);
+      const wantedApp = params.get('app');
+      if (wantedApp) void openAppShell(wantedApp);
       if (params.get('mem') === 'graph') {
         const tab = document.querySelector('#memTabs button[data-memview="graph"]');
         if (tab) tab.click();
@@ -3459,10 +3905,8 @@
         }, 400);
       }
     } catch (error) {
-      setMode('demo', '连不上 ' + API.replace(/^https?:\/\//, ''));
-      renderToolChips([]);
-      renderCtx();
-      if (params.get('auto') !== '0') setTimeout(() => demo.run('读一下 README，把结论记成一条笔记。'), 500);
+      // 已经连上服务端了，后面初始化出错就别把整个界面打回演示模式
+      toast('界面初始化出错：' + error.message);
     }
   })();
 })();

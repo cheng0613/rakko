@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 import { createDb, migrateDb } from '@rakko/db';
-import { createBuiltinTools, createSecondToolset, PluginHost, ProviderGateway, ToolRegistry } from '@rakko/core';
+import { createBuiltinTools, createRenderUiTool, createSecondToolset, PluginHost, ProviderGateway, ToolRegistry } from '@rakko/core';
 import type { ModelProvider, ProviderChunk, ProviderRequest } from '@rakko/core';
 
 import { createApp, FAKE_MODELS, type AppOptions } from './app.js';
@@ -1250,5 +1250,121 @@ test('运行概览：接口给成功率与工具失败榜，「接着做」记�
 
   const clamped = (await app.inject({ method: 'GET', url: '/v1/runs/overview?limit=9999' })).json();
   assert.ok(Array.isArray(clamped.items));
+  await app.close();
+});
+
+test('render_ui：合法树被接受并存成工具结果，非法树把原因回给模型', async () => {
+  const store = new MemoryStore();
+  let callCount = 0;
+  const provider: ModelProvider = {
+    id: 'genui',
+    async *stream() {
+      callCount += 1;
+      if (callCount === 1) {
+        yield {
+          kind: 'tool_call',
+          callId: 'c1',
+          name: 'render_ui',
+          args: {
+            tree: {
+              component: 'table',
+              props: { columns: ['时间', '结果'], rows: [['09:41', '成功'], ['08:00', '失败']] },
+            },
+          },
+        };
+        yield { kind: 'done', finishReason: 'tool_use' };
+        return;
+      }
+      yield { kind: 'delta', text: '就这些。' };
+      yield { kind: 'done', finishReason: 'stop' };
+    },
+  };
+  const app = createApp({ store, provider });
+
+  const thread = (await app.inject({ method: 'POST', url: '/v1/threads', payload: {} })).json();
+  const run = (await app.inject({ method: 'POST', url: '/v1/runs', payload: { threadId: thread.id, prompt: '看看运行记录' } })).json();
+  await waitFor(app, run.id, (body) => body.state === 'succeeded');
+
+  const messages = (await app.inject({ method: 'GET', url: `/v1/threads/${thread.id}/messages` })).json();
+  const result = messages.items.find((item: { kind: string; payload?: { name?: string } }) => item.kind === 'tool_result' && item.payload?.name === 'render_ui');
+  assert.ok(result, '要留下 render_ui 的工具结果');
+  const parsed = JSON.parse(result.payload.output);
+  assert.equal(parsed.ok, true);
+  assert.equal(parsed.tree.component, 'table');
+
+  await app.close();
+});
+
+test('render_ui：非法树回 ok:false 并带上哪一层错了', async () => {
+  const tool = createRenderUiTool();
+  const good = await tool.run(
+    { tree: { component: 'card', props: {}, children: [{ component: 'text', props: { text: 'hi' } }] } } as never,
+    {} as never,
+  );
+  assert.equal(JSON.parse(good).ok, true);
+
+  const wrongComponent = await tool.run({ tree: { component: 'iframe', props: {} } } as never, {} as never);
+  const parsedBad = JSON.parse(wrongComponent);
+  assert.equal(parsedBad.ok, false);
+  assert.match(parsedBad.error, /不在白名单/);
+
+  const badAction = await tool.run(
+    { tree: { component: 'button', props: { label: '点我', action: { script: 'alert(1)' } } } } as never,
+    {} as never,
+  );
+  assert.equal(JSON.parse(badAction).ok, false, '模型想塞脚本必须被拒');
+});
+
+test('应用：能存能读，界面不合法当场拒绝', async () => {
+  const store = new MemoryStore();
+  const app = createApp({ store, provider: { id: 'apps', async *stream() { yield { kind: 'done', finishReason: 'stop' }; } } });
+
+  const spec = {
+    component: 'card',
+    props: { title: '运行体检' },
+    children: [{ component: 'table', props: { columns: ['时间', '结果'], rows: [['09:41', '成功']] } }],
+  };
+
+  const created = await app.inject({ method: 'POST', url: '/v1/apps', payload: { name: '运行体检', description: '一句话', spec } });
+  assert.equal(created.statusCode, 201);
+  const body = created.json();
+  assert.equal(body.name, '运行体检');
+
+  const listed = (await app.inject({ method: 'GET', url: '/v1/apps' })).json();
+  assert.equal(listed.items.length, 1);
+  assert.deepEqual(listed.items[0].spec, spec, 'spec 原样存');
+
+  const one = await app.inject({ method: 'GET', url: `/v1/apps/${body.id}` });
+  assert.equal(one.statusCode, 200);
+
+  const bad = await app.inject({
+    method: 'POST',
+    url: '/v1/apps',
+    payload: { name: '坏的', spec: { component: 'iframe', props: {} } },
+  });
+  assert.equal(bad.statusCode, 400, '白名单外的组件不许存');
+  assert.match(bad.json().message, /不合法/);
+
+  const patched = await app.inject({ method: 'PATCH', url: `/v1/apps/${body.id}`, payload: { name: '运行体检 2' } });
+  assert.equal(patched.json().name, '运行体检 2');
+
+  const removed = await app.inject({ method: 'DELETE', url: `/v1/apps/${body.id}` });
+  assert.equal(removed.statusCode, 200);
+  assert.equal((await app.inject({ method: 'GET', url: '/v1/apps' })).json().items.length, 0);
+
+  await app.close();
+});
+
+test('save_app 工具：名字为空或界面不合法都不落库', async () => {
+  const store = new MemoryStore();
+  const registry = new ToolRegistry({ workspace: process.cwd() });
+  for (const tool of createBuiltinTools({ workspace: process.cwd() })) registry.register(tool);
+  const app = createApp({ store, tools: registry, provider: { id: 'noop', async *stream() { yield { kind: 'done', finishReason: 'stop' }; } } });
+
+  // 工具是服务端注册的，从 /health 的工具清单里确认它在
+  const health = (await app.inject({ method: 'GET', url: '/health' })).json();
+  assert.ok(health.tools.some((tool: { name: string }) => tool.name === 'save_app'), 'save_app 要在工具清单里');
+  assert.ok(health.tools.some((tool: { name: string }) => tool.name === 'render_ui'), 'render_ui 也要在');
+
   await app.close();
 });

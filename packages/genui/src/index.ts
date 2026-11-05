@@ -7,6 +7,8 @@
 
 import type { Parsed } from '@rakko/protocol';
 
+import { checkAction, checkFields, checkFilter } from './interactive.js';
+
 export type PropType = 'string' | 'number' | 'boolean' | 'json' | 'string[]';
 
 export interface ComponentSpec {
@@ -42,10 +44,22 @@ export const SPECS: Record<ComponentName, ComponentSpec> = {
   row: { props: { gap: 'number', wrap: 'boolean' }, required: [], children: true },
   card: { props: { title: 'string', tone: 'string' }, required: [], children: true },
   list: { props: { ordered: 'boolean' }, required: [], children: true },
-  table: { props: { columns: 'string[]', rows: 'json', caption: 'string' }, required: ['columns', 'rows'], children: false },
+  table: {
+    props: { columns: 'string[]', rows: 'json', caption: 'string', filterBy: 'json' },
+    required: ['columns', 'rows'],
+    children: false,
+  },
   chart: { props: { variant: 'string', data: 'json', label: 'string' }, required: ['variant', 'data'], children: false },
-  form: { props: { submitLabel: 'string', action: 'string' }, required: ['action'], children: true },
-  button: { props: { label: 'string', action: 'string' }, required: ['label', 'action'], children: false },
+  form: {
+    props: { submitLabel: 'string', action: 'json', fields: 'json', hint: 'string' },
+    required: ['action', 'fields'],
+    children: true,
+  },
+  button: {
+    props: { label: 'string', action: 'json', tone: 'string' },
+    required: ['label', 'action'],
+    children: false,
+  },
   code: { props: { text: 'string', language: 'string' }, required: ['text'], children: false },
   callout: { props: { tone: 'string', text: 'string' }, required: ['tone', 'text'], children: false },
 };
@@ -54,6 +68,8 @@ export interface GenNode {
   component: ComponentName;
   props: Record<string, unknown>;
   children?: GenNode[];
+  /** 输入类节点把值绑到哪个状态键（{{key}} 插值也读它） */
+  bind?: string;
 }
 
 /** 树的两条硬上限：深 = 排版崩，宽 = 喂给模型自己都会看漏。 */
@@ -90,7 +106,7 @@ function walk(input: unknown, depth: number, path: string, cursor: Cursor): Pars
   if (depth > MAX_DEPTH) return { ok: false, reason: `${path}: 嵌套超过 ${MAX_DEPTH} 层` };
 
   if (typeof input !== 'object' || input === null) return { ok: false, reason: `${path}: 节点必须是对象` };
-  const node = input as { component?: unknown; props?: unknown; children?: unknown };
+  const node = input as { component?: unknown; props?: unknown; children?: unknown; bind?: unknown };
 
   if (typeof node.component !== 'string') return { ok: false, reason: `${path}: 缺少 component` };
   if (!isComponentName(node.component)) {
@@ -115,6 +131,20 @@ function walk(input: unknown, depth: number, path: string, cursor: Cursor): Pars
     if (!(key in props)) return { ok: false, reason: `${path}: 缺少必填属性 ${key}` };
   }
 
+  // 控件是唯一能「做点什么」的地方，校验得比别的属性更严
+  if (node.component === 'button' || node.component === 'form') {
+    const problem = checkAction(props.action, `${path}.action`);
+    if (problem) return { ok: false, reason: problem };
+  }
+  if (node.component === 'form') {
+    const problem = checkFields(props.fields, `${path}.fields`);
+    if (problem) return { ok: false, reason: problem };
+  }
+  if (node.component === 'table' && props.filterBy !== undefined) {
+    const problem = checkFilter(props.filterBy, `${path}.filterBy`);
+    if (problem) return { ok: false, reason: problem };
+  }
+
   const rawChildren = node.children;
   if (rawChildren !== undefined) {
     if (!spec.children) return { ok: false, reason: `${path}: ${node.component} 不能有子节点` };
@@ -125,10 +155,20 @@ function walk(input: unknown, depth: number, path: string, cursor: Cursor): Pars
       if (!parsed.ok) return parsed;
       children.push(parsed.value);
     }
-    return { ok: true, value: { component: node.component, props, children } };
+    const parsedNode: GenNode = { component: node.component, props, children };
+    if (typeof node.bind === 'string') {
+      if (!/^[a-z][a-z0-9_]{0,23}$/.test(node.bind)) return { ok: false, reason: `${path}.bind: 状态名只能是小写字母数字下划线` };
+      parsedNode.bind = node.bind;
+    }
+    return { ok: true, value: parsedNode };
   }
 
-  return { ok: true, value: { component: node.component, props } };
+  const leaf: GenNode = { component: node.component, props };
+  if (typeof node.bind === 'string') {
+    if (!/^[a-z][a-z0-9_]{0,23}$/.test(node.bind)) return { ok: false, reason: `${path}.bind: 状态名只能是小写字母数字下划线` };
+    leaf.bind = node.bind;
+  }
+  return { ok: true, value: leaf };
 }
 
 export function validateTree(input: unknown): Parsed<GenNode> {
@@ -155,9 +195,19 @@ export function toPlainText(node: GenNode): string {
     }
     case 'chart':
       return `[图表 ${String(node.props.variant ?? '')}] ${String(node.props.label ?? '')}`.trim();
+    case 'form': {
+      const fields = Array.isArray(node.props.fields) ? (node.props.fields as { label?: string }[]) : [];
+      const submit = String(node.props.submitLabel ?? '提交');
+      const inner = (node.children ?? []).map((child) => toPlainText(child)).filter(Boolean).join('\n');
+      return [fields.map((field) => `${field.label ?? ''}：____`).join('\n'), inner, `[${submit}]`]
+        .filter(Boolean)
+        .join('\n');
+    }
     default: {
       const children = node.children ?? [];
       return children.map((child) => toPlainText(child)).filter(Boolean).join('\n');
     }
   }
 }
+
+export * from './interactive.js';
