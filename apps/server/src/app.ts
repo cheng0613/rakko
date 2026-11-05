@@ -76,13 +76,15 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
     pendingApprovals: gate.size,
   }));
 
-  /** 界面是自包含单文件，直接由服务端吐出，同源就没有跨域问题 */
+  /**
+   * 界面是自包含单文件，由服务端直接吐出，同源就没有跨域问题。
+   * 不缓存：改完 HTML 刷新就能看到，不用重启（M0 阶段这比省一次读盘重要）。
+   */
   const webFile = new URL('../../web/index.html', import.meta.url);
-  let webCache: string | null = null;
   app.get('/', async (_request, reply) => {
     try {
-      if (!webCache) webCache = await readFile(webFile, 'utf8');
-      return reply.type('text/html; charset=utf-8').send(webCache);
+      const html = await readFile(webFile, 'utf8');
+      return reply.type('text/html; charset=utf-8').header('cache-control', 'no-store').send(html);
     } catch {
       return reply.code(404).send({ error: 'web_missing', message: '界面文件 apps/web/index.html 不在' });
     }

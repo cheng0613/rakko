@@ -113,6 +113,16 @@ docker compose up -d --build                     # db + api 全容器化，api �
 界面是 **一个自包含 HTML**（`apps/web/index.html`，样式与脚本全内联，不引任何外部资源），
 由服务端在 `GET /` 直接吐出，所以和 API 同源、没有跨域问题；手机上也不用装东西。
 
+**界面用的是设计稿的样式表本身，不是照着重写一遍。** `design.html` 里那段 `<style>`（Apple HIG 令牌、
+`.side` / `.nav-item` / `.topbar` / `.msg` / `.tool` / `.composer` / `.ctx` 这些类和几何）被整段同步进来：
+
+```bash
+node scripts/sync-design.mjs <design.html 路径>   # 只替换 ==DESIGN-CSS-START/END== 之间的内容
+```
+
+所以在设计稿里改颜色、改圆角、改间距，跑一次同步，界面跟着变；界面里只额外加了事件流专用的几块
+（思考折叠、审批卡、降级提示、工具状态标签），全部复用同一套 `--line` / `--surface` / `--radius` 令牌。
+
 三种打开方式：
 
 ```bash
@@ -135,10 +145,12 @@ node --env-file=.env apps/server/dist/index.js   # 然后开 http://127.0.0.1:87
 - **工具卡**：`run.tool_call` 出现卡片（参数 + 状态），`run.tool_result` 回填结果，失败原因直接写出来；
 - **审批卡**：`run.approval_requested` 弹出「需要你点头」，显示风险级别、路径/命令摘要、倒计时，
   两个按钮分别是允许/拒绝；拒绝的文案明确写着「不会让任务失败」，`run.approval_decided` 到了就把按钮换成结论；
-- **降级提示**：`run.fallback` 显示成一条「已降级」说明，不假装什么都没发生；
+- **降级提示**：`run.fallback` 显示成一条「降级」说明，不假装什么都没发生；
+- **右侧运行时栏**：模型、本次工具调用数、等待审批数、本周用量、工具清单、存储与工作区，
+  全部来自 `/health` 与事件流，不是写死的装饰；
 - **用量**：`/v1/usage` 落成侧栏底部那一条（次数制，回写 `usage_ledger`）。
 
-移动端 ≤820px 时侧栏变成抽屉，输入区吃 safe-area，审批卡整宽。
+移动端沿用设计稿的断点：≤1180px 收起右侧运行时栏，≤980px 侧栏变抽屉、顶栏出汉堡按钮。
 
 ## 存储
 
