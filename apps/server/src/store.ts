@@ -8,7 +8,7 @@
 import { randomUUID } from 'node:crypto';
 
 import { currentPeriod, decideQuota, periodStart, planLimit, type QuotaDecision, type QuotaState } from '@rakko/core';
-import type { Message, MessageKind, MessageRole, RiskLevel, Run, RunEvent, Settings, Thread, Usage } from '@rakko/protocol';
+import type { Automation, Message, MessageKind, MessageRole, RiskLevel, Run, RunEvent, Settings, Thread, Usage } from '@rakko/protocol';
 
 export interface AppendMessageInput {
   threadId: string;
@@ -55,6 +55,12 @@ export interface RunStore {
   resumableRuns(): Promise<ResumableRun[]>;
   /** 线程最近一次运行，界面刷新后据此决定要不要接着看流 */
   latestRunForThread(threadId: string): Promise<Run | undefined>;
+  /** 自动化：cron + 一句任务描述 */
+  listAutomations(): Promise<Automation[]>;
+  createAutomation(input: { name: string; schedule: string; prompt: string; enabled?: boolean }): Promise<Automation>;
+  updateAutomation(id: string, patch: Partial<Pick<Automation, 'name' | 'schedule' | 'prompt' | 'enabled'>>): Promise<Automation | undefined>;
+  deleteAutomation(id: string): Promise<boolean>;
+  markAutomationRun(id: string, at: string): Promise<void>;
   /** 用户设置（用超了降级还是拦下） */
   getSettings(): Promise<Settings>;
   updateSettings(patch: Partial<Settings>): Promise<Settings>;
@@ -92,6 +98,7 @@ export class MemoryStore implements RunStore {
   readonly kind = 'memory' as const;
   private quota: QuotaState;
   private settings: Settings;
+  private readonly automations = new Map<string, Automation>();
 
   constructor(options: MemoryStoreOptions = {}) {
     const degradeOnExceed = options.degradeOnExceed ?? true;
@@ -118,6 +125,44 @@ export class MemoryStore implements RunStore {
 
   async resumableRuns(): Promise<ResumableRun[]> {
     return [];
+  }
+
+  async listAutomations(): Promise<Automation[]> {
+    return [...this.automations.values()].sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  async createAutomation(input: { name: string; schedule: string; prompt: string; enabled?: boolean }): Promise<Automation> {
+    const automation: Automation = {
+      id: randomUUID(),
+      name: input.name,
+      schedule: input.schedule,
+      prompt: input.prompt,
+      enabled: input.enabled ?? true,
+      lastRunAt: null,
+      createdAt: now(),
+    };
+    this.automations.set(automation.id, automation);
+    return automation;
+  }
+
+  async updateAutomation(
+    id: string,
+    patch: Partial<Pick<Automation, 'name' | 'schedule' | 'prompt' | 'enabled'>>,
+  ): Promise<Automation | undefined> {
+    const current = this.automations.get(id);
+    if (!current) return undefined;
+    const next: Automation = { ...current, ...patch };
+    this.automations.set(id, next);
+    return next;
+  }
+
+  async deleteAutomation(id: string): Promise<boolean> {
+    return this.automations.delete(id);
+  }
+
+  async markAutomationRun(id: string, at: string): Promise<void> {
+    const current = this.automations.get(id);
+    if (current) this.automations.set(id, { ...current, lastRunAt: at });
   }
 
   async getSettings(): Promise<Settings> {

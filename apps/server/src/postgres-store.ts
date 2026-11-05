@@ -10,9 +10,9 @@
 import { and, asc, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 
 import type { DbHandle } from '@rakko/db';
-import { messages, runEvents, runs, threads, usageLedger, users } from '@rakko/db';
+import { automations, messages, runEvents, runs, threads, usageLedger, users } from '@rakko/db';
 import { currentPeriod, decideQuota, periodStart, planLimit, type QuotaDecision } from '@rakko/core';
-import type { Message, MessageKind, RiskLevel, Run, RunEvent, RunState, Settings, Thread, Usage } from '@rakko/protocol';
+import type { Automation, Message, MessageKind, RiskLevel, Run, RunEvent, RunState, Settings, Thread, Usage } from '@rakko/protocol';
 
 import type { AppendMessageInput, CreateRunInput, Listener, PendingCall, ResumableRun, RunPatch, RunStore } from './store.js';
 
@@ -33,6 +33,16 @@ const toMessage = (row: typeof messages.$inferSelect): Message => ({
   text: row.text,
   payload: (row.payload as Record<string, unknown> | null) ?? null,
   runId: row.runId,
+  createdAt: row.createdAt.toISOString(),
+});
+
+const toAutomation = (row: typeof automations.$inferSelect): Automation => ({
+  id: row.id,
+  name: row.name,
+  schedule: row.schedule,
+  prompt: row.prompt,
+  enabled: row.enabled,
+  lastRunAt: row.lastRunAt ? row.lastRunAt.toISOString() : null,
   createdAt: row.createdAt.toISOString(),
 });
 
@@ -307,6 +317,59 @@ export class PostgresStore implements RunStore {
   async quotaDecision(): Promise<QuotaDecision> {
     const usage = await this.usage();
     return decideQuota({ limit: usage.limit, used: usage.used, degradeOnExceed: usage.degradeOnExceed });
+  }
+
+  async listAutomations(): Promise<Automation[]> {
+    const rows = await this.db
+      .select()
+      .from(automations)
+      .where(eq(automations.userId, this.requireUserId()))
+      .orderBy(asc(automations.name));
+    return rows.map(toAutomation);
+  }
+
+  async createAutomation(input: { name: string; schedule: string; prompt: string; enabled?: boolean }): Promise<Automation> {
+    const [row] = await this.db
+      .insert(automations)
+      .values({
+        userId: this.requireUserId(),
+        name: input.name,
+        schedule: input.schedule,
+        prompt: input.prompt,
+        enabled: input.enabled ?? true,
+      })
+      .returning();
+    if (!row) throw new Error('建自动化失败');
+    return toAutomation(row);
+  }
+
+  async updateAutomation(
+    id: string,
+    patch: Partial<Pick<Automation, 'name' | 'schedule' | 'prompt' | 'enabled'>>,
+  ): Promise<Automation | undefined> {
+    const [row] = await this.db
+      .update(automations)
+      .set({
+        ...(patch.name !== undefined ? { name: patch.name } : {}),
+        ...(patch.schedule !== undefined ? { schedule: patch.schedule } : {}),
+        ...(patch.prompt !== undefined ? { prompt: patch.prompt } : {}),
+        ...(patch.enabled !== undefined ? { enabled: patch.enabled } : {}),
+      })
+      .where(and(eq(automations.id, id), eq(automations.userId, this.requireUserId())))
+      .returning();
+    return row ? toAutomation(row) : undefined;
+  }
+
+  async deleteAutomation(id: string): Promise<boolean> {
+    const rows = await this.db
+      .delete(automations)
+      .where(and(eq(automations.id, id), eq(automations.userId, this.requireUserId())))
+      .returning({ id: automations.id });
+    return rows.length > 0;
+  }
+
+  async markAutomationRun(id: string, at: string): Promise<void> {
+    await this.db.update(automations).set({ lastRunAt: new Date(at) }).where(eq(automations.id, id));
   }
 
   async getSettings(): Promise<Settings> {

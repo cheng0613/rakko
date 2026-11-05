@@ -604,3 +604,60 @@ test('还在跑的运行不能继续（409），自定义指令会替换默认�
   assert.equal(missing.statusCode, 404);
   await app.close();
 });
+
+test('自动化：增删改查 + 立即运行 + 到点自动触发', async () => {
+  const store = new MemoryStore();
+  const app = makeApp({ store, automationIntervalMs: 60 });
+
+  const created = await app.inject({
+    method: 'POST',
+    url: '/v1/automations',
+    payload: { name: '晨间简报', schedule: '0 8 * * *', prompt: '汇总今天的日程' },
+  });
+  assert.equal(created.statusCode, 201);
+  const automation = created.json();
+  assert.equal(automation.enabled, true);
+  assert.equal(automation.human, '每天 08:00');
+
+  const bad = await app.inject({ method: 'POST', url: '/v1/automations', payload: { name: 'x', schedule: '0 25 * * *', prompt: 'y' } });
+  assert.equal(bad.statusCode, 400);
+  assert.equal(bad.json().error, 'invalid_schedule');
+
+  const listed = (await app.inject({ method: 'GET', url: '/v1/automations' })).json();
+  assert.equal(listed.items.length, 1);
+
+  // 立即运行：开一个会话、起一个运行
+  const ran = await app.inject({ method: 'POST', url: `/v1/automations/${automation.id}/run` });
+  assert.equal(ran.statusCode, 202);
+  const { threadId, runId } = ran.json();
+  assert.ok(threadId && runId);
+  await waitFor(app, runId, (body) => body.state === 'succeeded');
+
+  const threads = (await app.inject({ method: 'GET', url: '/v1/threads' })).json();
+  assert.match(threads.items[0].title, /晨间简报/);
+
+  const paused = await app.inject({ method: 'PATCH', url: `/v1/automations/${automation.id}`, payload: { enabled: false } });
+  assert.equal(paused.json().enabled, false);
+
+  // 到点自动触发：每分钟都命中的表达式 + 60ms 的巡检间隔
+  const always = await app.inject({
+    method: 'POST',
+    url: '/v1/automations',
+    payload: { name: '每分钟跑一次', schedule: '* * * * *', prompt: '看一眼状态' },
+  });
+  assert.equal(always.statusCode, 201);
+
+  let fired = null;
+  for (let i = 0; i < 40; i += 1) {
+    await sleep(50);
+    const list = (await app.inject({ method: 'GET', url: '/v1/automations' })).json();
+    fired = list.items.find((item: { id: string; lastRunAt: string | null }) => item.id === always.json().id && item.lastRunAt);
+    if (fired) break;
+  }
+  assert.ok(fired, '定时任务应该在巡检里被触发一次');
+
+  const removed = await app.inject({ method: 'DELETE', url: `/v1/automations/${automation.id}` });
+  assert.equal(removed.statusCode, 200);
+  assert.equal((await app.inject({ method: 'DELETE', url: `/v1/automations/${automation.id}` })).statusCode, 404);
+  await app.close();
+});

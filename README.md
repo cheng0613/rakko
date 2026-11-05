@@ -90,6 +90,18 @@ docker compose up -d --build                     # db + api 全容器化，api �
   失败时默认追加「接着刚才的做，不要从头开始。」，取消时追加「继续。」，
   也可以带 `instruction` 换成自己的说法。代价是一次配额，跟正常运行一样。
 
+## 自动化
+
+侧栏「任务与自动化」：一条 cron + 一句任务描述，到点自己起一个运行。
+
+- **定时**：标准五段 cron（分 时 日 月 周），支持 `*`、`*/15`、`9-18`、`8,20`；
+  界面把常见写法翻成人话（`0 8 * * *` → 每天 08:00）。
+- **巡检**：服务每 30 秒看一眼，`selectDue` 保证同一分钟只触发一次（容忍 tick 抖动，
+  `lastRunAt` 落在这一分钟内就不再跑）。
+- **跑起来就是开个会话**：标题「晨间简报 · 11/5」，内容和手动发一句没区别，
+  走的还是同一套配额、降级、审批、可重放。
+- **立即运行** / **暂停** / **删除** 都在卡片上；配额用超且不允许降级时，这次触发静默跳过。
+
 ## 工具与审批
 
 一个运行 = 若干轮「模型说 → 工具做 → 结果回给模型」。循环在 `packages/core/src/agent.ts`，
@@ -364,6 +376,11 @@ agent 的文件工具锁在工作区里，读这个目录会直接 `路径越界
 ```
 GET  /health                                   服务、provider、模型、熔断、工具、等待中的审批
 GET  /v1/usage                                 配额（次数制，来自 usage_ledger）
+GET  /v1/automations                           自动化列表（含 human 描述）
+POST /v1/automations                           新建（名字 / cron / 任务）
+PATCH /v1/automations/:id                      改名、改时间、启用暂停
+DELETE /v1/automations/:id                     删除
+POST /v1/automations/:id/run                   立即跑一次
 GET  /v1/settings                              用户设置（degradeOnExceed）
 PATCH /v1/settings                             改设置（目前只认 degradeOnExceed）
 GET  /v1/threads                               会话列表

@@ -704,8 +704,21 @@
 
   .tool-out{font-family:var(--mono);font-size:11px;line-height:1.6;color:var(--text-2);white-space:pre-wrap;word-break:break-word;border-top:1px solid var(--line);padding-top:7px;margin-top:4px;max-height:132px;overflow:auto}
 
+  .auto-toolbar{display:flex;align-items:center;gap:8px;margin-bottom:14px}
+  .auto-toolbar .muted{margin-right:auto;font-size:12.5px}
+  .auto-form{display:flex;flex-direction:column;gap:12px}
+  .field{display:flex;flex-direction:column;gap:6px;font-size:12px;color:var(--muted)}
+  .field > span{font-size:11.5px}
+  .field input,.field textarea{font:inherit;font-size:13px;color:var(--text);background:var(--surface-2);border:1px solid var(--line);border-radius:10px;padding:8px 11px;outline:none;resize:vertical}
+  .field input:focus,.field textarea:focus{border-color:var(--accent)}
+  .auto-form-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .auto-form-actions .muted{margin-right:auto;font-size:11.5px}
+  .auto-actions{display:flex;align-items:center;gap:8px;padding-top:10px;border-top:1px solid var(--line)}
+  .auto-actions .btn.quiet{margin-left:auto}
   .retry{display:flex;align-items:center;gap:10px;flex-wrap:wrap;border:1px solid var(--line);border-radius:14px;background:var(--surface-2);padding:9px 12px;margin:12px 0}
   .retry-why{font-size:12px;color:var(--muted)}
+  .retry.stale{opacity:.6}
+  .retry.stale .btn{pointer-events:none}
   .retry .btn{margin-left:auto;padding:6px 14px}
   .note{display:flex;align-items:center;gap:8px;font-size:11.8px;line-height:1.5;color:var(--muted);border:1px solid var(--line);border-radius:14px;background:var(--surface-2);padding:8px 11px;margin:12px 0}
   .note .tag{flex:none}
@@ -888,6 +901,34 @@
         </aside>
       </section>
 
+
+      <section class="view" id="view-tasks">
+        <div class="auto-toolbar">
+          <span class="muted" id="autoSummary">到点就让 agent 自己跑一遍</span>
+          <button class="btn" id="autoRefresh">刷新</button>
+          <button class="btn primary" id="autoNew">＋ 新建自动化</button>
+        </div>
+
+        <div class="card" id="autoForm" hidden style="margin-bottom:16px">
+          <div class="auto-form">
+            <label class="field"><span>名字</span><input id="autoName" placeholder="晨间简报" /></label>
+            <label class="field"><span>定时（分 时 日 月 周）</span><input id="autoSchedule" placeholder="0 8 * * *" /></label>
+            <label class="field"><span>任务</span><textarea id="autoPrompt" rows="2" placeholder="汇总今天的日程与未读消息"></textarea></label>
+            <div class="auto-form-actions">
+              <span class="muted">0 8 * * * = 每天 08:00 · */30 * * * * = 每 30 分钟</span>
+              <button class="btn" id="autoCancel">取消</button>
+              <button class="btn primary" id="autoSave">保存</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="grid two" id="autoList"></div>
+        <div id="autoEmpty" class="card" hidden style="text-align:center;padding:32px 16px">
+          <p style="margin:0 0 6px;font-size:14px;font-weight:560">还没有自动化</p>
+          <p class="muted" style="margin:0;font-size:12.5px">点右上角「新建自动化」，写一句任务，它就会按你给的时间自己跑。</p>
+        </div>
+      </section>
+
       <section class="view" id="view-settings">
         <div class="grid" style="grid-template-columns:minmax(0,1fr);max-width:860px;gap:14px">
           <article class="card">
@@ -1028,6 +1069,7 @@
     pending: 0,
     pendingCallId: null,
     settings: null,
+    automations: [],
   };
 
   /** 历史里最后一条助手消息，恢复运行时把新事件接在它后面 */
@@ -1545,8 +1587,19 @@
   };
 
   /** 运行没做完时，给一条「接着做」，别让人重打一遍 */
+  let lastContinueBar = null;
   const addContinueBar = (turn, runId, runState) => {
+    // 一屏里可能有好几条失败的运行，只留最新的那条可点
+    if (lastContinueBar) {
+      lastContinueBar.classList.add('stale');
+      const old = lastContinueBar.querySelector('button');
+      if (old) {
+        old.disabled = true;
+        old.textContent = '已过期';
+      }
+    }
     const bar = make('div', 'retry');
+    lastContinueBar = bar;
     const why = make('span', 'retry-why', runState === 'canceled' ? '这次运行被你停下了' : '这次运行没做完');
     const btn = make('button', 'btn primary', '接着做');
     btn.addEventListener('click', () => void continueRun(runId, btn));
@@ -1963,7 +2016,7 @@
     item.addEventListener('click', () => {
       document.querySelectorAll('.nav-item').forEach((other) => other.classList.remove('active'));
       item.classList.add('active');
-      if (item.dataset.nav === 'chat' || item.dataset.nav === 'settings') setView(item.dataset.nav);
+      if (['chat', 'tasks', 'settings'].includes(item.dataset.nav)) setView(item.dataset.nav);
       else toast('「' + item.textContent.trim() + '」还没做');
       closeSide();
     });
@@ -1994,7 +2047,7 @@
 
 
   /* ---------------- 视图切换：对话 / 设置 ---------------- */
-  const views = { chat: $('#view-chat'), settings: $('#view-settings') };
+  const views = { chat: $('#view-chat'), tasks: $('#view-tasks'), settings: $('#view-settings') };
   let currentView = 'chat';
 
   const setView = (name) => {
@@ -2007,6 +2060,10 @@
       ui.title.textContent = '设置';
       ui.sub.textContent = '计划与用量、模型、工具与存储';
       renderSettings();
+    } else if (name === 'tasks') {
+      ui.title.textContent = '自动化';
+      ui.sub.textContent = '到点就自己跑；点进去能看到它开的会话';
+      void loadAutomations();
     } else {
       ui.title.textContent = state.threadId ? (state.threads.find((t) => t.id === state.threadId)?.title || '对话') : '对话';
       ui.sub.textContent = state.health ? (state.health.tools ? state.health.tools.length + ' 个工具' : '') + ' · ' + state.health.store + ' 存储' : '长任务会自己接着做，你可以随时插入新的指令';
@@ -2115,6 +2172,128 @@
     }
   });
 
+  /* ---------------- 自动化 ---------------- */
+
+  const renderAutomations = () => {
+    const list = $('#autoList');
+    list.innerHTML = '';
+    const items = state.automations ?? [];
+    $('#autoEmpty').hidden = items.length > 0;
+    $('#autoSummary').textContent = items.length > 0
+      ? `${items.filter((item) => item.enabled).length} 个在跑 · 共 ${items.length} 个`
+      : '到点就让 agent 自己跑一遍';
+
+    for (const item of items) {
+      const card = make('article', 'card hover auto');
+
+      const top = make('div', 'auto-top');
+      const ico = make('div', 'ico');
+      ico.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></svg>';
+
+      const titleBox = make('div');
+      titleBox.append(make('h3', undefined, item.name));
+      titleBox.append(make('p', undefined, item.human || item.schedule));
+
+      const toggle = make('label', 'switch');
+      const checkbox = make('input');
+      checkbox.type = 'checkbox';
+      checkbox.checked = item.enabled;
+      checkbox.addEventListener('change', async () => {
+        try {
+          await api('/v1/automations/' + item.id, { method: 'PATCH', body: JSON.stringify({ enabled: checkbox.checked }) });
+          item.enabled = checkbox.checked;
+          renderAutomations();
+        } catch (error) {
+          checkbox.checked = !checkbox.checked;
+          toast('切换失败：' + error.message);
+        }
+      });
+      toggle.append(checkbox, make('span', 'track'));
+
+      top.append(ico, titleBox, toggle);
+
+      const meta = make('div', 'auto-meta');
+      const promptText = item.prompt.length > 28 ? item.prompt.slice(0, 28) + '…' : item.prompt;
+      meta.append(make('span', undefined, promptText));
+      meta.append(make('span', 'sep'));
+      meta.append(make('span', 'tag ' + (item.enabled ? 'mint' : 'violet'), item.enabled ? '启用' : '已暂停'));
+      if (item.lastRunAt) {
+        meta.append(make('span', 'sep'));
+        meta.append(make('span', undefined, '上次 ' + relTime(item.lastRunAt)));
+      }
+
+      const actions = make('div', 'auto-actions');
+      const runBtn = make('button', 'btn', '立即运行');
+      runBtn.addEventListener('click', async () => {
+        runBtn.disabled = true;
+        try {
+          await api('/v1/automations/' + item.id + '/run', { method: 'POST' });
+          toast('已经开跑，去侧栏看新会话');
+          await loadThreads().catch(() => {});
+          setTimeout(() => { runBtn.disabled = false; }, 1200);
+        } catch (error) {
+          runBtn.disabled = false;
+          toast('没跑起来：' + error.message);
+        }
+      });
+
+      const delBtn = make('button', 'btn quiet', '删除');
+      delBtn.addEventListener('click', async () => {
+        if (!window.confirm(`删除「${item.name}」？定时任务会立刻停掉。`)) return;
+        try {
+          await api('/v1/automations/' + item.id, { method: 'DELETE' });
+          state.automations = (state.automations ?? []).filter((other) => other.id !== item.id);
+          renderAutomations();
+        } catch (error) {
+          toast('删除失败：' + error.message);
+        }
+      });
+      actions.append(runBtn, delBtn);
+
+      card.append(top, meta, actions);
+      list.append(card);
+    }
+  };
+
+  const loadAutomations = async () => {
+    try {
+      const body = await api('/v1/automations');
+      state.automations = body.items ?? [];
+      renderAutomations();
+    } catch (error) {
+      toast('读自动化失败：' + error.message);
+    }
+  };
+
+  $('#autoRefresh').addEventListener('click', () => void loadAutomations());
+  $('#autoNew').addEventListener('click', () => {
+    $('#autoForm').hidden = false;
+    $('#autoName').focus();
+  });
+  $('#autoCancel').addEventListener('click', () => {
+    $('#autoForm').hidden = true;
+  });
+  $('#autoSave').addEventListener('click', async () => {
+    const name = $('#autoName').value.trim();
+    const schedule = $('#autoSchedule').value.trim();
+    const prompt = $('#autoPrompt').value.trim();
+    if (!name || !schedule || !prompt) {
+      toast('名字、定时、任务都要填');
+      return;
+    }
+    try {
+      await api('/v1/automations', { method: 'POST', body: JSON.stringify({ name, schedule, prompt }) });
+      $('#autoName').value = '';
+      $('#autoSchedule').value = '';
+      $('#autoPrompt').value = '';
+      $('#autoForm').hidden = true;
+      await loadAutomations();
+      toast('建好了');
+    } catch (error) {
+      toast('保存失败：' + error.message);
+    }
+  });
+
   const setMode = (mode, detail) => {
     state.mode = mode;
     if (mode === 'demo') {
@@ -2176,7 +2355,8 @@
         renderRecents();
       }
 
-      if (params.get('view') === 'settings') setView('settings');
+      const wantedView = params.get('view');
+      if (wantedView && wantedView in views) setView(wantedView);
 
       if (params.get('auto') === '1') {
         setTimeout(() => {

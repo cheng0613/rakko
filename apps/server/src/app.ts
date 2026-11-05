@@ -19,7 +19,9 @@ import {
   approvalDecisionSchema,
   createRunInput,
   continueRunInput,
+  createAutomationInput,
   createThreadInput,
+  updateAutomationInput,
   TERMINAL_STATES,
   updateSettingsInput,
   updateThreadInput,
@@ -29,6 +31,7 @@ import {
   type RunState,
 } from '@rakko/protocol';
 
+import { describeCron, selectDue, validateCron } from './automation.js';
 import { MemoryStore, type PendingCall, type RunStore } from './store.js';
 
 const invalid = (issues: unknown[]) => ({ error: 'invalid_request', message: '请求体不合法', issues });
@@ -45,6 +48,8 @@ export interface AppOptions {
   workspace?: string;
   approvalTimeoutMs?: number;
   maxSteps?: number;
+  /** 自动化巡检间隔，测试里调小 */
+  automationIntervalMs?: number;
 }
 
 export function createApp(options: AppOptions = {}): FastifyInstance {
@@ -70,6 +75,7 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
   const loop = new AgentLoop(gateway, tools, { maxSteps: options.maxSteps ?? 12 });
 
   const timers = new Set<ReturnType<typeof setInterval>>();
+  let automationTimer: ReturnType<typeof setInterval> | null = null;
   const controllers = new Map<string, AbortController>();
   const canceled = new Set<string>();
 
@@ -101,6 +107,75 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
     } catch {
       return reply.code(404).send({ error: 'web_missing', message: '界面文件 apps/web/index.html 不在' });
     }
+  });
+
+  /* ---------------- 自动化 ---------------- */
+
+  /** 跑一次自动化：开一个会话、起一个运行，和手动发一句没有区别 */
+  async function runAutomation(automation: { id: string; name: string; prompt: string }) {
+    const decision = await store.quotaDecision();
+    if (decision.kind === 'block') return null;
+
+    const tier: ModelTier = decision.kind === 'degrade' ? 'fast' : 'standard';
+    const day = new Date().toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' });
+    const thread = await store.createThread(`${automation.name} · ${day}`);
+    const run = await store.createRun({
+      threadId: thread.id,
+      prompt: automation.prompt,
+      model: gateway.models[tier],
+    });
+    await store.appendMessage({ threadId: thread.id, role: 'user', text: automation.prompt, runId: run.id });
+    await store.markAutomationRun(automation.id, new Date().toISOString());
+    void drive(run, tier, decision.kind === 'degrade' ? decision.reason : null);
+    return { thread, run, tier };
+  }
+
+  app.get('/v1/automations', async () => {
+    const items = await store.listAutomations();
+    return {
+      items: items.map((item) => ({ ...item, human: describeCron(item.schedule) })),
+    };
+  });
+
+  app.post('/v1/automations', async (request, reply) => {
+    const parsed = createAutomationInput.safeParse(request.body ?? {});
+    if (!parsed.success) return reply.code(400).send(invalid(parsed.error.issues));
+    if (!validateCron(parsed.data.schedule)) {
+      return reply.code(400).send({ error: 'invalid_schedule', message: '定时表达式要是五段 cron：分 时 日 月 周' });
+    }
+    const automation = await store.createAutomation(parsed.data);
+    return reply.code(201).send({ ...automation, human: describeCron(automation.schedule) });
+  });
+
+  app.patch('/v1/automations/:id', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const parsed = updateAutomationInput.safeParse(request.body ?? {});
+    if (!parsed.success) return reply.code(400).send(invalid(parsed.error.issues));
+    if (parsed.data.schedule && !validateCron(parsed.data.schedule)) {
+      return reply.code(400).send({ error: 'invalid_schedule', message: '定时表达式要是五段 cron：分 时 日 月 周' });
+    }
+    const automation = await store.updateAutomation(id, parsed.data);
+    if (!automation) return reply.code(404).send({ error: 'automation_not_found', message: '自动化不存在' });
+    return { ...automation, human: describeCron(automation.schedule) };
+  });
+
+  app.delete('/v1/automations/:id', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    if (!(await store.deleteAutomation(id))) {
+      return reply.code(404).send({ error: 'automation_not_found', message: '自动化不存在' });
+    }
+    return { ok: true };
+  });
+
+  /** 立即跑一次，不等 cron */
+  app.post('/v1/automations/:id/run', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const automation = (await store.listAutomations()).find((item) => item.id === id);
+    if (!automation) return reply.code(404).send({ error: 'automation_not_found', message: '自动化不存在' });
+
+    const started = await runAutomation(automation);
+    if (!started) return reply.code(429).send({ error: 'quota_exceeded', message: '本周次数已用完，这次自动化没有启动' });
+    return reply.code(202).send({ threadId: started.thread.id, runId: started.run.id });
   });
 
   app.get('/v1/usage', async () => store.usage());
@@ -670,6 +745,20 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
   }
 
   app.addHook('onReady', async () => {
+    // 每 30 秒看一眼有没有该跑的；selectDue 保证同一分钟只触发一次
+    const interval = setInterval(() => {
+      void (async () => {
+        try {
+          const due = selectDue(await store.listAutomations(), new Date());
+          for (const automation of due) await runAutomation(automation);
+        } catch (error) {
+          console.error('自动化触发失败：', error);
+        }
+      })();
+    }, options.automationIntervalMs ?? 30_000);
+    interval.unref?.();
+    automationTimer = interval;
+
     const settings = await store.getSettings();
     for (const name of settings.approvedTools) grants.add(name);
 
@@ -683,6 +772,7 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
   });
 
   app.addHook('onClose', async () => {
+    if (automationTimer) clearInterval(automationTimer);
     for (const timer of timers) clearInterval(timer);
     timers.clear();
     gate.cancelAll();

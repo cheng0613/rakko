@@ -188,6 +188,35 @@ export type ApprovalDecisionInput = z.infer<typeof approvalDecisionSchema>;
 export const riskLevelSchema = z.enum(['low', 'medium', 'high']);
 export type RiskLevel = z.infer<typeof riskLevelSchema>;
 
+/** 自动化：一条 cron + 一句任务描述，到点就起一个运行 */
+export const automationSchema = z.object({
+  id,
+  name: z.string(),
+  schedule: z.string(),
+  prompt: z.string(),
+  enabled: z.boolean(),
+  lastRunAt: at.nullable(),
+  createdAt: at,
+});
+export type Automation = z.infer<typeof automationSchema>;
+
+export const createAutomationInput = z.object({
+  name: z.string().trim().min(1).max(80),
+  /** 五段 cron：分 时 日 月 周 */
+  schedule: z.string().trim().min(1).max(60),
+  prompt: z.string().min(1).max(4000),
+  enabled: z.boolean().optional(),
+});
+export type CreateAutomationInput = z.infer<typeof createAutomationInput>;
+
+export const updateAutomationInput = z.object({
+  name: z.string().trim().min(1).max(80).optional(),
+  schedule: z.string().trim().min(1).max(60).optional(),
+  prompt: z.string().min(1).max(4000).optional(),
+  enabled: z.boolean().optional(),
+});
+export type UpdateAutomationInput = z.infer<typeof updateAutomationInput>;
+
 /** 用户设置：目前只有「用超了怎么办」，以后加别的都进这个对象 */
 export const settingsSchema = z.object({
   degradeOnExceed: z.boolean(),
