@@ -1172,8 +1172,8 @@ textarea:focus-visible{outline:none}
     showBanner('<span>◐</span><div><b>演示数据</b> · ' + esc(why) + '。下面是一次真实事件流的回放：思考 → 读文件 → 等你点头才写文件。</div>');
     ui.demoBtn.hidden = true;
 
-    // ?auto=1：打开就自动跑一段，方便截图 / 手机上看流程
-    if (params.get('auto') === '1') {
+    // ?auto=1 或直接双击文件打开：自动跑一段，方便手机 / 静态预览
+    if (params.get('auto') === '1' || location.protocol === 'file:') {
       setTimeout(() => {
         if (!state.running) demo.run('读一下 README，把结论记成一条笔记。');
       }, 500);
