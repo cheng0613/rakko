@@ -1,0 +1,25 @@
+{
+  "name": "@rakko/server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "types": "./dist/app.d.ts",
+      "import": "./dist/app.js"
+    }
+  },
+  "dependencies": {
+    "@rakko/core": "workspace:^",
+    "@rakko/protocol": "workspace:^",
+    "fastify": "^5.6.1"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test \"dist/**/*.test.js\"",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js"
+  }
+}
