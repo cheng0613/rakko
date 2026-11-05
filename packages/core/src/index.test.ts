@@ -52,6 +52,14 @@ test('describeQuota 三种情况：可继续、降级、拦截', () => {
   assert.equal(describeQuota({ limit: 120, used: 130, degradeOnExceed: false }), '本周次数已用完，新任务将被拦截');
 });
 
+test('describeQuota 从公开入口可导入且三种状态文案正确', async () => {
+  const { describeQuota: dq } = await import('./index.js');
+  assert.equal(typeof dq, 'function');
+  assert.equal(dq({ limit: 120, used: 62, degradeOnExceed: true }), '剩余 58 次，可继续运行');
+  assert.equal(dq({ limit: 120, used: 120, degradeOnExceed: true }), '本周次数已用完，将降级到快速模型继续');
+  assert.equal(dq({ limit: 120, used: 130, degradeOnExceed: false }), '本周次数已用完，新任务将被拦截');
+});
+
 test('配额按次数计，用超了按设置降级或拦截', () => {
   assert.deepEqual(decideQuota({ limit: 120, used: 62, degradeOnExceed: true }), {
     kind: 'allow',

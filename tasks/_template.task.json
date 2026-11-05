@@ -1,0 +1,29 @@
+{
+  "id": "template",
+  "title": "任务卡模板：复制成 <id>.task.json 再改",
+  "why": "验收标准必须写在卡里，不能靠人临时在提示词里补 —— 否则 agent 会用自己的宽松测试来定义「做完」。",
+  "prompt": "这里是给 agent 的任务描述。写清楚：改哪个文件、按什么顺序做、不许动什么。",
+  "repro": [
+    "pnpm --filter @rakko/core test --test-name-pattern 关键词"
+  ],
+  "accept": [
+    {
+      "name": "行为正确",
+      "cmd": "node tasks/checks/<你自己写的检查>.mjs",
+      "expectExitCode": 0,
+      "note": "独立检查：不依赖 agent 自己的测试，直接调用被测代码或压边界"
+    },
+    {
+      "name": "相关测试全绿",
+      "cmd": "pnpm --filter @rakko/core test",
+      "expectExitCode": 0
+    }
+  ],
+  "boundaries": {
+    "concurrency": [20, 40],
+    "mustNotChange": [
+      { "file": "packages/core/src/quota.ts", "contains": "必须原样保留的一行" }
+    ]
+  },
+  "autoApprove": ["read_file", "list_dir", "grep", "apply_patch", "shell"]
+}

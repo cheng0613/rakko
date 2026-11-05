@@ -10,6 +10,7 @@ export { CircuitBreaker, type BreakerOptions, type BreakerState } from './circui
 export {
   currentPeriod,
   decideQuota,
+  describeQuota,
   planLimit,
   PLAN_LIMITS,
   periodStart,

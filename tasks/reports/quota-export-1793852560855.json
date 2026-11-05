@@ -1,0 +1,53 @@
+{
+  "task": "quota-export",
+  "title": "把 describeQuota 提到包的公开入口",
+  "at": "2026-11-05T04:22:40.855Z",
+  "runId": "9d3c3b5d-1ac3-458f-8399-2897445ea56a",
+  "threadId": "b2d2c42c-b4be-46f6-99d0-696755fc9eb7",
+  "state": "succeeded",
+  "error": null,
+  "durationMs": 29408,
+  "toolCalls": [
+    "grep",
+    "read_file",
+    "read_file",
+    "read_file",
+    "shell",
+    "shell"
+  ],
+  "answer": "全部通过了，不需要再做任何改动。\n\n**现状确认：**\n- `describeQuota` 已经在 `packages/core/src/index.ts` 第 13 行导出（和 quota 模块其他导出一起）\n- `packages/core/src/index.test.ts` 里已经有一条对应测试（第 55 行：`describeQuota 从公开入口可导入且三种状态文案正确`），从 `'./index.js'` 动态 import 并断言三种文案\n\n**验证结果：**\n- `pnpm --filter @rakko/core test` → **52 tests, 0 fail**（含 build + 跑测试）\n- `node tasks/checks/quota-export.mjs` → **全部通过**：导出存在，三种状态文案均正确\n\n看起来这些改动之前已经完成了，当前仓库状态就是满足验收标准的。",
+  "results": [
+    {
+      "name": "core 测试全绿",
+      "cmd": "pnpm --filter @rakko/core test",
+      "exitCode": 0,
+      "ok": true,
+      "tail": "# cancelled 0\n# skipped 0\n# todo 0\n# duration_ms 268.7275\n$ pnpm build && node --test \"dist/**/*.test.js\"\n$ tsc -p tsconfig.json"
+    },
+    {
+      "name": "公开入口能用",
+      "cmd": "node tasks/checks/quota-export.mjs",
+      "exitCode": 0,
+      "ok": true,
+      "tail": "✓ 导出了 describeQuota\n✓ 剩余次数文案\n✓ 允许降级文案\n✓ 拦截文案\n\n全部通过"
+    }
+  ],
+  "guards": [
+    {
+      "file": "packages/core/src/quota.ts",
+      "contains": "剩余 ${remaining} 次，可继续运行",
+      "ok": true
+    },
+    {
+      "file": "packages/core/src/quota.ts",
+      "contains": "本周次数已用完，将降级到快速模型继续",
+      "ok": true
+    },
+    {
+      "file": "packages/core/src/quota.ts",
+      "contains": "本周次数已用完，新任务将被拦截",
+      "ok": true
+    }
+  ],
+  "passed": true
+}

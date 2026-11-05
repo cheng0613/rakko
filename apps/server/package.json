@@ -8,6 +8,10 @@
     ".": {
       "types": "./dist/app.d.ts",
       "import": "./dist/app.js"
+    },
+    "./postgres-store": {
+      "types": "./dist/postgres-store.d.ts",
+      "import": "./dist/postgres-store.js"
     }
   },
   "dependencies": {

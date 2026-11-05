@@ -13,13 +13,17 @@
     "dev": "turbo run dev --parallel",
     "verify": "pnpm typecheck && pnpm test && pnpm build",
     "stack:up": "docker compose up -d --build",
-    "stack:down": "docker compose down"
+    "stack:down": "docker compose down",
+    "task": "node scripts/task-run.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.15.3",
     "turbo": "^2.6.3",
     "tsx": "^4.20.6",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "@rakko/core": "workspace:^",
+    "@rakko/db": "workspace:^",
+    "@rakko/server": "workspace:^"
   },
   "pnpm": {
     "onlyBuiltDependencies": [

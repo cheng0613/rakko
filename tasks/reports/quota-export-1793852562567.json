@@ -1,0 +1,45 @@
+{
+  "task": "quota-export",
+  "title": "把 describeQuota 提到包的公开入口",
+  "at": "2026-11-05T04:22:42.566Z",
+  "runId": null,
+  "threadId": null,
+  "error": null,
+  "durationMs": 1609,
+  "toolCalls": [],
+  "answer": null,
+  "results": [
+    {
+      "name": "core 测试全绿",
+      "cmd": "pnpm --filter @rakko/core test",
+      "exitCode": 1,
+      "ok": false,
+      "tail": "$ pnpm build && node --test \"dist/**/*.test.js\"\n$ tsc -p tsconfig.json\n[ELIFECYCLE] Test failed. See above for more details.\nError: ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL\n\n  × \"pnpm recursive run\" failed in C:\\Users\\chiaki\\Desktop\\Rakko\\packages\\core"
+    },
+    {
+      "name": "公开入口能用",
+      "cmd": "node tasks/checks/quota-export.mjs",
+      "exitCode": 1,
+      "ok": false,
+      "tail": "✓ 剩余次数文案\n✓ 允许降级文案\n✗ 拦截文案\n    期望 \"本周次数已用完，新任务将被拦截\"，实际 \"本周次数已用完，新请求将被拦截\"\n\n1 项不达标：拦截文案"
+    }
+  ],
+  "guards": [
+    {
+      "file": "packages/core/src/quota.ts",
+      "contains": "剩余 ${remaining} 次，可继续运行",
+      "ok": true
+    },
+    {
+      "file": "packages/core/src/quota.ts",
+      "contains": "本周次数已用完，将降级到快速模型继续",
+      "ok": true
+    },
+    {
+      "file": "packages/core/src/quota.ts",
+      "contains": "本周次数已用完，新任务将被拦截",
+      "ok": false
+    }
+  ],
+  "passed": false
+}

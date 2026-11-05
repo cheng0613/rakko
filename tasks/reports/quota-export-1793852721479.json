@@ -1,0 +1,55 @@
+{
+  "task": "quota-export",
+  "title": "把 describeQuota 提到包的公开入口",
+  "at": "2026-11-05T04:25:21.479Z",
+  "runId": "0f6b76a2-3eda-4a72-be87-89bea36b362c",
+  "threadId": "b1c8ed29-3148-4046-a1b7-e9fac82d8865",
+  "state": "succeeded",
+  "error": null,
+  "durationMs": 69292,
+  "toolCalls": [
+    "grep",
+    "read_file",
+    "read_file",
+    "read_file",
+    "read_file",
+    "apply_patch",
+    "shell",
+    "shell"
+  ],
+  "answer": "全部通过。\n\n**总结：**\n\n- `describeQuota` 本身已经在 `index.ts` 导出，测试也已在 `index.test.ts` 写好（包括从 `./index.js` 动态 import 的那条）。\n- 唯一的问题在 `quota.ts` 第 48 行：拦截文案写的是 `新请求将被拦截`，但测试和验收脚本都期望 `新任务将被拦截`。改了一个字，两个检查全绿：\n  - `pnpm --filter @rakko/core test`：52 条全过\n  - `node tasks/checks/quota-export.mjs`：4 项全部通过",
+  "results": [
+    {
+      "name": "core 测试全绿",
+      "cmd": "pnpm --filter @rakko/core test",
+      "exitCode": 0,
+      "ok": true,
+      "tail": "# cancelled 0\n# skipped 0\n# todo 0\n# duration_ms 277.3248\n$ pnpm build && node --test \"dist/**/*.test.js\"\n$ tsc -p tsconfig.json"
+    },
+    {
+      "name": "公开入口能用",
+      "cmd": "node tasks/checks/quota-export.mjs",
+      "exitCode": 0,
+      "ok": true,
+      "tail": "✓ 导出了 describeQuota\n✓ 剩余次数文案\n✓ 允许降级文案\n✓ 拦截文案\n\n全部通过"
+    }
+  ],
+  "guards": [
+    {
+      "file": "packages/core/src/quota.ts",
+      "contains": "剩余 ${remaining} 次，可继续运行",
+      "ok": true
+    },
+    {
+      "file": "packages/core/src/quota.ts",
+      "contains": "本周次数已用完，将降级到快速模型继续",
+      "ok": true
+    },
+    {
+      "file": "packages/core/src/quota.ts",
+      "contains": "本周次数已用完，新任务将被拦截",
+      "ok": true
+    }
+  ],
+  "passed": true
+}

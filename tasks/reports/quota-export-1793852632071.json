@@ -1,0 +1,54 @@
+{
+  "task": "quota-export",
+  "title": "把 describeQuota 提到包的公开入口",
+  "at": "2026-11-05T04:23:52.071Z",
+  "runId": "cb66a8e4-4766-40f3-b9fc-e1adc6a494a8",
+  "threadId": "72b6cd15-2b4b-4300-acf6-45d1134e016a",
+  "state": "succeeded",
+  "error": null,
+  "durationMs": 71113,
+  "toolCalls": [
+    "grep",
+    "read_file",
+    "read_file",
+    "read_file",
+    "apply_patch",
+    "shell",
+    "shell"
+  ],
+  "answer": "全部通过。核心测试 52/52 绿，验收脚本也确认三种配额文案正确。\n\n**实际只做了一处改动**：`packages/core/src/quota.ts` 第48行，把 `新请求将被拦截` → `新任务将被拦截`，与已有测试和验收约束对齐。\n\n其余两项（`index.ts` 导出、`index.test.ts` 的公开入口测试）**之前就已经有了**，无需改动。",
+  "results": [
+    {
+      "name": "core 测试全绿",
+      "cmd": "pnpm --filter @rakko/core test",
+      "exitCode": 0,
+      "ok": true,
+      "tail": "# cancelled 0\n# skipped 0\n# todo 0\n# duration_ms 275.6007\n$ pnpm build && node --test \"dist/**/*.test.js\"\n$ tsc -p tsconfig.json"
+    },
+    {
+      "name": "公开入口能用",
+      "cmd": "node tasks/checks/quota-export.mjs",
+      "exitCode": 0,
+      "ok": true,
+      "tail": "✓ 导出了 describeQuota\n✓ 剩余次数文案\n✓ 允许降级文案\n✓ 拦截文案\n\n全部通过"
+    }
+  ],
+  "guards": [
+    {
+      "file": "packages/core/src/quota.ts",
+      "contains": "剩余 ${remaining} 次，可继续运行",
+      "ok": true
+    },
+    {
+      "file": "packages/core/src/quota.ts",
+      "contains": "本周次数已用完，将降级到快速模型继续",
+      "ok": true
+    },
+    {
+      "file": "packages/core/src/quota.ts",
+      "contains": "本周次数已用完，新任务将被拦截",
+      "ok": true
+    }
+  ],
+  "passed": true
+}

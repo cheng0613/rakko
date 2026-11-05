@@ -166,6 +166,15 @@ importers:
 
   .:
     devDependencies:
+      '@rakko/core':
+        specifier: workspace:^
+        version: link:packages/core
+      '@rakko/db':
+        specifier: workspace:^
+        version: link:packages/db
+      '@rakko/server':
+        specifier: workspace:^
+        version: link:apps/server
       '@types/node':
         specifier: ^22.15.3
         version: 22.20.5

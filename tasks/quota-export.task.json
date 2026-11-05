@@ -1,0 +1,46 @@
+{
+  "id": "quota-export",
+  "title": "把 describeQuota 提到包的公开入口",
+  "why": "agent 上次只改了 quota.ts 并让测试从 quota.js 直接 import，功能在，但别人 import '@rakko/core' 拿不到。验收标准要写死这一点。",
+  "prompt": "packages/core/src/quota.ts 里有纯函数 describeQuota，但包的公开入口 packages/core/src/index.ts 没有导出它，外部只能从内部路径 import。\n\n请：\n1. 先确认现状：grep 一下 describeQuota 在 core 包里出现在哪些地方\n2. 在 packages/core/src/index.ts 的导出里加上 describeQuota（保持现有的分组与排序风格）\n3. 在 packages/core/src/index.test.ts 里加一条测试，从 './index.js' 导入 describeQuota 并断言它对三种配额状态返回正确文案\n4. 跑 `pnpm --filter @rakko/core test` 确认全绿",
+  "repro": [
+    "pnpm --filter @rakko/core test"
+  ],
+  "accept": [
+    {
+      "name": "core 测试全绿",
+      "cmd": "pnpm --filter @rakko/core test",
+      "expectExitCode": 0,
+      "note": "先跑这个：它内部会先 build，验收脚本才能 import 到最新的 dist"
+    },
+    {
+      "name": "公开入口能用",
+      "cmd": "node tasks/checks/quota-export.mjs",
+      "expectExitCode": 0,
+      "note": "专门检查 import '@rakko/core' 能拿到 describeQuota 且三种状态文案正确"
+    }
+  ],
+  "boundaries": {
+    "mustNotChange": [
+      {
+        "file": "packages/core/src/quota.ts",
+        "contains": "剩余 ${remaining} 次，可继续运行"
+      },
+      {
+        "file": "packages/core/src/quota.ts",
+        "contains": "本周次数已用完，将降级到快速模型继续"
+      },
+      {
+        "file": "packages/core/src/quota.ts",
+        "contains": "本周次数已用完，新任务将被拦截"
+      }
+    ]
+  },
+  "autoApprove": [
+    "read_file",
+    "list_dir",
+    "grep",
+    "apply_patch",
+    "shell"
+  ]
+}

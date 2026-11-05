@@ -1,0 +1,41 @@
+{
+  "task": "concurrent-append",
+  "title": "同一会话并发写消息不丢数据",
+  "at": "2026-11-05T04:26:53.472Z",
+  "runId": null,
+  "threadId": null,
+  "state": "succeeded",
+  "error": null,
+  "durationMs": 7826,
+  "toolCalls": [],
+  "answer": null,
+  "results": [
+    {
+      "name": "20 / 40 并发都正确",
+      "cmd": "node tasks/checks/concurrent-append.mjs",
+      "exitCode": 0,
+      "ok": true,
+      "tail": "✓ 并发 20：成功 20/20 · 库中 20 条 · seq 去重 20 个（期望 20）\n✓ 并发 40：成功 40/40 · 库中 60 条 · seq 去重 60 个（期望 60）\n\n并发边界全部通过"
+    },
+    {
+      "name": "server 测试全绿",
+      "cmd": "pnpm --filter @rakko/server test",
+      "exitCode": 0,
+      "ok": true,
+      "tail": "# cancelled 0\n# skipped 0\n# todo 0\n# duration_ms 5417.7773\n$ pnpm build && node --test \"dist/**/*.test.js\"\n$ tsc -p tsconfig.json"
+    }
+  ],
+  "guards": [
+    {
+      "file": "packages/db/src/schema.ts",
+      "contains": "uniqueIndex('messages_thread_seq_uq')",
+      "ok": true
+    },
+    {
+      "file": "apps/server/src/postgres-store.ts",
+      "contains": "async appendMessage(",
+      "ok": true
+    }
+  ],
+  "passed": true
+}

@@ -217,6 +217,48 @@ apply_patch 加一个纯函数 → 补测试 → 跑测试）。第一轮崩在�
 这一轮还暴露两个自己的问题：`recoverOrphans` 是全局扫的（测试一调就会误伤正在跑的运行），
 以及成功的运行会留着历史 error。都修了。
 
+## 任务卡（验收不靠嘴说）
+
+让 agent 干活时，最大的坑不是它不会写代码，而是**「做完了」由它自己定义**。
+任务卡把「活」和「怎么算做完」写在同一个文件里，执行器只认卡，不认它的自评。
+
+```bash
+pnpm task                      # 列出所有任务卡
+pnpm task quota-export --dry   # 只看拼好的提示（含验收标准）
+pnpm task quota-export         # 跑：自动审批 + 独立验收 + 写报告
+pnpm task quota-export --check-only   # 不跑 agent，只复检验收（改完代码想快速核对）
+```
+
+一张卡长这样（`tasks/<id>.task.json`）：
+
+```json
+{
+  "id": "concurrent-append",
+  "title": "同一会话并发写消息不丢数据",
+  "prompt": "给 agent 的活……",
+  "repro": ["pnpm --filter @rakko/server test --test-name-pattern 并发"],
+  "accept": [
+    { "name": "20 / 40 并发都正确", "cmd": "node tasks/checks/concurrent-append.mjs", "expectExitCode": 0 },
+    { "name": "server 测试全绿", "cmd": "pnpm --filter @rakko/server test", "expectExitCode": 0 }
+  ],
+  "boundaries": {
+    "concurrency": [20, 40],
+    "mustNotChange": [
+      { "file": "packages/db/src/schema.ts", "contains": "uniqueIndex('messages_thread_seq_uq')" }
+    ]
+  },
+  "autoApprove": ["read_file", "list_dir", "grep", "apply_patch", "shell"]
+}
+```
+
+三条规矩：
+
+1. **验收由执行器跑**（`accept` 里的命令），agent 自己写的测试再绿也不算过；
+2. **边界写死**（`boundaries.concurrency`），上次那个「重试 5 次」就是只测了 5 并发才漏的；
+3. **`mustNotChange` 会被机检**（文件里必须还包含某段文本）—— 防止它改文案去迎合测试。
+
+报告落在 `tasks/reports/<id>-<时间>.json`（不进 git），有任何一项不达标就以 1 退出，能直接进 CI。
+
 ## 存储
 
 `RunStore` 是唯一接口，两套实现行为一致：

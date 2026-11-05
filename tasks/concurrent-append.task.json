@@ -1,0 +1,45 @@
+{
+  "id": "concurrent-append",
+  "title": "同一会话并发写消息不丢数据",
+  "why": "上一次 agent 用「撞 23505 就重试 5 次」修好了 5 并发，但 20 并发实测只成功 16/20。验收标准必须把并发边界写死，而不是让它自己定义一个宽松的测试。",
+  "prompt": "PostgresStore.appendMessage 用子查询 coalesce(max(seq),0)+1 算 seq，同一会话并发写会撞 (thread_id, seq) 唯一索引。\n\n请：\n1. 先跑 `pnpm --filter @rakko/server test` 看有没有现成的并发测试、现在是否红\n2. 先写一个能稳定复现的测试（并发追加消息，断言全部成功且 seq 不重复）\n3. 修 apps/server/src/postgres-store.ts 的 appendMessage，让并发下也正确\n4. 跑 `pnpm --filter @rakko/server test` 确认全绿\n\n注意：验收不看你自己写的测试有多宽松 —— 我会用独立的检查脚本压到 20 并发和 40 并发。",
+  "repro": [
+    "pnpm --filter @rakko/server test --test-name-pattern 并发"
+  ],
+  "accept": [
+    {
+      "name": "20 / 40 并发都正确",
+      "cmd": "node tasks/checks/concurrent-append.mjs",
+      "expectExitCode": 0,
+      "note": "独立压测：并发 20 与 40，要求全部成功、seq 无重复、条数对得上"
+    },
+    {
+      "name": "server 测试全绿",
+      "cmd": "pnpm --filter @rakko/server test",
+      "expectExitCode": 0
+    }
+  ],
+  "boundaries": {
+    "concurrency": [
+      20,
+      40
+    ],
+    "mustNotChange": [
+      {
+        "file": "packages/db/src/schema.ts",
+        "contains": "uniqueIndex('messages_thread_seq_uq')"
+      },
+      {
+        "file": "apps/server/src/postgres-store.ts",
+        "contains": "async appendMessage("
+      }
+    ]
+  },
+  "autoApprove": [
+    "read_file",
+    "list_dir",
+    "grep",
+    "apply_patch",
+    "shell"
+  ]
+}
