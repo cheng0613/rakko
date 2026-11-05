@@ -90,6 +90,15 @@ docker compose up -d --build                     # db + api 全容器化，api �
   失败时默认追加「接着刚才的做，不要从头开始。」，取消时追加「继续。」，
   也可以带 `instruction` 换成自己的说法。代价是一次配额，跟正常运行一样。
 
+## 记忆
+
+侧栏「记忆」：四类跨会话的东西 —— 关于我 / 偏好纠正 / 项目 / 参考。
+
+- 增删改查都在界面里（新建表单、卡片列表、删除），四类 kind 有中文标签。
+- **记忆真的进上下文**：每次运行拼系统提示时会带上一段「用户的记忆（跨会话）」，
+  最多 20 条、每条正文截 200 字；和当前指令冲突时以当前指令为准。
+- 记忆不进对话记录，只在系统提示里出现 —— 换会话也生效，删掉就立刻不生效。
+
 ## 自动化
 
 侧栏「任务与自动化」：一条 cron + 一句任务描述，到点自己起一个运行。
@@ -376,6 +385,10 @@ agent 的文件工具锁在工作区里，读这个目录会直接 `路径越界
 ```
 GET  /health                                   服务、provider、模型、熔断、工具、等待中的审批
 GET  /v1/usage                                 配额（次数制，来自 usage_ledger）
+GET  /v1/memories                              记忆列表（按更新时间倒序）
+POST /v1/memories                              记一条（kind / title / description / body）
+PATCH /v1/memories/:id                         改
+DELETE /v1/memories/:id                        删
 GET  /v1/automations                           自动化列表（含 human 描述）
 POST /v1/automations                           新建（名字 / cron / 任务）
 PATCH /v1/automations/:id                      改名、改时间、启用暂停

@@ -661,3 +661,70 @@ test('自动化：增删改查 + 立即运行 + 到点自动触发', async () =>
   assert.equal((await app.inject({ method: 'DELETE', url: `/v1/automations/${automation.id}` })).statusCode, 404);
   await app.close();
 });
+
+test('记忆：增删改查，四类 kind 才合法', async () => {
+  const app = makeApp();
+
+  const created = await app.inject({
+    method: 'POST',
+    url: '/v1/memories',
+    payload: { kind: 'user', title: '偏好简洁回答', description: '沟通风格', body: '不喜欢客套，直接给结论。' },
+  });
+  assert.equal(created.statusCode, 201);
+  const memory = created.json();
+  assert.equal(memory.kind, 'user');
+
+  const badKind = await app.inject({
+    method: 'POST',
+    url: '/v1/memories',
+    payload: { kind: 'whatever', title: 'x', body: 'y' },
+  });
+  assert.equal(badKind.statusCode, 400);
+
+  const emptyTitle = await app.inject({ method: 'POST', url: '/v1/memories', payload: { kind: 'project', title: '  ', body: 'y' } });
+  assert.equal(emptyTitle.statusCode, 400);
+
+  const listed = (await app.inject({ method: 'GET', url: '/v1/memories' })).json();
+  assert.equal(listed.items.length, 1);
+
+  const updated = await app.inject({
+    method: 'PATCH',
+    url: `/v1/memories/${memory.id}`,
+    payload: { kind: 'feedback', body: '改成：先给结论，再给理由。' },
+  });
+  assert.equal(updated.statusCode, 200);
+  assert.equal(updated.json().kind, 'feedback');
+  assert.match(updated.json().body, /先给结论/);
+
+  assert.equal((await app.inject({ method: 'DELETE', url: `/v1/memories/${memory.id}` })).statusCode, 200);
+  assert.equal((await app.inject({ method: 'DELETE', url: `/v1/memories/${memory.id}` })).statusCode, 404);
+  assert.equal((await app.inject({ method: 'GET', url: '/v1/memories' })).json().items.length, 0);
+  await app.close();
+});
+
+test('记忆会被带进系统提示，下一次对话就能用上', async () => {
+  const seen: string[] = [];
+  const provider: ModelProvider = {
+    id: 'peek',
+    async *stream(request) {
+      seen.push(request.messages[0]?.content ?? '');
+      yield { kind: 'delta', text: '好。' };
+      yield { kind: 'done', finishReason: 'stop' };
+    },
+  };
+
+  const store = new MemoryStore();
+  const gateway = new ProviderGateway({ provider, models: FAKE_MODELS, firstChunkTimeoutMs: 2_000 });
+  const app = createApp({ store, gateway });
+
+  await store.createMemory({ kind: 'user', title: '回答先给结论', description: '沟通风格', body: '不要客套，先给结论。' });
+
+  const thread = (await app.inject({ method: 'POST', url: '/v1/threads', payload: {} })).json();
+  const run = (await app.inject({ method: 'POST', url: '/v1/runs', payload: { threadId: thread.id, prompt: '帮我看看构建' } })).json();
+  await waitFor(app, run.id, (body) => body.state === 'succeeded');
+
+  assert.match(seen[0] ?? '', /## 用户的记忆（跨会话）/, '系统提示里要有记忆段');
+  assert.match(seen[0] ?? '', /回答先给结论/, '记忆的标题要出现');
+  assert.match(seen[0] ?? '', /不要客套/, '记忆的正文要出现');
+  await app.close();
+});

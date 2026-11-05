@@ -8,7 +8,7 @@
 import { randomUUID } from 'node:crypto';
 
 import { currentPeriod, decideQuota, periodStart, planLimit, type QuotaDecision, type QuotaState } from '@rakko/core';
-import type { Automation, Message, MessageKind, MessageRole, RiskLevel, Run, RunEvent, Settings, Thread, Usage } from '@rakko/protocol';
+import type { Automation, Memory, Message, MessageKind, MessageRole, RiskLevel, Run, RunEvent, Settings, Thread, Usage } from '@rakko/protocol';
 
 export interface AppendMessageInput {
   threadId: string;
@@ -55,6 +55,12 @@ export interface RunStore {
   resumableRuns(): Promise<ResumableRun[]>;
   /** 线程最近一次运行，界面刷新后据此决定要不要接着看流 */
   latestRunForThread(threadId: string): Promise<Run | undefined>;
+  /** 记忆：跨会话留下的东西 */
+  listMemories(): Promise<Memory[]>;
+  createMemory(input: { kind: Memory['kind']; title: string; description?: string; body: string }): Promise<Memory>;
+  updateMemory(id: string, patch: Partial<Pick<Memory, 'kind' | 'title' | 'description' | 'body'>>): Promise<Memory | undefined>;
+  deleteMemory(id: string): Promise<boolean>;
+
   /** 自动化：cron + 一句任务描述 */
   listAutomations(): Promise<Automation[]>;
   createAutomation(input: { name: string; schedule: string; prompt: string; enabled?: boolean }): Promise<Automation>;
@@ -99,6 +105,7 @@ export class MemoryStore implements RunStore {
   private quota: QuotaState;
   private settings: Settings;
   private readonly automations = new Map<string, Automation>();
+  private readonly memories = new Map<string, Memory>();
 
   constructor(options: MemoryStoreOptions = {}) {
     const degradeOnExceed = options.degradeOnExceed ?? true;
@@ -125,6 +132,40 @@ export class MemoryStore implements RunStore {
 
   async resumableRuns(): Promise<ResumableRun[]> {
     return [];
+  }
+
+  async listMemories(): Promise<Memory[]> {
+    return [...this.memories.values()].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+
+  async createMemory(input: { kind: Memory['kind']; title: string; description?: string; body: string }): Promise<Memory> {
+    const at = now();
+    const memory: Memory = {
+      id: randomUUID(),
+      kind: input.kind,
+      title: input.title,
+      description: input.description ?? '',
+      body: input.body,
+      createdAt: at,
+      updatedAt: at,
+    };
+    this.memories.set(memory.id, memory);
+    return memory;
+  }
+
+  async updateMemory(
+    id: string,
+    patch: Partial<Pick<Memory, 'kind' | 'title' | 'description' | 'body'>>,
+  ): Promise<Memory | undefined> {
+    const current = this.memories.get(id);
+    if (!current) return undefined;
+    const next: Memory = { ...current, ...patch, updatedAt: now() };
+    this.memories.set(id, next);
+    return next;
+  }
+
+  async deleteMemory(id: string): Promise<boolean> {
+    return this.memories.delete(id);
   }
 
   async listAutomations(): Promise<Automation[]> {

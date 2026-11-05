@@ -20,8 +20,10 @@ import {
   createRunInput,
   continueRunInput,
   createAutomationInput,
+  createMemoryInput,
   createThreadInput,
   updateAutomationInput,
+  updateMemoryInput,
   TERMINAL_STATES,
   updateSettingsInput,
   updateThreadInput,
@@ -107,6 +109,33 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
     } catch {
       return reply.code(404).send({ error: 'web_missing', message: '界面文件 apps/web/index.html 不在' });
     }
+  });
+
+  /* ---------------- 记忆 ---------------- */
+
+  app.get('/v1/memories', async () => ({ items: await store.listMemories() }));
+
+  app.post('/v1/memories', async (request, reply) => {
+    const parsed = createMemoryInput.safeParse(request.body ?? {});
+    if (!parsed.success) return reply.code(400).send(invalid(parsed.error.issues));
+    return reply.code(201).send(await store.createMemory(parsed.data));
+  });
+
+  app.patch('/v1/memories/:id', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const parsed = updateMemoryInput.safeParse(request.body ?? {});
+    if (!parsed.success) return reply.code(400).send(invalid(parsed.error.issues));
+    const memory = await store.updateMemory(id, parsed.data);
+    if (!memory) return reply.code(404).send({ error: 'memory_not_found', message: '这条记忆不存在' });
+    return memory;
+  });
+
+  app.delete('/v1/memories/:id', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    if (!(await store.deleteMemory(id))) {
+      return reply.code(404).send({ error: 'memory_not_found', message: '这条记忆不存在' });
+    }
+    return { ok: true };
   });
 
   /* ---------------- 自动化 ---------------- */
@@ -712,7 +741,22 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
 
     // 整条会话都带上：上一轮说过什么、调过什么工具，模型都看得到
     const history = trimHistory(buildHistory(await store.listMessages(run.threadId)));
-    await executeRun(run, tier, [{ role: 'system', content: buildSystemPrompt() }, ...history], null, notice);
+    const systemPrompt = buildSystemPrompt() + (await buildMemorySection());
+    await executeRun(run, tier, [{ role: 'system', content: systemPrompt }, ...history], null, notice);
+  }
+
+  /** 把记忆拼成系统提示的一段：跨会话的偏好与背景，最多 20 条、每条 200 字 */
+  async function buildMemorySection(): Promise<string> {
+    const items = await store.listMemories();
+    if (items.length === 0) return '';
+
+    const lines = items.slice(0, 20).map((memory) => {
+      const body = memory.body.replace(/\s+/g, ' ').slice(0, 200);
+      const note = memory.description ? `（${memory.description}）` : '';
+      return `- [${memory.kind}] ${memory.title}${note}：${body}`;
+    });
+
+    return ['', '## 用户的记忆（跨会话）', ...lines, '这些是长期有效的偏好与背景，默认按它们行事；和当前指令冲突时以当前指令为准。'].join('\n');
   }
 
   /**
@@ -739,7 +783,10 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
   /** 重启后恢复：拿库里的历史 + 还挂着的审批，接着跑 */
   async function resumeRun(run: Run, pending: PendingCall | null): Promise<void> {
     const items = await store.listMessages(run.threadId);
-    const messages: ChatMessage[] = [{ role: 'system', content: buildSystemPrompt() }, ...buildHistory(items)];
+    const messages: ChatMessage[] = [
+      { role: 'system', content: buildSystemPrompt() + (await buildMemorySection()) },
+      ...buildHistory(items),
+    ];
     const tier: ModelTier = run.model === gateway.models.fast ? 'fast' : 'standard';
     await executeRun(run, tier, messages, pending, null);
   }

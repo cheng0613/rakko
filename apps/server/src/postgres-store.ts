@@ -10,9 +10,9 @@
 import { and, asc, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 
 import type { DbHandle } from '@rakko/db';
-import { automations, messages, runEvents, runs, threads, usageLedger, users } from '@rakko/db';
+import { automations, memories, messages, runEvents, runs, threads, usageLedger, users } from '@rakko/db';
 import { currentPeriod, decideQuota, periodStart, planLimit, type QuotaDecision } from '@rakko/core';
-import type { Automation, Message, MessageKind, RiskLevel, Run, RunEvent, RunState, Settings, Thread, Usage } from '@rakko/protocol';
+import type { Automation, Memory, MemoryKind, Message, MessageKind, RiskLevel, Run, RunEvent, RunState, Settings, Thread, Usage } from '@rakko/protocol';
 
 import type { AppendMessageInput, CreateRunInput, Listener, PendingCall, ResumableRun, RunPatch, RunStore } from './store.js';
 
@@ -34,6 +34,16 @@ const toMessage = (row: typeof messages.$inferSelect): Message => ({
   payload: (row.payload as Record<string, unknown> | null) ?? null,
   runId: row.runId,
   createdAt: row.createdAt.toISOString(),
+});
+
+const toMemory = (row: typeof memories.$inferSelect): Memory => ({
+  id: row.id,
+  kind: row.kind as MemoryKind,
+  title: row.title,
+  description: row.description,
+  body: row.body,
+  createdAt: row.createdAt.toISOString(),
+  updatedAt: row.updatedAt.toISOString(),
 });
 
 const toAutomation = (row: typeof automations.$inferSelect): Automation => ({
@@ -317,6 +327,56 @@ export class PostgresStore implements RunStore {
   async quotaDecision(): Promise<QuotaDecision> {
     const usage = await this.usage();
     return decideQuota({ limit: usage.limit, used: usage.used, degradeOnExceed: usage.degradeOnExceed });
+  }
+
+  async listMemories(): Promise<Memory[]> {
+    const rows = await this.db
+      .select()
+      .from(memories)
+      .where(eq(memories.userId, this.requireUserId()))
+      .orderBy(desc(memories.updatedAt));
+    return rows.map(toMemory);
+  }
+
+  async createMemory(input: { kind: MemoryKind; title: string; description?: string; body: string }): Promise<Memory> {
+    const [row] = await this.db
+      .insert(memories)
+      .values({
+        userId: this.requireUserId(),
+        kind: input.kind,
+        title: input.title,
+        description: input.description ?? '',
+        body: input.body,
+      })
+      .returning();
+    if (!row) throw new Error('写记忆失败');
+    return toMemory(row);
+  }
+
+  async updateMemory(
+    id: string,
+    patch: Partial<Pick<Memory, 'kind' | 'title' | 'description' | 'body'>>,
+  ): Promise<Memory | undefined> {
+    const [row] = await this.db
+      .update(memories)
+      .set({
+        ...(patch.kind !== undefined ? { kind: patch.kind } : {}),
+        ...(patch.title !== undefined ? { title: patch.title } : {}),
+        ...(patch.description !== undefined ? { description: patch.description } : {}),
+        ...(patch.body !== undefined ? { body: patch.body } : {}),
+        updatedAt: new Date(),
+      })
+      .where(and(eq(memories.id, id), eq(memories.userId, this.requireUserId())))
+      .returning();
+    return row ? toMemory(row) : undefined;
+  }
+
+  async deleteMemory(id: string): Promise<boolean> {
+    const rows = await this.db
+      .delete(memories)
+      .where(and(eq(memories.id, id), eq(memories.userId, this.requireUserId())))
+      .returning({ id: memories.id });
+    return rows.length > 0;
   }
 
   async listAutomations(): Promise<Automation[]> {

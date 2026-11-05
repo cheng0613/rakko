@@ -188,6 +188,38 @@ export type ApprovalDecisionInput = z.infer<typeof approvalDecisionSchema>;
 export const riskLevelSchema = z.enum(['low', 'medium', 'high']);
 export type RiskLevel = z.infer<typeof riskLevelSchema>;
 
+/** 记忆：值得跨会话留下的四类东西 */
+export const MEMORY_KINDS = ['user', 'feedback', 'project', 'reference'] as const;
+export const memoryKindSchema = z.enum(MEMORY_KINDS);
+export type MemoryKind = (typeof MEMORY_KINDS)[number];
+
+export const memorySchema = z.object({
+  id,
+  kind: memoryKindSchema,
+  title: z.string(),
+  description: z.string(),
+  body: z.string(),
+  createdAt: at,
+  updatedAt: at,
+});
+export type Memory = z.infer<typeof memorySchema>;
+
+export const createMemoryInput = z.object({
+  kind: memoryKindSchema,
+  title: z.string().trim().min(1).max(120),
+  description: z.string().trim().max(200).optional(),
+  body: z.string().min(1).max(8000),
+});
+export type CreateMemoryInput = z.infer<typeof createMemoryInput>;
+
+export const updateMemoryInput = z.object({
+  kind: memoryKindSchema.optional(),
+  title: z.string().trim().min(1).max(120).optional(),
+  description: z.string().trim().max(200).optional(),
+  body: z.string().min(1).max(8000).optional(),
+});
+export type UpdateMemoryInput = z.infer<typeof updateMemoryInput>;
+
 /** 自动化：一条 cron + 一句任务描述，到点就起一个运行 */
 export const automationSchema = z.object({
   id,
