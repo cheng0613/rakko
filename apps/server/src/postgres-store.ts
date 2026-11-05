@@ -178,6 +178,24 @@ export class PostgresStore implements RunStore {
     return toThread(row);
   }
 
+  async renameThread(id: string, title: string): Promise<Thread | undefined> {
+    const [row] = await this.db
+      .update(threads)
+      .set({ title, updatedAt: new Date() })
+      .where(and(eq(threads.id, id), eq(threads.userId, this.requireUserId())))
+      .returning();
+    return row ? toThread(row) : undefined;
+  }
+
+  async deleteThread(id: string): Promise<boolean> {
+    // messages / runs / run_events 靠外键 cascade 跟着删
+    const rows = await this.db
+      .delete(threads)
+      .where(and(eq(threads.id, id), eq(threads.userId, this.requireUserId())))
+      .returning({ id: threads.id });
+    return rows.length > 0;
+  }
+
   async listMessages(threadId: string): Promise<Message[]> {
     const rows = await this.db
       .select()

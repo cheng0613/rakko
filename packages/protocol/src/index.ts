@@ -150,6 +150,12 @@ export const createThreadInput = z.object({
 });
 export type CreateThreadInput = z.infer<typeof createThreadInput>;
 
+export const updateThreadInput = z.object({
+  // 先 trim 再判空：只输空格不算有效标题
+  title: z.string().trim().min(1).max(120),
+});
+export type UpdateThreadInput = z.infer<typeof updateThreadInput>;
+
 export const createRunInput = z.object({
   threadId: id,
   prompt: z.string().min(1).max(20000),

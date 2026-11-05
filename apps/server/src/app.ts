@@ -20,6 +20,7 @@ import {
   createRunInput,
   createThreadInput,
   updateSettingsInput,
+  updateThreadInput,
   type Message,
   type Run,
   type RunEvent,
@@ -121,6 +122,24 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
     return reply.code(201).send(await store.createThread(parsed.data.title));
   });
 
+  app.patch('/v1/threads/:id', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const parsed = updateThreadInput.safeParse(request.body ?? {});
+    if (!parsed.success) return reply.code(400).send(invalid(parsed.error.issues));
+
+    const thread = await store.renameThread(id, parsed.data.title.trim());
+    if (!thread) return reply.code(404).send({ error: 'thread_not_found', message: '会话不存在' });
+    return thread;
+  });
+
+  app.delete('/v1/threads/:id', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const removed = await store.deleteThread(id);
+    if (!removed) return reply.code(404).send({ error: 'thread_not_found', message: '会话不存在' });
+    gate.cancelRun(id, '会话已删除');
+    return { ok: true };
+  });
+
   app.get('/v1/threads/:id', async (request, reply) => {
     const { id } = request.params as { id: string };
     const thread = await store.getThread(id);
@@ -158,6 +177,13 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
     const tier: ModelTier = decision.kind === 'degrade' ? 'fast' : 'standard';
     const run = await store.createRun({ threadId: thread.id, prompt: parsed.data.prompt, model: gateway.models[tier] });
     await store.appendMessage({ threadId: thread.id, role: 'user', text: parsed.data.prompt, runId: run.id });
+
+    // 新会话用第一句话当标题，别让侧栏一堆「新对话」
+    if (thread.title === '新对话') {
+      const firstLine = parsed.data.prompt.split('\n').find((line) => line.trim())?.trim() ?? '新对话';
+      const title = firstLine.length > 24 ? firstLine.slice(0, 24) + '…' : firstLine;
+      await store.renameThread(thread.id, title);
+    }
 
     void drive(run, tier, decision.kind === 'degrade' ? decision.reason : null);
 
@@ -571,7 +597,31 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
     await store.patchRun(run.id, { state: 'running' });
     await store.publish({ type: 'run.started', runId: run.id, at: at() });
     await store.publish({ type: 'run.state', runId: run.id, at: at(), state: 'running' });
-    await executeRun(run, tier, [{ role: 'system', content: buildSystemPrompt() }, { role: 'user', content: run.prompt }], null, notice);
+
+    // 整条会话都带上：上一轮说过什么、调过什么工具，模型都看得到
+    const history = trimHistory(buildHistory(await store.listMessages(run.threadId)));
+    await executeRun(run, tier, [{ role: 'system', content: buildSystemPrompt() }, ...history], null, notice);
+  }
+
+  /**
+   * 历史不能无限长：留最近 40 条 / 8 万字符。
+   * 从后往前留；开头如果剩下孤儿 tool 结果就丢掉（它引用的 tool_call 已经被裁掉了）。
+   */
+  function trimHistory(history: ChatMessage[], maxItems = 40, maxChars = 80_000): ChatMessage[] {
+    let items = history.length > maxItems ? history.slice(-maxItems) : history;
+
+    let chars = 0;
+    const kept: ChatMessage[] = [];
+    for (let index = items.length - 1; index >= 0; index -= 1) {
+      const item = items[index];
+      if (!item) continue;
+      chars += item.content.length;
+      if (chars > maxChars && kept.length > 0) break;
+      kept.unshift(item);
+    }
+
+    while (kept[0]?.role === 'tool') kept.shift();
+    return kept;
   }
 
   /** 重启后恢复：拿库里的历史 + 还挂着的审批，接着跑 */

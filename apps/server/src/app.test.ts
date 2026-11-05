@@ -475,3 +475,61 @@ test('「允许这类」之后同名工具不再弹审批，而且记进设置',
   assert.ok(types.includes('run.tool_result'));
   await app.close();
 });
+
+test('同一会话接着聊：第二轮带上了上一轮的对话', async () => {
+  const store = new MemoryStore();
+  const calls: string[][] = [];
+
+  const provider: ModelProvider = {
+    id: 'recording',
+    async *stream(request) {
+      calls.push(request.messages.map((message) => `${message.role}:${message.content.slice(0, 12)}`));
+      const last = request.messages.at(-1)?.content ?? '';
+      yield { kind: 'delta', text: `收到：${last.slice(0, 20)}` };
+      yield { kind: 'done', finishReason: 'stop' };
+    },
+  };
+
+  const gateway = new ProviderGateway({ provider, models: FAKE_MODELS, firstChunkTimeoutMs: 2_000 });
+  const app = createApp({ store, gateway });
+  const thread = (await app.inject({ method: 'POST', url: '/v1/threads', payload: {} })).json();
+
+  const first = (await app.inject({ method: 'POST', url: '/v1/runs', payload: { threadId: thread.id, prompt: '第一句' } })).json();
+  await waitFor(app, first.id, (body) => body.state === 'succeeded');
+
+  const second = (await app.inject({ method: 'POST', url: '/v1/runs', payload: { threadId: thread.id, prompt: '第二句' } })).json();
+  await waitFor(app, second.id, (body) => body.state === 'succeeded');
+
+  assert.equal(calls.length, 2);
+  const secondCall = calls[1] ?? [];
+  assert.ok(secondCall[0]?.startsWith('system:'), '第一段必须是系统提示');
+  assert.ok(secondCall.some((line) => line.startsWith('user:第一句')), '上一轮的问句要在');
+  assert.ok(secondCall.some((line) => line.startsWith('assistant:收到：第一句')), '上一轮的回答要在');
+  assert.equal(secondCall.at(-1), 'user:第二句');
+  await app.close();
+});
+
+test('新会话用第一句话当标题，且能重命名与删除', async () => {
+  const app = makeApp();
+  const thread = (await app.inject({ method: 'POST', url: '/v1/threads', payload: {} })).json();
+  assert.equal(thread.title, '新对话');
+
+  const run = (await app.inject({ method: 'POST', url: '/v1/runs', payload: { threadId: thread.id, prompt: '帮我把京都行程排一下\n顺便看酒店' } })).json();
+  await waitFor(app, run.id, (body) => body.state === 'succeeded');
+
+  const list = (await app.inject({ method: 'GET', url: '/v1/threads' })).json();
+  assert.equal(list.items[0].title, '帮我把京都行程排一下', '标题只取第一行，且不超过 24 字');
+
+  const renamed = await app.inject({ method: 'PATCH', url: `/v1/threads/${thread.id}`, payload: { title: '京都行程' } });
+  assert.equal(renamed.statusCode, 200);
+  assert.equal(renamed.json().title, '京都行程');
+
+  const empty = await app.inject({ method: 'PATCH', url: `/v1/threads/${thread.id}`, payload: { title: '  ' } });
+  assert.equal(empty.statusCode, 400);
+
+  const removed = await app.inject({ method: 'DELETE', url: `/v1/threads/${thread.id}` });
+  assert.equal(removed.statusCode, 200);
+  assert.equal((await app.inject({ method: 'GET', url: '/v1/threads' })).json().items.length, 0);
+  assert.equal((await app.inject({ method: 'DELETE', url: `/v1/threads/${thread.id}` })).statusCode, 404);
+  await app.close();
+});

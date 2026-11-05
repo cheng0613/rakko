@@ -61,6 +61,8 @@ export interface RunStore {
   listThreads(): Promise<Thread[]>;
   getThread(id: string): Promise<Thread | undefined>;
   createThread(title?: string): Promise<Thread>;
+  renameThread(id: string, title: string): Promise<Thread | undefined>;
+  deleteThread(id: string): Promise<boolean>;
   listMessages(threadId: string): Promise<Message[]>;
   appendMessage(input: AppendMessageInput): Promise<Message>;
   createRun(input: CreateRunInput): Promise<Run>;
@@ -152,6 +154,27 @@ export class MemoryStore implements RunStore {
     this.threads.set(thread.id, thread);
     this.messages.set(thread.id, []);
     return thread;
+  }
+
+  async renameThread(id: string, title: string): Promise<Thread | undefined> {
+    const thread = this.threads.get(id);
+    if (!thread) return undefined;
+    const next: Thread = { ...thread, title, updatedAt: now() };
+    this.threads.set(id, next);
+    return next;
+  }
+
+  async deleteThread(id: string): Promise<boolean> {
+    if (!this.threads.delete(id)) return false;
+    this.messages.delete(id);
+    for (const [runId, run] of this.runs) {
+      if (run.threadId === id) {
+        this.runs.delete(runId);
+        this.events.delete(runId);
+        this.listeners.delete(runId);
+      }
+    }
+    return true;
   }
 
   async listMessages(threadId: string): Promise<Message[]> {

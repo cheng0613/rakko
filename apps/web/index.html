@@ -711,6 +711,12 @@
   .demo-bar .tag{flex:none}
   .demo-bar[hidden]{display:none}
 
+  .recent{display:flex;flex-direction:row;align-items:stretch;gap:2px;position:relative;padding:0}
+  .recent-main{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px;padding:8px 11px;border-radius:9px;text-align:left}
+  .recent-del{width:0;padding:0;overflow:hidden;visibility:hidden;color:var(--faint);font-size:16px;line-height:1;border-radius:9px;transition:width .15s,visibility .15s;flex:none}
+  .recent:hover .recent-del{width:26px;padding:0 6px;visibility:visible}
+  .recent-del:hover{color:var(--danger);background:var(--surface-2)}
+  .title-edit{font:inherit;font-size:16px;font-weight:590;letter-spacing:-.01em;color:var(--text);background:var(--surface-2);border:1px solid var(--accent);border-radius:8px;padding:1px 7px;min-width:240px;outline:none}
   .recents .recent.empty{color:var(--faint);font-size:12px;padding:8px 11px;cursor:default}
   .ctx .tag{cursor:default}
   #toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%) translateY(10px);opacity:0;pointer-events:none;transition:.2s var(--ease);background:var(--text);color:var(--bg);padding:8px 14px;border-radius:99px;font-size:12px;z-index:60}
@@ -990,7 +996,7 @@
 
   const ui = {
     side: $('#side'), recents: $('#recents'), messages: $('#messages'), landing: $('#landing'),
-    title: $('#viewTitle'), sub: $('#viewSub'), input: $('#input'), composer: $('#composer'),
+    title: $('#viewTitle'), sub: $('#viewSub'), input: $('#input'), composer: $('#composer'), search: $('#searchInput'),
     stop: $('#stopBtn'), newTask: $('#newTaskBtn'), toast: $('#toast'), demoBar: $('#demoBar'),
     demoText: $('#demoText'), modelChip: $('#modelChipText'), landDate: $('#landDate'),
   };
@@ -1105,20 +1111,93 @@
   /* ---------------- 侧栏 ---------------- */
   const renderRecents = () => {
     ui.recents.innerHTML = '';
+    const keyword = (ui.search?.value ?? '').trim().toLowerCase();
+    const threads = keyword
+      ? state.threads.filter((thread) => (thread.title || '').toLowerCase().includes(keyword))
+      : state.threads;
+
     if (state.threads.length === 0) {
       ui.recents.append(make('div', 'recent empty', '还没有对话'));
       return;
     }
-    for (const thread of state.threads) {
-      const item = make('button', 'recent' + (thread.id === state.threadId ? ' on' : ''));
-      item.append(make('b', undefined, thread.title || '未命名'));
-      item.append(make('span', undefined, relTime(thread.updatedAt || thread.createdAt)));
-      item.addEventListener('click', () => openThread(thread.id));
+    if (threads.length === 0) {
+      ui.recents.append(make('div', 'recent empty', `没有匹配「${keyword}」的对话`));
+      return;
+    }
+
+    for (const thread of threads) {
+      const item = make('div', 'recent' + (thread.id === state.threadId ? ' on' : ''));
+      const main = make('button', 'recent-main');
+      main.append(make('b', undefined, thread.title || '未命名'));
+      main.append(make('span', undefined, relTime(thread.updatedAt || thread.createdAt)));
+      main.addEventListener('click', () => openThread(thread.id));
+
+      const del = make('button', 'recent-del', '×');
+      del.title = '删除这个对话';
+      del.addEventListener('click', async (event) => {
+        event.stopPropagation();
+        if (!window.confirm(`删除「${thread.title || '未命名'}」？消息和运行记录一起删，不能撤销。`)) return;
+        try {
+          await api('/v1/threads/' + thread.id, { method: 'DELETE' });
+          state.threads = state.threads.filter((item2) => item2.id !== thread.id);
+          if (state.threadId === thread.id) {
+            state.threadId = null;
+            state.messages = [];
+            ui.messages.innerHTML = '';
+            showLanding(true);
+            ui.title.textContent = '对话';
+          }
+          renderRecents();
+          toast('已删除');
+        } catch (error) {
+          toast('删除失败：' + error.message);
+        }
+      });
+
+      item.append(main, del);
       ui.recents.append(item);
     }
   };
 
   /* ---------------- 运行时侧栏 ---------------- */
+  /** 点标题就地改名：Enter 保存，Esc 取消 */
+  const startRename = () => {
+    const thread = state.threads.find((item) => item.id === state.threadId);
+    if (!thread) return;
+
+    const input = make('input', 'title-edit');
+    input.value = thread.title || '';
+    ui.title.hidden = true;
+    ui.title.parentElement.insertBefore(input, ui.title);
+    input.focus();
+    input.select();
+
+    let done = false;
+    const finish = async (save) => {
+      if (done) return;
+      done = true;
+      const title = input.value.trim();
+      input.remove();
+      ui.title.hidden = false;
+
+      if (!save || !title || title === thread.title) return;
+      try {
+        const updated = await api('/v1/threads/' + thread.id, { method: 'PATCH', body: JSON.stringify({ title }) });
+        thread.title = updated.title;
+        ui.title.textContent = updated.title;
+        renderRecents();
+      } catch (error) {
+        toast('改名失败：' + error.message);
+      }
+    };
+
+    input.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' && !event.isComposing) finish(true);
+      if (event.key === 'Escape') finish(false);
+    });
+    input.addEventListener('blur', () => finish(false));
+  };
+
   const renderCtx = () => {
     const usage = state.usage;
     $('#ctxModel').textContent = state.lastModel === '—' ? '—' : state.lastModel;
@@ -1524,6 +1603,8 @@
         closeStream();
         setRunning(false);
         currentTurn = null;
+        // 标题是拿第一句话生成的，跑完刷新一下侧栏
+        void loadThreads().catch(() => {});
         break;
       default:
         break;
@@ -1808,6 +1889,37 @@
     });
   });
 
+  ui.title.addEventListener('click', startRename);
+  ui.title.style.cursor = 'text';
+  ui.title.title = '点一下改名';
+
+  ui.search.addEventListener('input', renderRecents);
+  ui.search.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      const first = state.threads.find((thread) => (thread.title || '').toLowerCase().includes(ui.search.value.trim().toLowerCase()));
+      if (first) openThread(first.id);
+    }
+    if (event.key === 'Escape') {
+      ui.search.value = '';
+      renderRecents();
+      ui.search.blur();
+    }
+  });
+
+  // ⌘K 搜对话，⌘N 新建（和界面上的提示一致）
+  document.addEventListener('keydown', (event) => {
+    if (!(event.metaKey || event.ctrlKey)) return;
+    const key = event.key.toLowerCase();
+    if (key === 'k') {
+      event.preventDefault();
+      ui.search.focus();
+      ui.search.select();
+    } else if (key === 'n') {
+      event.preventDefault();
+      $('#newChat').click();
+    }
+  });
+
   document.querySelectorAll('.nav-item').forEach((item) => {
     item.addEventListener('click', () => {
       document.querySelectorAll('.nav-item').forEach((other) => other.classList.remove('active'));
@@ -2018,6 +2130,12 @@
       await loadUsage();
       try { state.settings = await api('/v1/settings'); } catch { state.settings = null; }
       if (state.threads[0]) await openThread(state.threads[0].id);
+
+      const query = params.get('q');
+      if (query) {
+        ui.search.value = query;
+        renderRecents();
+      }
 
       if (params.get('view') === 'settings') setView('settings');
 

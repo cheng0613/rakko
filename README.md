@@ -77,6 +77,15 @@ docker compose up -d --build                     # db + api 全容器化，api �
 
 实测：一次回答里 reasoning 事件可达几百条，用 token 换质量，所以首字超时给了 45 秒。
 
+## 对话
+
+- **接着聊**：每次运行都把整条会话（上一轮的问与答、调过哪些工具、工具结果）带给模型，
+  不再是一句一孤立。历史按 40 条 / 8 万字符裁剪，且不会留下拦腰截断的 tool 结果。
+- **自动标题**：新会话拿第一句话当标题（只取第一行，超过 24 字截断），侧栏不再一排「新对话」。
+- **改名**：点顶栏标题就地编辑，Enter 保存、Esc 取消。
+- **删除**：侧栏会话悬停出 ×，确认后连消息、运行、事件一起删（外键 cascade）。
+- **搜索**：⌘K 聚焦搜索框，按标题实时过滤；回车跳到第一条。`?q=关键词` 也能直接带过滤打开。
+
 ## 工具与审批
 
 一个运行 = 若干轮「模型说 → 工具做 → 结果回给模型」。循环在 `packages/core/src/agent.ts`，
@@ -354,6 +363,8 @@ GET  /v1/usage                                 配额（次数制，来自 usage
 GET  /v1/settings                              用户设置（degradeOnExceed）
 PATCH /v1/settings                             改设置（目前只认 degradeOnExceed）
 GET  /v1/threads                               会话列表
+PATCH /v1/threads/:id                          改名（title，先 trim 再判空）
+DELETE /v1/threads/:id                         删会话（消息/运行/事件一起删）
 POST /v1/threads                               新建会话
 GET  /v1/threads/:id                           线程 + 最近一次运行 + 待批调用（刷新后据此接着看流）
 GET  /v1/threads/:id/messages                  会话消息（含 kind/payload，工具与审批可重放）
