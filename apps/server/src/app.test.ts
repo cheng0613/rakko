@@ -1129,3 +1129,33 @@ test('消息分页：默认一页 30 条，往前的用 before 翻', async () =>
 
   await app.close();
 });
+
+test('运行记录：接口给出 run + 事件流水 + 体检报告', async () => {
+  const store = new MemoryStore();
+  const provider: ModelProvider = {
+    id: 'trace',
+    async *stream() {
+      yield { kind: 'delta', text: '好了。' };
+      yield { kind: 'done', finishReason: 'stop' };
+    },
+  };
+  const app = createApp({ store, provider });
+
+  const thread = (await app.inject({ method: 'POST', url: '/v1/threads', payload: {} })).json();
+  const run = (await app.inject({ method: 'POST', url: '/v1/runs', payload: { threadId: thread.id, prompt: '你好' } })).json();
+  await waitFor(app, run.id, (body) => body.state === 'succeeded');
+
+  const trace = (await app.inject({ method: 'GET', url: `/v1/runs/${run.id}/trace` })).json();
+  assert.equal(trace.run.id, run.id);
+  assert.ok(trace.events.length > 0, '要有事件流水');
+  assert.equal(trace.events[0].type, 'run.started');
+  assert.equal(trace.summary.state, 'succeeded');
+  assert.equal(trace.summary.model, run.model);
+  assert.equal(typeof trace.summary.durationMs, 'number');
+  assert.ok(trace.summary.firstTokenMs !== null, '有输出就该有首字耗时');
+  assert.deepEqual(trace.summary.tools, [], '这次没调工具');
+
+  const missing = await app.inject({ method: 'GET', url: '/v1/runs/nope/trace' });
+  assert.equal(missing.statusCode, 404);
+  await app.close();
+});

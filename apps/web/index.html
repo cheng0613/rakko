@@ -736,6 +736,45 @@
   .messages .older{align-self:center;font-size:12px;padding:6px 16px;border-radius:99px}
   .messages .older:hover{color:var(--text)}
 
+  /* 运行记录抽屉：右侧滑出，只在排查时才看，所以用安静的字色与细线 */
+  .trace{position:fixed;inset:0;z-index:70;display:flex;justify-content:flex-end}
+  .trace[hidden]{display:none}
+  .trace-backdrop{position:absolute;inset:0;background:rgba(0,0,0,.16)}
+  .trace-panel{position:relative;width:min(460px,92vw);height:100%;background:var(--surface);border-left:1px solid var(--line);display:flex;flex-direction:column;animation:trace-in .18s var(--ease)}
+  @keyframes trace-in{from{transform:translateX(14px);opacity:.5}to{transform:none;opacity:1}}
+  .trace-head{display:flex;align-items:flex-start;gap:10px;padding:20px 20px 10px;border-bottom:1px solid var(--line)}
+  .trace-kicker{font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--faint)}
+  .trace-title{font-size:17px;font-weight:590;margin-top:3px}
+  .trace-title small{font-weight:400;font-size:12px;color:var(--muted);margin-left:6px}
+  .trace-body{flex:1;overflow:auto;padding:14px 20px 26px}
+  .trace-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--line);border:1px solid var(--line);border-radius:14px;overflow:hidden;margin-bottom:6px}
+  .trace-stat{background:var(--surface);padding:10px 12px}
+  .trace-stat .k{font-size:10.5px;color:var(--faint)}
+  .trace-stat .v{font-size:15px;font-weight:590;font-variant-numeric:tabular-nums;margin-top:2px}
+  .trace-stat[data-tone="bad"] .v{color:var(--danger)}
+  .trace-sec{font-size:11px;color:var(--muted);margin:18px 0 6px;letter-spacing:.04em}
+  .trace-tool{display:flex;align-items:center;gap:8px;padding:7px 0;border-bottom:1px solid var(--line);font-size:12px}
+  .trace-tool .n{font-family:var(--mono);font-size:11.5px}
+  .trace-tool .r{margin-left:auto;color:var(--faint);font-family:var(--mono);font-size:10.5px;font-variant-numeric:tabular-nums}
+  .trace-tool .r.bad{color:var(--danger)}
+  .tline{display:grid;grid-template-columns:46px 8px 1fr;gap:8px;align-items:start;padding:5px 0;font-size:12px;line-height:1.45}
+  .tline .tat{font-family:var(--mono);font-size:10px;color:var(--faint);padding-top:2px;text-align:right;font-variant-numeric:tabular-nums}
+  .tline .tdot{width:6px;height:6px;border-radius:50%;background:var(--line-strong);margin-top:5px}
+  .tline[data-kind="ok"] .tdot{background:var(--mint)}
+  .tline[data-kind="fail"] .tdot{background:var(--danger)}
+  .tline[data-kind="gate"] .tdot{background:var(--orange)}
+  .tline[data-kind="warn"] .tdot{background:var(--violet)}
+  .tline[data-kind="muted"] .tdot{background:transparent;border:1px solid var(--line-strong)}
+  .tmain{color:var(--text-2)}
+  .tmain b{font-weight:590;color:var(--text)}
+  .tmain code{font-family:var(--mono);font-size:11px}
+  .tline[data-kind="fail"] .tmain{color:var(--danger)}
+  .tsub{color:var(--muted);font-size:11px;margin-top:1px;white-space:pre-wrap;word-break:break-word;max-height:4.4em;overflow:hidden}
+  .who .trace-link{margin-left:auto;font-size:10.5px;color:var(--faint);background:none;border:0;padding:0 0 0 10px;cursor:pointer}
+  .who .trace-link:hover{color:var(--accent)}
+  .retry .trace-open{margin-left:auto}
+  .retry .trace-open + .btn{margin-left:8px}
+
   .demo-bar{display:flex;align-items:center;gap:8px;padding:9px 22px;border-bottom:1px solid var(--line);background:var(--surface-2);font-size:11.8px;color:var(--muted);flex:none}
   .demo-bar .tag{flex:none}
   .demo-bar[hidden]{display:none}
@@ -1507,6 +1546,15 @@
       if (!turn) turn = openAssistant(createdAt);
       return turn;
     };
+    const turnsWithRun = [];
+    // 一条运行可能只有工具卡、没有正文；只要挂在某个 turn 上，就把「记录」入口挂过去
+    const trackRun = (at, runId) => {
+      const holder = ensureTurn(at);
+      if (!runId) return holder;
+      holder.runId = runId;
+      if (!turnsWithRun.includes(holder)) turnsWithRun.push(holder);
+      return holder;
+    };
 
     for (const message of state.messages) {
       const payload = message.payload || {};
@@ -1515,13 +1563,13 @@
         pushUserBubble(message.text, false, message.createdAt);
         turn = null;
       } else if (message.kind === 'text' && message.role === 'assistant') {
-        appendParagraph(ensureTurn(message.createdAt), message.text);
+        appendParagraph(trackRun(message.createdAt, message.runId), message.text);
       } else if (message.kind === 'tool_call') {
         // 兼容早期行：那时用 id 而不是 callId
         payload.callId = payload.callId || payload.id;
         const meta = toolMeta(payload.name);
         cards.set(payload.callId, addTool(
-          ensureTurn(message.createdAt),
+          trackRun(message.createdAt, message.runId),
           { callId: payload.callId, name: payload.name, args: payload.args || {} },
           meta ? meta.risk : 'low',
           meta ? meta.approval : false,
@@ -1533,7 +1581,7 @@
         // 重启后这次运行还挂在 waiting_approval 时，历史里的这张卡就是当前要处理的那张
         const isPending = payload.callId === state.pendingCallId;
         gates.set(payload.callId, addApproval(
-          ensureTurn(message.createdAt),
+          trackRun(message.createdAt, message.runId),
           { callId: payload.callId, name: payload.name, args: payload.args || {} },
           payload.risk || 'high',
           isPending ? null : new Date(message.createdAt).getTime() + 10 * 60 * 1000,
@@ -1546,9 +1594,11 @@
           payload.reason ? (payload.decision === 'allow' ? '已允许：' + payload.reason : '已拒绝：' + payload.reason) : undefined,
         );
       } else if (message.kind === 'notice') {
-        addNote(ensureTurn(message.createdAt), message.text || payload.detail || '已切换模型', 'fallback');
+        addNote(trackRun(message.createdAt, message.runId), message.text || payload.detail || '已切换模型', 'fallback');
       }
     }
+
+    for (const item of turnsWithRun) attachTraceLink(item, item.runId);
 
     historyTurn = turn;
     scrollBottom();
@@ -1784,9 +1834,12 @@
     const bar = make('div', 'retry');
     lastContinueBar = bar;
     const why = make('span', 'retry-why', runState === 'canceled' ? '这次运行被你停下了' : '这次运行没做完');
+    const traceBtn = make('button', 'btn quiet trace-open', '查看记录');
+    traceBtn.type = 'button';
+    traceBtn.addEventListener('click', () => void openTrace(runId));
     const btn = make('button', 'btn primary', '接着做');
     btn.addEventListener('click', () => void continueRun(runId, btn));
-    bar.append(why, btn);
+    bar.append(why, traceBtn, btn);
     turn.body.append(bar);
     scrollBottom();
   };
@@ -1807,6 +1860,226 @@
       btn.disabled = false;
       toast('接着做失败：' + error.message);
     }
+  };
+
+  /* ---------------- 运行记录 ---------------- */
+  const TRACE_STATE_TEXT = { queued: '排队中', running: '运行中', waiting_approval: '等你审批', succeeded: '成功', failed: '失败', canceled: '已取消' };
+
+  const fmtMs = (value) => {
+    if (value === null || value === undefined) return '—';
+    if (value < 1000) return value + ' ms';
+    if (value < 60_000) return (value / 1000).toFixed(value < 10_000 ? 1 : 0) + ' s';
+    const minutes = Math.floor(value / 60_000);
+    return minutes + ' 分 ' + Math.round((value % 60_000) / 1000) + ' 秒';
+  };
+
+  const traceShort = (text, limit = 90) => {
+    const flat = String(text == null ? '' : text).replace(/\s+/g, ' ').trim();
+    return flat.length > limit ? flat.slice(0, limit) + '…' : flat;
+  };
+
+  /** 工具参数里挑一个最能说明问题的值 */
+  const traceArgs = (args) => {
+    const entries = Object.entries(args || {});
+    const pick = entries.find(([, v]) => typeof v === 'string') || entries[0];
+    if (!pick) return '';
+    const [key, value] = pick;
+    return key + '=' + traceShort(typeof value === 'string' ? value : JSON.stringify(value), 60);
+  };
+
+  let traceNode = null;
+  const traceParts = {};
+
+  const ensureTrace = () => {
+    if (traceNode) return traceParts;
+    traceNode = make('div', 'trace');
+    traceNode.hidden = true;
+
+    const backdrop = make('div', 'trace-backdrop');
+    backdrop.addEventListener('click', closeTrace);
+
+    const panel = make('aside', 'trace-panel');
+    const head = make('div', 'trace-head');
+    const headText = make('div');
+    headText.append(make('div', 'trace-kicker', '运行记录'));
+    const title = make('div', 'trace-title');
+    headText.append(title);
+    const closeBtn = make('button', 'btn icon quiet', '×');
+    closeBtn.type = 'button';
+    closeBtn.setAttribute('aria-label', '关闭');
+    closeBtn.addEventListener('click', closeTrace);
+    head.append(headText, closeBtn);
+
+    const body = make('div', 'trace-body');
+    panel.append(head, body);
+    traceNode.append(backdrop, panel);
+    document.body.append(traceNode);
+
+    Object.assign(traceParts, { title, body });
+    return traceParts;
+  };
+
+  const traceStat = (label, value, tone) => {
+    const cell = make('div', 'trace-stat');
+    if (tone) cell.dataset.tone = tone;
+    cell.append(make('div', 'k', label), make('div', 'v', value));
+    return cell;
+  };
+
+  const traceLine = (offsetMs, kind, main, sub) => {
+    const row = make('div', 'tline');
+    row.dataset.kind = kind;
+    const at = offsetMs === null ? '' : (offsetMs >= 0 ? '+' : '') + (offsetMs / 1000).toFixed(1) + 's';
+    row.append(make('span', 'tat', at), make('span', 'tdot'));
+    const content = make('div');
+    content.append(make('div', 'tmain', main));
+    if (sub) content.append(make('div', 'tsub', sub));
+    row.append(content);
+    return row;
+  };
+
+  const renderTrace = (payload) => {
+    const { title, body } = ensureTrace();
+    const run = payload.run || {};
+    const events = payload.events || [];
+    const summary = payload.summary || {};
+
+    title.textContent = TRACE_STATE_TEXT[run.state] || run.state || '运行';
+    title.append(make('small', undefined, run.model || ''));
+
+    body.innerHTML = '';
+    const stats = make('div', 'trace-stats');
+    stats.append(
+      traceStat('耗时', fmtMs(summary.durationMs)),
+      traceStat('首响', fmtMs(summary.firstOutputMs ?? summary.firstTokenMs)),
+      traceStat('首字', fmtMs(summary.firstTokenMs)),
+      traceStat('工具', String(summary.toolCalls ?? 0) + (summary.toolFailures ? ' / 失败 ' + summary.toolFailures : '')),
+      traceStat('降级', summary.fallbacks ? String(summary.fallbacks) + ' 次' : '无', summary.fallbacks ? 'bad' : undefined),
+      traceStat('审批', String(summary.approvals ?? 0) + (summary.denials ? ' / 拒 ' + summary.denials : '')),
+      traceStat('输出', String(events.filter((event) => event.type === 'run.delta').length) + ' 段'),
+    );
+    // 3 列网格：补满最后一行，不然空位会露出分隔线的底色
+    const filler = (3 - (stats.children.length % 3)) % 3;
+    for (let i = 0; i < filler; i += 1) stats.append(make('div', 'trace-stat'));
+
+    body.append(stats);
+
+    if (Array.isArray(summary.tools) && summary.tools.length > 0) {
+      body.append(make('div', 'trace-sec', '工具'));
+      for (const tool of summary.tools) {
+        const row = make('div', 'trace-tool');
+        row.append(make('span', 'n', tool.name));
+        if (tool.failures > 0) row.append(make('span', 'r bad', '失败 ' + tool.failures + ' / ' + tool.calls));
+        else row.append(make('span', 'r', tool.calls + ' 次'));
+        row.append(make('span', 'r', fmtMs(tool.ms)));
+        body.append(row);
+      }
+    }
+
+    if (Array.isArray(summary.errors) && summary.errors.length > 0) {
+      // 成功的运行也可能中途报过错（比如到过步数上限后来又接着做完），标题就别说死
+      body.append(make('div', 'trace-sec', run.state === 'succeeded' ? '过程中的报错' : '错误'));
+      for (const message of summary.errors) body.append(traceLine(null, 'fail', traceShort(message, 160)));
+    }
+
+    body.append(make('div', 'trace-sec', '时间线'));
+    const start = events.length > 0 ? Date.parse(events[0].at) : 0;
+    const offset = (at) => (start ? Date.parse(at) - start : null);
+    const begun = new Set();
+    const nameOf = new Map();
+
+    for (const event of events) {
+      switch (event.type) {
+        case 'run.started':
+          body.append(traceLine(offset(event.at), 'muted', '开始运行'));
+          break;
+        case 'run.state':
+          body.append(traceLine(offset(event.at), 'muted', '状态 → ' + (TRACE_STATE_TEXT[event.state] || event.state)));
+          break;
+        case 'run.tool_call':
+          nameOf.set(event.callId, event.name);
+          body.append(traceLine(offset(event.at), 'muted', '调用 ' + event.name, traceArgs(event.args)));
+          break;
+        case 'run.tool_result': {
+          const toolName = nameOf.get(event.callId);
+          body.append(traceLine(
+            offset(event.at),
+            event.ok ? 'ok' : 'fail',
+            (event.ok ? '工具返回' : '工具失败') + (toolName ? ' · ' + toolName : ''),
+            traceShort(event.output, 120),
+          ));
+          break;
+        }
+        case 'run.approval_requested':
+          body.append(traceLine(offset(event.at), 'gate', '等你允许 ' + event.name, traceArgs(event.args)));
+          break;
+        case 'run.approval_decided':
+          body.append(traceLine(
+            offset(event.at),
+            event.decision === 'allow' ? 'ok' : 'gate',
+            event.decision === 'allow' ? '你允许了' : '你拒绝了',
+            event.reason || '',
+          ));
+          break;
+        case 'run.fallback':
+          body.append(traceLine(offset(event.at), 'warn', '降到快模型 ' + event.to, (event.from || '') + ' · ' + (event.reason || '')));
+          break;
+        case 'run.error':
+          body.append(traceLine(offset(event.at), 'fail', '出错', traceShort(event.message, 200)));
+          break;
+        case 'run.delta':
+        case 'run.reasoning': {
+          const key = event.type;
+          if (begun.has(key)) break;
+          begun.add(key);
+          body.append(traceLine(offset(event.at), 'muted', key === 'run.delta' ? '开始输出' : '开始思考'));
+          break;
+        }
+        case 'run.done':
+          body.append(traceLine(offset(event.at), event.state === 'succeeded' ? 'ok' : 'fail', '结束 · ' + (TRACE_STATE_TEXT[event.state] || event.state)));
+          break;
+        default:
+          break;
+      }
+    }
+
+    body.append(make('div', 'trace-sec', '提示词'));
+    body.append(traceLine(null, 'muted', traceShort(run.prompt || '（空）', 200)));
+    body.scrollTop = 0;
+  };
+
+  const closeTrace = () => {
+    if (!traceNode) return;
+    traceNode.hidden = true;
+  };
+
+  const openTrace = async (runId) => {
+    ensureTrace();
+    traceNode.hidden = false;
+    traceParts.title.textContent = '读取中…';
+    traceParts.body.innerHTML = '';
+    try {
+      renderTrace(await api('/v1/runs/' + runId + '/trace'));
+    } catch (error) {
+      traceParts.title.textContent = '读不到记录';
+      traceParts.body.innerHTML = '';
+      traceParts.body.append(traceLine(null, 'fail', '读取失败：' + error.message));
+    }
+  };
+
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') closeTrace();
+  });
+
+  /** 给某条回答挂一个安静的「记录」入口 */
+  const attachTraceLink = (turn, runId) => {
+    if (!turn || !runId || turn.traceLinked) return;
+    turn.traceLinked = true;
+    const link = make('button', 'trace-link', '记录');
+    link.type = 'button';
+    link.title = '查看这次运行的记录';
+    link.addEventListener('click', () => void openTrace(runId));
+    turn.row.querySelector('.who')?.append(link);
   };
 
   /* ---------------- 事件处理 ---------------- */
@@ -1867,6 +2140,7 @@
         appendAnswer(turn, '\n\n**出错了**：' + event.message);
         break;
       case 'run.done':
+        attachTraceLink(turn, event.runId);
         finishAnswer(turn, event.state === 'canceled' ? '已取消' : null);
         closeStream();
         setRunning(false);

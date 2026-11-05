@@ -40,6 +40,7 @@ import {
 
 import { describeCron, selectDue, validateCron } from './automation.js';
 import { extractMemories } from './memory-extract.js';
+import { summarizeTrace } from './trace.js';
 import { MemoryStore, type PendingCall, type RunStore } from './store.js';
 
 const invalid = (issues: unknown[]) => ({ error: 'invalid_request', message: '请求体不合法', issues });
@@ -468,6 +469,16 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
     const waiting = gate.cancelRun(id, '运行已取消，审批作废');
     controllers.get(id)?.abort();
     return { ok: true, releasedApprovals: waiting };
+  });
+
+  /** 一次运行的体检报告 + 完整事件流水；前端拿它画「运行记录」抽屉 */
+  app.get('/v1/runs/:id/trace', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const run = await store.getRun(id);
+    if (!run) return reply.code(404).send({ error: 'run_not_found', message: '运行不存在' });
+
+    const events = await store.eventsOf(id);
+    return { run, events, summary: summarizeTrace(run, events) };
   });
 
   app.get('/v1/runs/:id/events', async (request, reply) => {
