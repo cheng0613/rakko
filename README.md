@@ -189,6 +189,21 @@ pnpm --filter @rakko/desktop smoke     # 无人值守冒烟：加载页面，打
 
 **还没做**：打包成安装包、签名、自动更新。这一轮只是「能双击开」。
 
+## 自己改自己（dogfood）
+
+2026-11-05 第一次让 agent 在本仓库里干活：任务写死成五步（grep 找函数 → 读 quota.ts →
+apply_patch 加一个纯函数 → 补测试 → 跑测试）。第一轮崩在四个地方，修完第二轮 41 秒通过：
+
+| 崩在哪 | 现象 | 修法 |
+| --- | --- | --- |
+| 没有系统提示 | 模型不知道是 Windows、不知道工作区在哪，写了 `cd /home/user/rakko && pnpm …`，退出码 1 | 新增 `buildSystemPrompt()`：系统、工作区、shell 语义、工具规则、干活纪律、用中文 |
+| shell 不认错的 cd | 命令整个失败，白烧一轮 | `normalizeCommand()` 忽略不存在的 `cd`，并在输出里说明 |
+| 默认步数 6 太紧 | 改完没机会验证，运行却标 `succeeded`，答案是半句话 | 默认 12；到上限把原因写进 `run.error`，流里提示「任务可能没做完」 |
+| **包级 `pnpm test` 不 build** | 跑的是旧 dist，改了源码也可能「绿」 | 每个包 test 改成 `pnpm build && node --test …` |
+
+最后一条最危险：agent 会信测试结果。修完第二轮：3 次审批、41 秒、51 条测试全绿、
+用中文给出改动摘要，产物在分支 `dogfood/agent-run`。
+
 ## 存储
 
 `RunStore` 是唯一接口，两套实现行为一致：
