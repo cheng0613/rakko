@@ -1,0 +1,1 @@
+ALTER TABLE "runs" ADD COLUMN "source" text DEFAULT 'chat' NOT NULL;

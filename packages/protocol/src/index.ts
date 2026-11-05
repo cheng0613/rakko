@@ -130,6 +130,8 @@ export const runSchema = z.object({
   state: runStateSchema,
   model: z.string(),
   prompt: z.string(),
+  /** 谁触发的：chat / automation / continue */
+  source: z.enum(['chat', 'automation', 'continue']),
   error: z.string().nullable(),
   createdAt: at,
   finishedAt: at.nullable(),

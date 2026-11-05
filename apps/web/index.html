@@ -784,6 +784,19 @@
   .tsub{color:var(--muted);font-size:11px;margin-top:1px;white-space:pre-wrap;word-break:break-word;max-height:4.4em;overflow:hidden}
   .who .trace-link{margin-left:auto;font-size:10.5px;color:var(--faint);background:none;border:0;padding:0 0 0 10px;cursor:pointer}
   .who .trace-link:hover{color:var(--accent)}
+  .runs-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:10px}
+  .runs-list{display:flex;flex-direction:column}
+  .run-row{display:grid;grid-template-columns:62px minmax(0,1fr) 54px 70px 72px 52px;gap:10px;align-items:center;padding:9px 2px;border-top:1px solid var(--line);font-size:12px;cursor:pointer;text-align:left;background:none;border-left:0;border-right:0;border-bottom:0;color:inherit;width:100%}
+  .run-row:first-child{border-top:0}
+  .run-row:hover{background:var(--surface-2)}
+  .run-row .rt{font-family:var(--mono);font-size:10.5px;color:var(--faint);white-space:nowrap}
+  .run-row .rn{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text-2)}
+  .run-row .rs,.run-row .rd{color:var(--faint);font-size:11px;white-space:nowrap}
+  .run-row .rr{font-size:11px;text-align:right;white-space:nowrap}
+  .run-row .rr.ok{color:var(--mint)}
+  .run-row .rr.bad{color:var(--danger)}
+  .run-row .rr.mid{color:var(--orange)}
+  .run-row .hint{color:var(--danger);font-size:10.5px;white-space:nowrap}
   .retry .trace-open{margin-left:auto}
   .retry .trace-open + .btn{margin-left:8px}
 
@@ -1084,6 +1097,17 @@
         <div id="autoEmpty" class="card" hidden style="text-align:center;padding:32px 16px">
           <p style="margin:0 0 6px;font-size:14px;font-weight:560">还没有自动化</p>
           <p class="muted" style="margin:0;font-size:12.5px">点右上角「新建自动化」，写一句任务，它就会按你给的时间自己跑。</p>
+        </div>
+
+        <div class="card" id="runsCard" style="margin-top:16px">
+          <div class="runs-head">
+            <div>
+              <h3 style="margin:0 0 2px;font-size:14px;font-weight:560">运行记录</h3>
+              <p class="muted" id="runsSub" style="margin:0;font-size:11.8px">读一下最近的运行…</p>
+            </div>
+            <button class="btn quiet" id="runsRefresh">刷新</button>
+          </div>
+          <div class="runs-list" id="runsList"></div>
         </div>
       </section>
 
@@ -1877,6 +1901,66 @@
     }
   };
 
+  /* ---------------- 运行记录（跨运行） ---------------- */
+  const RUN_STATE_TEXT = { queued: '排队中', running: '运行中', waiting_approval: '等审批', succeeded: '成功', failed: '失败', canceled: '已取消' };
+  const RUN_STATE_TONE = { succeeded: 'ok', failed: 'bad', canceled: 'mid', waiting_approval: 'mid', running: '', queued: '' };
+
+  const runTime = (iso) => {
+    const at = new Date(iso);
+    const now = new Date();
+    const sameDay = at.toDateString() === now.toDateString();
+    const pad = (n) => String(n).padStart(2, '0');
+    return sameDay ? pad(at.getHours()) + ':' + pad(at.getMinutes()) : pad(at.getMonth() + 1) + '/' + pad(at.getDate());
+  };
+
+  const renderRuns = (overview) => {
+    const list = $('#runsList');
+    const sub = $('#runsSub');
+    if (!list || !sub) return;
+    const stats = overview.stats || {};
+    const items = overview.items || [];
+
+    const rate = stats.successRate === null || stats.successRate === undefined ? '—' : stats.successRate + '%';
+    const bits = ['最近 ' + items.length + ' 次', '成功率 ' + rate];
+    if (stats.p50Ms !== null && stats.p50Ms !== undefined) bits.push('中位 ' + fmtMs(stats.p50Ms));
+    if (stats.p90Ms !== null && stats.p90Ms !== undefined) bits.push('p90 ' + fmtMs(stats.p90Ms));
+    const worst = (stats.topTools || []).find((tool) => tool.failures > 0);
+    if (worst) bits.push('最常出错：' + worst.name + '（' + worst.failures + '/' + worst.calls + '）');
+    sub.textContent = bits.join(' · ');
+
+    list.innerHTML = '';
+    if (items.length === 0) {
+      list.append(make('p', 'muted', '还没有运行记录。'));
+      return;
+    }
+
+    for (const run of items) {
+      const row = document.createElement('button');
+      row.className = 'run-row';
+      row.type = 'button';
+      row.append(
+        make('span', 'rt', runTime(run.createdAt)),
+        make('span', 'rn', (run.source === 'automation' ? '定时 · ' : run.source === 'continue' ? '接着做 · ' : '') + (run.threadTitle || run.prompt)),
+        make('span', 'rs', run.source === 'automation' ? '定时' : '手动'),
+        make('span', 'rd', fmtMs(run.durationMs)),
+        make('span', 'hint', run.toolFailures > 0 ? '失败 ' + run.toolFailures : ''),
+        make('span', 'rr ' + (RUN_STATE_TONE[run.state] || ''), RUN_STATE_TEXT[run.state] || run.state),
+      );
+      row.title = run.error || run.prompt;
+      row.addEventListener('click', () => void openTrace(run.id));
+      list.append(row);
+    }
+  };
+
+  const loadRuns = async () => {
+    try {
+      renderRuns(await api('/v1/runs/overview?limit=30'));
+    } catch (error) {
+      const sub = $('#runsSub');
+      if (sub) sub.textContent = '读不到运行记录：' + error.message;
+    }
+  };
+
   /* ---------------- 运行记录 ---------------- */
   const TRACE_STATE_TEXT = { queued: '排队中', running: '运行中', waiting_approval: '等你审批', succeeded: '成功', failed: '失败', canceled: '已取消' };
 
@@ -2634,6 +2718,7 @@
       ui.title.textContent = '自动化';
       ui.sub.textContent = '到点就自己跑；点进去能看到它开的会话';
       void loadAutomations();
+      void loadRuns();
     } else if (name === 'memory') {
       ui.title.textContent = '记忆';
       ui.sub.textContent = '跨会话留下的偏好、项目与参考';
@@ -2858,6 +2943,7 @@
   };
 
   $('#autoRefresh').addEventListener('click', () => void loadAutomations());
+  $('#runsRefresh')?.addEventListener('click', () => void loadRuns());
   $('#autoNew').addEventListener('click', () => {
     $('#autoForm').hidden = false;
     $('#autoName').focus();

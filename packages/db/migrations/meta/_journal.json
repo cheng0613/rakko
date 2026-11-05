@@ -57,6 +57,13 @@
       "when": 1793866981437,
       "tag": "0007_wooden_randall",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1793870371213,
+      "tag": "0008_tiny_tag",
+      "breakpoints": true
     }
   ]
 }

@@ -17,6 +17,7 @@ import type { Automation, Graph, KgEdge, KgNode, Memory, MemoryKind, MemoryStatu
 import { entityKey, normalizeEntityName, toVectorLiteral } from '@rakko/core';
 
 import { BUILTIN_SKILLS } from './store.js';
+import { buildOverview, type RunOverviewRow, type RunsOverview, type ToolTally } from './overview.js';
 import type {
   AppendMessageInput,
   CreateRunInput,
@@ -106,6 +107,7 @@ const toRun = (row: typeof runs.$inferSelect): Run => ({
   state: row.state as RunState,
   model: row.model,
   prompt: row.prompt,
+  source: row.source as Run['source'],
   error: row.error,
   createdAt: row.createdAt.toISOString(),
   finishedAt: iso(row.finishedAt),
@@ -222,6 +224,79 @@ export class PostgresStore implements RunStore {
     }
 
     return out;
+  }
+
+  /**
+   * 跨运行概览。列表用一条 SQL 出（事件表按 run_id 聚合，不把几千条事件读进来），
+   * 工具成败单独数一条 —— 只有它需要把 tool_call 和 tool_result 按 callId 配上对。
+   */
+  async runsOverview(limit: number): Promise<RunsOverview> {
+    const userId = this.requireUserId();
+
+    const listed = await this.db.execute(sql`
+      select r.id, r.thread_id, t.title as thread_title, r.source, r.state, r.model, r.prompt,
+             r.created_at, r.error,
+             extract(epoch from (coalesce(r.finished_at, now()) - r.created_at)) * 1000 as duration_ms,
+             coalesce(a.tool_calls, 0)::int as tool_calls,
+             coalesce(a.tool_failures, 0)::int as tool_failures,
+             coalesce(a.fallbacks, 0)::int as fallbacks,
+             coalesce(a.approvals, 0)::int as approvals
+      from runs r
+      join threads t on t.id = r.thread_id
+      left join (
+        select run_id,
+               count(*) filter (where type = 'run.tool_call') as tool_calls,
+               count(*) filter (where type = 'run.tool_result' and coalesce((payload->>'ok')::boolean, true) = false) as tool_failures,
+               count(*) filter (where type = 'run.fallback') as fallbacks,
+               count(*) filter (where type = 'run.approval_requested') as approvals
+        from run_events
+        group by run_id
+      ) a on a.run_id = r.id
+      where r.user_id = ${userId}
+      order by r.created_at desc
+      limit ${limit}
+    `);
+
+    const tally = await this.db.execute(sql`
+      select c.payload->>'name' as name,
+             count(*)::int as calls,
+             count(*) filter (where coalesce((r.payload->>'ok')::boolean, true) = false)::int as failures
+      from run_events c
+      join runs ru on ru.id = c.run_id and ru.user_id = ${userId}
+      left join run_events r
+        on r.run_id = c.run_id
+       and r.type = 'run.tool_result'
+       and r.payload->>'callId' = c.payload->>'callId'
+      where c.type = 'run.tool_call' and c.payload->>'name' is not null
+      group by 1
+      order by failures desc, calls desc
+      limit 5
+    `);
+
+    const items: RunOverviewRow[] = (listed as unknown as Record<string, unknown>[]).map((row) => ({
+      id: String(row.id),
+      threadId: String(row.thread_id),
+      threadTitle: String(row.thread_title ?? ''),
+      source: row.source as RunOverviewRow['source'],
+      state: row.state as RunOverviewRow['state'],
+      model: String(row.model),
+      prompt: String(row.prompt ?? ''),
+      createdAt: new Date(row.created_at as string).toISOString(),
+      durationMs: Math.max(0, Math.round(Number(row.duration_ms ?? 0))),
+      toolCalls: Number(row.tool_calls ?? 0),
+      toolFailures: Number(row.tool_failures ?? 0),
+      fallbacks: Number(row.fallbacks ?? 0),
+      approvals: Number(row.approvals ?? 0),
+      error: (row.error as string | null) ?? null,
+    }));
+
+    const topTools: ToolTally[] = (tally as unknown as Record<string, unknown>[]).map((row) => ({
+      name: String(row.name),
+      calls: Number(row.calls ?? 0),
+      failures: Number(row.failures ?? 0),
+    }));
+
+    return buildOverview(items, topTools);
   }
 
   async latestRunForThread(threadId: string): Promise<Run | undefined> {
@@ -386,7 +461,7 @@ export class PostgresStore implements RunStore {
     const row = await this.db.transaction(async (tx) => {
       const [created] = await tx
         .insert(runs)
-        .values({ threadId: input.threadId, userId, prompt: input.prompt, model: input.model })
+        .values({ threadId: input.threadId, userId, prompt: input.prompt, model: input.model, source: input.source ?? 'chat' })
         .returning();
       if (!created) throw new Error('建运行失败');
       await tx.update(threads).set({ updatedAt: created.createdAt }).where(eq(threads.id, input.threadId));

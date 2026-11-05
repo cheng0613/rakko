@@ -240,6 +240,7 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
       threadId: thread.id,
       prompt: automation.prompt,
       model: gateway.models[tier],
+      source: 'automation',
     });
     await store.appendMessage({ threadId: thread.id, role: 'user', text: automation.prompt, runId: run.id });
     await store.markAutomationRun(automation.id, new Date().toISOString());
@@ -416,6 +417,7 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
       threadId: source.threadId,
       prompt: instruction,
       model: gateway.models[tier],
+      source: 'continue',
     });
     await store.appendMessage({ threadId: source.threadId, role: 'user', text: instruction, runId: run.id });
     void drive(run, tier, decision.kind === 'degrade' ? decision.reason : null);
@@ -501,6 +503,13 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
 
     const events = await store.eventsOf(id);
     return { run, events, summary: summarizeTrace(run, events) };
+  });
+
+  /** 跨运行概览：最近 N 条 + 成功率 / 分位耗时 / 工具失败榜 */
+  app.get('/v1/runs/overview', async (request, reply) => {
+    const query = request.query as { limit?: string };
+    const limit = Math.min(200, Math.max(1, Number(query.limit ?? 30) || 30));
+    return store.runsOverview(limit);
   });
 
   app.get('/v1/runs/:id/events', async (request, reply) => {

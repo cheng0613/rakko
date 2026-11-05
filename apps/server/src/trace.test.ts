@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import type { Run, RunEvent } from '@rakko/protocol';
 
+import { buildOverview, percentile, type RunOverviewRow } from './overview.js';
 import { summarizeTrace } from './trace.js';
 
 const run: Run = {
@@ -11,6 +12,7 @@ const run: Run = {
   state: 'failed',
   model: 'deepseek-v4-pro',
   prompt: '改个 bug',
+  source: 'chat',
   error: '步数用完了',
   createdAt: '2026-01-01T00:00:00.000Z',
   finishedAt: '2026-01-01T00:00:12.000Z',
@@ -74,4 +76,50 @@ test('体检报告：空运行也不炸', () => {
   assert.equal(summary.toolCalls, 0);
   assert.deepEqual(summary.tools, []);
   assert.deepEqual(summary.errors, []);
+});
+
+test('分位耗时：样本少也算得稳，空样本给 null', () => {
+  assert.equal(percentile([], 0.5), null);
+  assert.equal(percentile([1200], 0.5), 1200);
+  assert.equal(percentile([100, 200, 300], 0.5), 200);
+  assert.equal(percentile([100, 200, 300, 400], 0.5), 250, '线性插值');
+  assert.equal(percentile([100, 200, 300], 0.9), 280);
+});
+
+test('概览统计：成功率只算已结束的，未完成的不进分母', () => {
+  const row = (over: Partial<RunOverviewRow>): RunOverviewRow => ({
+    id: 'r',
+    threadId: 't',
+    threadTitle: '会话',
+    source: 'chat',
+    state: 'succeeded',
+    model: 'm',
+    prompt: 'p',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    durationMs: 1000,
+    toolCalls: 0,
+    toolFailures: 0,
+    fallbacks: 0,
+    approvals: 0,
+    error: null,
+    ...over,
+  });
+
+  const overview = buildOverview(
+    [
+      row({ state: 'succeeded', durationMs: 1000 }),
+      row({ state: 'failed', durationMs: 3000 }),
+      row({ state: 'running', durationMs: 9999 }),
+    ],
+    [{ name: 'shell', calls: 3, failures: 2 }],
+  );
+
+  assert.equal(overview.stats.total, 3);
+  assert.equal(overview.stats.successRate, 50, '2 条已结束，1 条成功');
+  assert.equal(overview.stats.p50Ms, 2000);
+  assert.equal(overview.stats.topTools[0]?.name, 'shell');
+
+  const empty = buildOverview([], []);
+  assert.equal(empty.stats.successRate, null, '没有已结束的运行就别报 0%');
+  assert.equal(empty.stats.p50Ms, null);
 });

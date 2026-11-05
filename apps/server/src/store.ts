@@ -8,6 +8,8 @@
 import { randomUUID } from 'node:crypto';
 
 import { currentPeriod, decideQuota, entityKey, normalizeEntityName, periodStart, planLimit, type QuotaDecision, type QuotaState } from '@rakko/core';
+
+import { buildOverview, type RunOverviewRow, type RunsOverview, type ToolTally } from './overview.js';
 import type { Automation, Graph, Memory, MemoryStatus, Message, MessageKind, MessageRole, RiskLevel, Run, RunEvent, Settings, Skill, Thread, Usage } from '@rakko/protocol';
 
 export interface AppendMessageInput {
@@ -32,6 +34,8 @@ export interface CreateRunInput {
   threadId: string;
   prompt: string;
   model: string;
+  /** 谁触发的；默认 chat */
+  source?: 'chat' | 'automation' | 'continue';
 }
 
 export type RunPatch = Partial<Pick<Run, 'state' | 'error' | 'finishedAt' | 'model'>>;
@@ -82,6 +86,8 @@ export interface RunStore {
   resumableRuns(): Promise<ResumableRun[]>;
   /** 线程最近一次运行，界面刷新后据此决定要不要接着看流 */
   latestRunForThread(threadId: string): Promise<Run | undefined>;
+  /** 跨运行的概览：最近 limit 条 + 成功率 / 分位耗时 / 最爱出错的工具 */
+  runsOverview(limit: number): Promise<RunsOverview>;
   /** 技能：可挂载的规则块 */
   listSkills(): Promise<Skill[]>;
   createSkill(input: { name: string; description?: string; body: string; tools?: string[] }): Promise<Skill>;
@@ -639,6 +645,7 @@ export class MemoryStore implements RunStore {
       state: 'queued',
       model: input.model,
       prompt: input.prompt,
+      source: input.source ?? 'chat',
       error: null,
       createdAt: now(),
       finishedAt: null,
@@ -662,6 +669,56 @@ export class MemoryStore implements RunStore {
 
   async eventsOf(runId: string): Promise<RunEvent[]> {
     return this.events.get(runId) ?? [];
+  }
+
+  async runsOverview(limit: number): Promise<RunsOverview> {
+    const rows: RunOverviewRow[] = [...this.runs.values()]
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+      .slice(0, limit)
+      .map((run) => {
+        const events = this.events.get(run.id) ?? [];
+        return {
+          id: run.id,
+          threadId: run.threadId,
+          threadTitle: this.threads.get(run.threadId)?.title ?? '（已删除的会话）',
+          source: run.source,
+          state: run.state,
+          model: run.model,
+          prompt: run.prompt,
+          createdAt: run.createdAt,
+          durationMs: Math.max(0, Date.parse(run.finishedAt ?? now()) - Date.parse(run.createdAt)),
+          toolCalls: events.filter((event) => event.type === 'run.tool_call').length,
+          toolFailures: events.filter((event) => event.type === 'run.tool_result' && !event.ok).length,
+          fallbacks: events.filter((event) => event.type === 'run.fallback').length,
+          approvals: events.filter((event) => event.type === 'run.approval_requested').length,
+          error: run.error,
+        };
+      });
+
+    // 一次遍历把「每个工具调了几次、失败几次」数出来
+    const tally = new Map<string, ToolTally>();
+    for (const run of this.runs.values()) {
+      const names = new Map<string, string>();
+      for (const event of this.events.get(run.id) ?? []) {
+        if (event.type === 'run.tool_call') {
+          names.set(event.callId, event.name);
+          const entry = tally.get(event.name) ?? { name: event.name, calls: 0, failures: 0 };
+          entry.calls += 1;
+          tally.set(event.name, entry);
+        } else if (event.type === 'run.tool_result' && !event.ok) {
+          const name = names.get(event.callId);
+          const entry = name ? tally.get(name) : undefined;
+          if (entry) entry.failures += 1;
+        }
+      }
+    }
+
+    const topTools = [...tally.values()]
+      .filter((entry) => entry.calls > 0)
+      .sort((a, b) => b.failures - a.failures || b.calls - a.calls)
+      .slice(0, 5);
+
+    return buildOverview(rows, topTools);
   }
 
   async publish(event: RunEvent): Promise<void> {

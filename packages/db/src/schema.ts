@@ -91,6 +91,8 @@ export const runs = pgTable(
     state: text('state').notNull().default('queued'),
     model: text('model').notNull(),
     prompt: text('prompt').notNull(),
+    /** 谁触发的：chat 对话 / automation 定时 / continue 接着做 */
+    source: text('source').notNull().default('chat'),
     error: text('error'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     startedAt: timestamp('started_at', { withTimezone: true }),

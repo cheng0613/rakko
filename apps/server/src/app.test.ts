@@ -1220,3 +1220,35 @@ test('分叉：复制到某条消息之前，原会话一点不动', async () =>
 
   await app.close();
 });
+
+test('运行概览：接口给成功率与工具失败榜，「接着做」记来源', async () => {
+  const store = new MemoryStore();
+  const provider: ModelProvider = {
+    id: 'overview',
+    async *stream() {
+      yield { kind: 'delta', text: '好。' };
+      yield { kind: 'done', finishReason: 'stop' };
+    },
+  };
+  const app = createApp({ store, provider });
+
+  const thread = (await app.inject({ method: 'POST', url: '/v1/threads', payload: {} })).json();
+  const run = (await app.inject({ method: 'POST', url: '/v1/runs', payload: { threadId: thread.id, prompt: '第一轮' } })).json();
+  await waitFor(app, run.id, (body) => body.state === 'succeeded');
+
+  const again = (await app.inject({ method: 'POST', url: `/v1/runs/${run.id}/continue`, payload: {} })).json();
+  await waitFor(app, again.id, (body) => body.state === 'succeeded');
+
+  const overview = (await app.inject({ method: 'GET', url: '/v1/runs/overview?limit=10' })).json();
+  assert.equal(overview.items.length, 2);
+  assert.equal(overview.items[0].id, again.id, '最新的在前');
+  assert.equal(overview.items[0].source, 'continue');
+  assert.equal(overview.items[1].source, 'chat');
+  assert.equal(overview.stats.successRate, 100);
+  assert.ok(overview.stats.p50Ms !== null);
+  assert.deepEqual(overview.stats.topTools, [], '没调工具就没有榜单');
+
+  const clamped = (await app.inject({ method: 'GET', url: '/v1/runs/overview?limit=9999' })).json();
+  assert.ok(Array.isArray(clamped.items));
+  await app.close();
+});
