@@ -7,15 +7,27 @@
  * - 配额只认 usage_ledger 的求和，用户改不动这个数。
  */
 
-import { and, asc, desc, eq, inArray, isNull, or, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, ilike, inArray, isNotNull, isNull, or, sql } from 'drizzle-orm';
 
 import type { DbHandle } from '@rakko/db';
-import { automations, memories, messages, runEvents, runs, skills, threads, usageLedger, users } from '@rakko/db';
+import { automations, kgEdges, kgNodes, memories, messages, runEvents, runs, skills, threads, usageLedger, users } from '@rakko/db';
 import { currentPeriod, decideQuota, periodStart, planLimit, type QuotaDecision } from '@rakko/core';
-import type { Automation, Memory, MemoryKind, MemoryStatus, Message, MessageKind, RiskLevel, Run, RunEvent, RunState, Settings, Skill, Thread, Usage } from '@rakko/protocol';
+import type { Automation, Graph, KgEdge, KgNode, Memory, MemoryKind, MemoryStatus, Message, MessageKind, RiskLevel, Run, RunEvent, RunState, Settings, Skill, Thread, Usage } from '@rakko/protocol';
+
+import { toVectorLiteral } from '@rakko/core';
 
 import { BUILTIN_SKILLS } from './store.js';
-import type { AppendMessageInput, CreateRunInput, Listener, PendingCall, ResumableRun, RunPatch, RunStore } from './store.js';
+import type {
+  AppendMessageInput,
+  CreateRunInput,
+  Listener,
+  MemorySearchOptions,
+  PendingCall,
+  ResumableRun,
+  RunPatch,
+  RunStore,
+  TripleInput,
+} from './store.js';
 
 const iso = (value: Date | null): string | null => (value ? value.toISOString() : null);
 
@@ -34,6 +46,23 @@ const toMessage = (row: typeof messages.$inferSelect): Message => ({
   text: row.text,
   payload: (row.payload as Record<string, unknown> | null) ?? null,
   runId: row.runId,
+  createdAt: row.createdAt.toISOString(),
+});
+
+const toKgNode = (row: typeof kgNodes.$inferSelect): KgNode => ({
+  id: row.id,
+  name: row.name,
+  kind: row.kind,
+  memoryId: row.memoryId,
+  createdAt: row.createdAt.toISOString(),
+});
+
+const toKgEdge = (row: typeof kgEdges.$inferSelect): KgEdge => ({
+  id: row.id,
+  fromId: row.fromId,
+  toId: row.toId,
+  relation: row.relation,
+  memoryId: row.memoryId,
   createdAt: row.createdAt.toISOString(),
 });
 
@@ -419,7 +448,14 @@ export class PostgresStore implements RunStore {
     return rows.map(toMemory);
   }
 
-  async createMemory(input: { kind: MemoryKind; title: string; description?: string; body: string; status?: MemoryStatus }): Promise<Memory> {
+  async createMemory(input: {
+    kind: MemoryKind;
+    title: string;
+    description?: string;
+    body: string;
+    status?: MemoryStatus;
+    embedding?: number[] | null;
+  }): Promise<Memory> {
     const [row] = await this.db
       .insert(memories)
       .values({
@@ -429,10 +465,97 @@ export class PostgresStore implements RunStore {
         description: input.description ?? '',
         body: input.body,
         status: input.status ?? 'active',
+        ...(input.embedding && input.embedding.length > 0
+          ? { embedding: sql`${toVectorLiteral(input.embedding)}::vector` }
+          : {}),
       })
       .returning();
     if (!row) throw new Error('写记忆失败');
     return toMemory(row);
+  }
+
+  async searchMemories(options: MemorySearchOptions): Promise<Memory[]> {
+    const userId = this.requireUserId();
+    const like = `%${options.query.replace(/[%_]/g, '')}%`;
+
+    if (options.embedding && options.embedding.length > 0) {
+      const literal = toVectorLiteral(options.embedding);
+      const rows = await this.db
+        .select()
+        .from(memories)
+        .where(and(eq(memories.userId, userId), eq(memories.status, 'active'), isNotNull(memories.embedding)))
+        .orderBy(sql`${memories.embedding} <=> ${sql.raw(`'${literal}'::vector`)}`)
+        .limit(options.limit);
+      if (rows.length > 0) return rows.map(toMemory);
+    }
+
+    // 没有向量：关键词兜底，再不行给最近更新的
+    const rows = await this.db
+      .select()
+      .from(memories)
+      .where(
+        and(
+          eq(memories.userId, userId),
+          eq(memories.status, 'active'),
+          or(ilike(memories.title, like), ilike(memories.body, like)),
+        ),
+      )
+      .orderBy(desc(memories.updatedAt))
+      .limit(options.limit);
+    if (rows.length > 0) return rows.map(toMemory);
+
+    const recent = await this.db
+      .select()
+      .from(memories)
+      .where(and(eq(memories.userId, userId), eq(memories.status, 'active')))
+      .orderBy(desc(memories.updatedAt))
+      .limit(options.limit);
+    return recent.map(toMemory);
+  }
+
+  async listGraph(): Promise<Graph> {
+    const userId = this.requireUserId();
+    const [nodes, edges] = await Promise.all([
+      this.db.select().from(kgNodes).where(eq(kgNodes.userId, userId)),
+      this.db.select().from(kgEdges).where(eq(kgEdges.userId, userId)),
+    ]);
+    return { nodes: nodes.map(toKgNode), edges: edges.map(toKgEdge) };
+  }
+
+  async saveTriples(memoryId: string, triples: TripleInput[]): Promise<void> {
+    const userId = this.requireUserId();
+    for (const triple of triples) {
+      const fromId = await this.ensureNode(userId, triple.from, triple.fromKind ?? 'concept', memoryId);
+      const toId = await this.ensureNode(userId, triple.to, triple.toKind ?? 'concept', memoryId);
+      await this.db
+        .insert(kgEdges)
+        .values({ userId, fromId, toId, relation: triple.relation, memoryId })
+        .onConflictDoNothing();
+    }
+  }
+
+  private async ensureNode(userId: string, name: string, kind: string, memoryId: string): Promise<string> {
+    const [existing] = await this.db
+      .select({ id: kgNodes.id })
+      .from(kgNodes)
+      .where(and(eq(kgNodes.userId, userId), eq(kgNodes.name, name)))
+      .limit(1);
+    if (existing) return existing.id;
+
+    const [created] = await this.db
+      .insert(kgNodes)
+      .values({ userId, name, kind, memoryId })
+      .onConflictDoNothing({ target: [kgNodes.userId, kgNodes.name] })
+      .returning({ id: kgNodes.id });
+    if (created) return created.id;
+
+    const [again] = await this.db
+      .select({ id: kgNodes.id })
+      .from(kgNodes)
+      .where(and(eq(kgNodes.userId, userId), eq(kgNodes.name, name)))
+      .limit(1);
+    if (!again) throw new Error(`建图谱节点失败：${name}`);
+    return again.id;
   }
 
   async updateMemory(

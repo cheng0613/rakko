@@ -983,7 +983,22 @@
           </div>
         </div>
 
+        <div class="seg" id="memTabs" style="margin-bottom:14px">
+          <button data-memview="list" class="on">清单</button>
+          <button data-memview="graph">知识图谱</button>
+        </div>
+
         <div class="grid two" id="memList"></div>
+        <div id="memGraph" hidden>
+          <div class="card" style="padding:12px">
+            <div class="auto-meta" style="margin-bottom:8px">
+              <span class="muted" id="graphSummary">从记忆里抽出的实体与关系</span>
+              <span class="sep"></span>
+              <span class="muted" style="font-size:11px">点节点看它的关系</span>
+            </div>
+            <div id="graphCanvas" style="width:100%;overflow:auto"></div>
+          </div>
+        </div>
         <div id="memEmpty" class="card" hidden style="text-align:center;padding:32px 16px">
           <p style="margin:0 0 6px;font-size:14px;font-weight:560">还没有记忆</p>
           <p class="muted" style="margin:0;font-size:12.5px">记下你的偏好、项目背景或常用参考，之后的对话会带着它们。</p>
@@ -1168,6 +1183,8 @@
     memories: [],
     skills: [],
     plugins: null,
+    graph: null,
+    memView: 'list',
   };
 
   /** 历史里最后一条助手消息，恢复运行时把新事件接在它后面 */
@@ -2711,6 +2728,134 @@
     }
   });
 
+  /* ---------------- 记忆图谱 ---------------- */
+
+  const KIND_COLOR = {
+    project: 'var(--accent)',
+    tool: 'var(--violet)',
+    person: 'var(--mint)',
+    place: 'var(--orange)',
+    concept: 'var(--muted)',
+  };
+
+  const renderGraph = () => {
+    const canvas = $('#graphCanvas');
+    canvas.innerHTML = '';
+    const graph = state.graph;
+    if (!graph || graph.nodes.length === 0) {
+      canvas.append(make('p', 'muted', '还没有图谱数据 —— 自动提取记忆时会顺带抽出实体与关系。'));
+      return;
+    }
+
+    const width = Math.max(560, canvas.clientWidth || 640);
+    const height = 420;
+    const cx = width / 2;
+    const cy = height / 2;
+    const radius = Math.min(width, height) / 2 - 60;
+
+    const positions = new Map();
+    graph.nodes.forEach((node, index) => {
+      const angle = (index / graph.nodes.length) * Math.PI * 2 - Math.PI / 2;
+      positions.set(node.id, { x: cx + radius * Math.cos(angle), y: cy + radius * Math.sin(angle) });
+    });
+
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+    svg.setAttribute('width', '100%');
+    svg.setAttribute('height', String(height));
+    svg.style.display = 'block';
+
+    const lineLayer = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+    const labelLayer = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+    const nodeLayer = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+    svg.append(lineLayer, labelLayer, nodeLayer);
+
+    const edges = [];
+    for (const edge of graph.edges) {
+      const from = positions.get(edge.fromId);
+      const to = positions.get(edge.toId);
+      if (!from || !to) continue;
+
+      const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+      line.setAttribute('x1', String(from.x));
+      line.setAttribute('y1', String(from.y));
+      line.setAttribute('x2', String(to.x));
+      line.setAttribute('y2', String(to.y));
+      line.style.stroke = 'var(--line-strong)';
+      line.style.strokeWidth = '1.2';
+      lineLayer.append(line);
+
+      const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+      label.setAttribute('x', String((from.x + to.x) / 2));
+      label.setAttribute('y', String((from.y + to.y) / 2));
+      label.setAttribute('font-size', '10');
+      label.style.fill = 'var(--faint)';
+      label.setAttribute('text-anchor', 'middle');
+      label.textContent = edge.relation;
+      labelLayer.append(label);
+
+      edges.push({ edge, line, label });
+    }
+
+    for (const node of graph.nodes) {
+      const position = positions.get(node.id);
+      const group = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+
+      const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+      circle.setAttribute('cx', String(position.x));
+      circle.setAttribute('cy', String(position.y));
+      circle.setAttribute('r', '7');
+      circle.style.fill = KIND_COLOR[node.kind] ?? KIND_COLOR.concept;
+      circle.style.cursor = 'pointer';
+
+      const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+      text.setAttribute('x', String(position.x));
+      text.setAttribute('y', String(position.y + 20));
+      text.setAttribute('font-size', '11');
+      text.style.fill = 'var(--text-2)';
+      text.setAttribute('text-anchor', 'middle');
+      text.textContent = node.name.length > 12 ? node.name.slice(0, 12) + '…' : node.name;
+
+      group.append(circle, text);
+      group.style.cursor = 'pointer';
+      group.addEventListener('click', () => {
+        for (const item of edges) {
+          const related = item.edge.fromId === node.id || item.edge.toId === node.id;
+          item.line.style.stroke = related ? 'var(--accent)' : 'var(--line)';
+          item.line.style.strokeWidth = related ? '2' : '1.2';
+          item.label.style.fill = related ? 'var(--accent)' : 'var(--faint)';
+        }
+        const links = edges.filter((item) => item.edge.fromId === node.id || item.edge.toId === node.id);
+        $('#graphSummary').textContent = `${node.name} · ${links.length} 条关系`;
+      });
+
+      nodeLayer.append(group);
+    }
+
+    canvas.append(svg);
+    $('#graphSummary').textContent = `${graph.nodes.length} 个实体 · ${graph.edges.length} 条关系`;
+  };
+
+  const loadGraph = async () => {
+    try {
+      state.graph = await api('/v1/graph');
+      renderGraph();
+    } catch (error) {
+      toast('读图谱失败：' + error.message);
+    }
+  };
+
+  document.querySelectorAll('#memTabs button').forEach((button) => {
+    button.addEventListener('click', () => {
+      const view = button.dataset.memview;
+      state.memView = view;
+      document.querySelectorAll('#memTabs button').forEach((other) => other.classList.toggle('on', other === button));
+      $('#memList').hidden = view !== 'list';
+      $('#memGraph').hidden = view !== 'graph';
+      if (view === 'graph') void loadGraph();
+    });
+  });
+
   const setMode = (mode, detail) => {
     state.mode = mode;
     if (mode === 'demo') {
@@ -2774,6 +2919,10 @@
 
       const wantedView = params.get('view');
       if (wantedView && wantedView in views) setView(wantedView);
+      if (params.get('mem') === 'graph') {
+        const tab = document.querySelector('#memTabs button[data-memview="graph"]');
+        if (tab) tab.click();
+      }
 
       if (params.get('auto') === '1') {
         setTimeout(() => {

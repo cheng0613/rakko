@@ -16,6 +16,22 @@ export const extractedMemorySchema = z.object({
   title: z.string().trim().min(1).max(80),
   description: z.string().trim().max(120).optional(),
   body: z.string().trim().min(1).max(600),
+  /** 这条记忆里出现的实体，用来搭知识图谱 */
+  entities: z
+    .array(z.object({ name: z.string().trim().min(1).max(40), kind: z.string().trim().max(20).optional() }))
+    .max(6)
+    .optional(),
+  /** 实体之间的关系 */
+  relations: z
+    .array(
+      z.object({
+        from: z.string().trim().min(1).max(40),
+        relation: z.string().trim().min(1).max(20),
+        to: z.string().trim().min(1).max(40),
+      }),
+    )
+    .max(6)
+    .optional(),
 });
 export type ExtractedMemory = z.infer<typeof extractedMemorySchema>;
 
@@ -27,8 +43,10 @@ const SYSTEM = [
   '- kind=reference：外部系统、文档、地址',
   '不要记：一次性任务细节、临时状态、能从代码里直接读到的东西、与已有记忆重复的。',
   '最多 3 条；没有就返回空数组。',
-  '只输出 JSON 数组，不要解释、不要代码块：',
-  '[{"kind":"user","title":"不超过 20 字","description":"不超过 20 字","body":"不超过 200 字"}]',
+  '每条再附上实体与关系，用于搭知识图谱（没有就省略）：',
+  "[{kind,title,description,body,entities:[{name,kind}],relations:[{from,relation,to}]}]",
+  'kind 用 person/project/tool/concept/place；relation 用动词，例如「使用」「决定」「属于」「偏好」。',
+  '只输出 JSON 数组，不要解释、不要代码块。',
 ].join('\n');
 
 const clip = (text: string, limit: number): string =>

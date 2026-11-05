@@ -49,6 +49,13 @@ export { createSecondToolset, type HttpToolOptions, type SecondToolsetOptions } 
 export { loadToolPlugins, type LoadedPlugins, type ToolPluginError } from './plugins.js';
 export { PluginHost, type PluginHostInfo, type PluginHostOptions } from './plugin-host.js';
 export {
+  cosineSimilarity,
+  OpenAICompatibleEmbeddings,
+  toVectorLiteral,
+  type EmbeddingProvider,
+  type OpenAICompatibleEmbeddingsOptions,
+} from './embedding.js';
+export {
   ApprovalGate,
   type ApprovalDecision,
   type ApprovalGateOptions,

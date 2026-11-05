@@ -891,3 +891,78 @@ test('没有插件宿主时，接口给出明确回应而不是 500', async () =
   assert.equal(reload.json().error, 'plugins_unavailable');
   await app.close();
 });
+
+test('语义检索：查询命中的记忆排在最前，最多带 8 条', async () => {
+  const store = new MemoryStore();
+
+  // 一条跟「数据库」相关，八条不相干
+  await store.createMemory({ kind: 'project', title: 'Postgres 独占事实源', body: '不做本地缓存。', embedding: [1, 0, 0] });
+  for (let i = 0; i < 8; i += 1) {
+    await store.createMemory({ kind: 'user', title: `无关记忆 ${i}`, body: '跟数据库没关系', embedding: [0, 1, 0] });
+  }
+
+  const hits = await store.searchMemories({ query: '数据库用什么', embedding: [1, 0, 0], limit: 8 });
+  assert.equal(hits.length, 8);
+  assert.equal(hits[0]?.title, 'Postgres 独占事实源');
+
+  const keywordOnly = await store.searchMemories({ query: '本地缓存', embedding: null, limit: 3 });
+  assert.ok(keywordOnly.some((memory) => memory.title === 'Postgres 独占事实源'), '没有向量时按关键词兜底');
+});
+
+test('知识图谱：三元组落库，接口能读到', async () => {
+  const store = new MemoryStore();
+  const memory = await store.createMemory({ kind: 'project', title: 'Rakko 用 Postgres', body: '唯一事实源。' });
+
+  await store.saveTriples(memory.id, [
+    { from: 'Rakko', fromKind: 'project', relation: '使用', to: 'Postgres', toKind: 'tool' },
+    { from: 'Postgres', fromKind: 'tool', relation: '承担', to: '消息持久化', toKind: 'concept' },
+  ]);
+
+  const app = createApp({ store });
+  const graph = (await app.inject({ method: 'GET', url: '/v1/graph' })).json();
+
+  assert.equal(graph.nodes.length, 3);
+  assert.equal(graph.edges.length, 2);
+  assert.deepEqual(
+    graph.edges.map((edge: { relation: string }) => edge.relation).sort(),
+    ['使用', '承担'],
+  );
+  await app.close();
+});
+
+test('记忆段会按查询挑：相关的进系统提示，不相关的排在后面', async () => {
+  const seen: string[] = [];
+  const provider: ModelProvider = {
+    id: 'peek-memory',
+    async *stream(request) {
+      seen.push(request.messages[0]?.content ?? '');
+      yield { kind: 'delta', text: '好。' };
+      yield { kind: 'done', finishReason: 'stop' };
+    },
+  };
+
+  const store = new MemoryStore();
+  await store.createMemory({ kind: 'project', title: 'Postgres 独占事实源', body: '不做本地缓存。', embedding: [1, 0, 0] });
+  await store.createMemory({ kind: 'user', title: '回答先给结论', body: '不要客套。', embedding: [0, 1, 0] });
+
+  const embeddings = {
+    model: 'stub',
+    dims: 3,
+    embed: async () => [[1, 0, 0]],
+  };
+
+  const gateway = new ProviderGateway({ provider, models: FAKE_MODELS, firstChunkTimeoutMs: 2_000 });
+  const app = createApp({ store, gateway, embeddings });
+
+  const thread = (await app.inject({ method: 'POST', url: '/v1/threads', payload: {} })).json();
+  const run = (await app.inject({ method: 'POST', url: '/v1/runs', payload: { threadId: thread.id, prompt: '数据库用的是什么' } })).json();
+  await waitFor(app, run.id, (body) => body.state === 'succeeded');
+
+  const system = seen[0] ?? '';
+  assert.match(system, /用户的记忆（跨会话）/);
+  const first = system.indexOf('Postgres 独占事实源');
+  const second = system.indexOf('回答先给结论');
+  assert.ok(first > -1, '相关的记忆要在');
+  assert.ok(first < second, '相关的应该排在前面');
+  await app.close();
+});

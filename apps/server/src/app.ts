@@ -12,6 +12,7 @@ import {
   ToolRegistry,
   type AgentHooks,
   type ChatMessage,
+  type EmbeddingProvider,
   type ModelProvider,
   type ModelTier,
   type PluginHost,
@@ -58,6 +59,8 @@ export interface AppOptions {
   automationIntervalMs?: number;
   /** 工具插件宿主；不存在时 /v1/plugins 返回空 */
   plugins?: PluginHost;
+  /** 语义检索；没有就退回关键词 */
+  embeddings?: EmbeddingProvider;
 }
 
 export function createApp(options: AppOptions = {}): FastifyInstance {
@@ -176,12 +179,28 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
 
   /* ---------------- 记忆 ---------------- */
 
+  /** 算一条记忆的向量；失败返回 null（检索会退回关键词） */
+  async function embedFor(title: string, body: string): Promise<number[] | null> {
+    if (!options.embeddings) return null;
+    try {
+      const [vector] = await options.embeddings.embed([`${title}\n${body}`.slice(0, 2000)]);
+      return vector ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+
   app.get('/v1/memories', async () => ({ items: await store.listMemories() }));
+
+  app.get('/v1/graph', async () => store.listGraph());
 
   app.post('/v1/memories', async (request, reply) => {
     const parsed = createMemoryInput.safeParse(request.body ?? {});
     if (!parsed.success) return reply.code(400).send(invalid(parsed.error.issues));
-    return reply.code(201).send(await store.createMemory(parsed.data));
+    return reply.code(201).send(
+      await store.createMemory({ ...parsed.data, embedding: await embedFor(parsed.data.title, parsed.data.body) }),
+    );
   });
 
   app.patch('/v1/memories/:id', async (request, reply) => {
@@ -832,7 +851,7 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
 
     // 整条会话都带上：上一轮说过什么、调过什么工具，模型都看得到
     const history = trimHistory(buildHistory(await store.listMessages(run.threadId)));
-    const systemPrompt = buildSystemPrompt() + (await buildSkillSection()) + (await buildMemorySection());
+    const systemPrompt = buildSystemPrompt() + (await buildSkillSection()) + (await buildMemorySection(run.prompt));
     await executeRun(run, tier, [{ role: 'system', content: systemPrompt }, ...history], null, notice);
   }
 
@@ -856,13 +875,25 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
       });
 
       for (const candidate of candidates) {
-        await store.createMemory({
+        const memory = await store.createMemory({
           kind: candidate.kind,
           title: candidate.title,
           description: candidate.description ?? '',
           body: candidate.body,
           status: 'pending',
+          embedding: await embedFor(candidate.title, candidate.body),
         });
+
+        const triples = (candidate.relations ?? [])
+          .filter((relation) => relation.from && relation.to)
+          .map((relation) => ({
+            from: relation.from,
+            to: relation.to,
+            relation: relation.relation,
+            fromKind: candidate.entities?.find((entity) => entity.name === relation.from)?.kind ?? 'concept',
+            toKind: candidate.entities?.find((entity) => entity.name === relation.to)?.kind ?? 'concept',
+          }));
+        if (triples.length > 0) await store.saveTriples(memory.id, triples);
       }
       if (candidates.length > 0) console.log(`记忆候选：${candidates.length} 条待确认`);
     } finally {
@@ -900,9 +931,19 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
     return ['', '## 已挂载的技能（按它们做事）', ...blocks].join('\n');
   }
 
-  /** 把记忆拼成系统提示的一段：跨会话的偏好与背景，最多 20 条、每条 200 字 */
-  async function buildMemorySection(): Promise<string> {
-    const items = await store.listMemories();
+  /** 把与本次任务最相关的记忆拼进系统提示：优先语义检索，拿不到向量就退回关键词 */
+  async function buildMemorySection(query: string): Promise<string> {
+    let embedding: number[] | null = null;
+    if (options.embeddings) {
+      try {
+        const [vector] = await options.embeddings.embed([query.slice(0, 2000)]);
+        embedding = vector ?? null;
+      } catch {
+        embedding = null; // 检索失败就退回关键词，不影响运行
+      }
+    }
+
+    const items = await store.searchMemories({ query, embedding, limit: 8 });
     if (items.length === 0) return '';
 
     const lines = items.slice(0, 20).map((memory) => {
@@ -935,11 +976,21 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
     return kept;
   }
 
+  /** 恢复运行时拿不到 run.prompt 的上下文，用历史里最后一条用户消息当检索词 */
+  const lastUserText = (items: Message[]): string =>
+    [...items].reverse().find((item) => item.role === 'user' && item.kind === 'text')?.text ?? '';
+
   /** 重启后恢复：拿库里的历史 + 还挂着的审批，接着跑 */
   async function resumeRun(run: Run, pending: PendingCall | null): Promise<void> {
     const items = await store.listMessages(run.threadId);
     const messages: ChatMessage[] = [
-      { role: 'system', content: buildSystemPrompt() + (await buildSkillSection()) + (await buildMemorySection()) },
+      {
+        role: 'system',
+        content:
+          buildSystemPrompt() +
+          (await buildSkillSection()) +
+          (await buildMemorySection(lastUserText(items))),
+      },
       ...buildHistory(items),
     ];
     const tier: ModelTier = run.model === gateway.models.fast ? 'fast' : 'standard';

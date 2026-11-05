@@ -242,6 +242,32 @@ export const memorySchema = z.object({
 });
 export type Memory = z.infer<typeof memorySchema>;
 
+/** 知识图谱：节点与边 */
+export const kgNodeSchema = z.object({
+  id,
+  name: z.string(),
+  kind: z.string(),
+  memoryId: id.nullable(),
+  createdAt: at,
+});
+export type KgNode = z.infer<typeof kgNodeSchema>;
+
+export const kgEdgeSchema = z.object({
+  id,
+  fromId: id,
+  toId: id,
+  relation: z.string(),
+  memoryId: id.nullable(),
+  createdAt: at,
+});
+export type KgEdge = z.infer<typeof kgEdgeSchema>;
+
+export const graphSchema = z.object({
+  nodes: z.array(kgNodeSchema),
+  edges: z.array(kgEdgeSchema),
+});
+export type Graph = z.infer<typeof graphSchema>;
+
 export const createMemoryInput = z.object({
   kind: memoryKindSchema,
   title: z.string().trim().min(1).max(120),

@@ -1,7 +1,7 @@
 # 本地一把起：Postgres 是唯一事实源，api 无状态。
 services:
   db:
-    image: postgres:17-alpine
+    image: pgvector/pgvector:pg17
     environment:
       POSTGRES_USER: rakko
       POSTGRES_PASSWORD: rakko

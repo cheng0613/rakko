@@ -16,6 +16,7 @@ import { relations } from 'drizzle-orm';
 import {
   boolean,
   index,
+  vector,
   integer,
   jsonb,
   pgTable,
@@ -163,10 +164,56 @@ export const memories = pgTable(
     body: text('body').notNull(),
     /** active = 已生效；pending = 自动提取出来、等用户确认 */
     status: text('status').notNull().default('active'),
+    /** 语义检索用；没有 embedding 就退回关键词 */
+    embedding: vector('embedding', { dimensions: 1024 }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [index('memories_user_kind_idx').on(table.userId, table.kind)],
+);
+
+/** 知识图谱的实体 */
+export const kgNodes = pgTable(
+  'kg_nodes',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    /** 人类可读的名字，例如「Rakko」「Postgres」 */
+    name: text('name').notNull(),
+    /** 类型：person / project / tool / concept / place 等 */
+    kind: text('kind').notNull().default('concept'),
+    /** 来自哪条记忆（可空：也可以从对话里直接冒出来） */
+    memoryId: uuid('memory_id').references(() => memories.id, { onDelete: 'set null' }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [uniqueIndex('kg_nodes_user_name_uq').on(table.userId, table.name)],
+);
+
+/** 实体之间的关系 */
+export const kgEdges = pgTable(
+  'kg_edges',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    fromId: uuid('from_id')
+      .notNull()
+      .references(() => kgNodes.id, { onDelete: 'cascade' }),
+    toId: uuid('to_id')
+      .notNull()
+      .references(() => kgNodes.id, { onDelete: 'cascade' }),
+    /** 关系动词，例如「使用」「决定」「属于」 */
+    relation: text('relation').notNull(),
+    memoryId: uuid('memory_id').references(() => memories.id, { onDelete: 'cascade' }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex('kg_edges_triple_uq').on(table.userId, table.fromId, table.toId, table.relation),
+    index('kg_edges_from_idx').on(table.fromId),
+  ],
 );
 
 export const usageLedger = pgTable(
@@ -209,6 +256,8 @@ export const TABLES = [
   skills,
   memories,
   usageLedger,
+  kgNodes,
+  kgEdges,
 ] as const;
 
 export type User = typeof users.$inferSelect;
@@ -220,3 +269,5 @@ export type Automation = typeof automations.$inferSelect;
 export type Skill = typeof skills.$inferSelect;
 export type Memory = typeof memories.$inferSelect;
 export type UsageLedgerRow = typeof usageLedger.$inferSelect;
+export type KgNode = typeof kgNodes.$inferSelect;
+export type KgEdge = typeof kgEdges.$inferSelect;

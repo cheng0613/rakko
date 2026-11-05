@@ -12,6 +12,9 @@ export interface ProviderSettings {
   models: Record<ModelTier, string>;
   timeoutMs: number;
   firstChunkTimeoutMs: number;
+  /** 语义检索用的 embedding 模型与维度 */
+  embedModel: string;
+  embedDims: number;
 }
 
 const num = (value: string | undefined, fallback: number): number => {
@@ -35,6 +38,8 @@ export function loadProviderSettings(env: NodeJS.ProcessEnv = process.env): Prov
     },
     timeoutMs: num(env.RAKKO_TIMEOUT_MS, 180_000),
     firstChunkTimeoutMs: num(env.RAKKO_FIRST_CHUNK_MS, 45_000),
+    embedModel: env.RAKKO_EMBED_MODEL ?? 'kinfra-text-embedding-0.6b',
+    embedDims: num(env.RAKKO_EMBED_DIMS, 1024),
   };
 }
 

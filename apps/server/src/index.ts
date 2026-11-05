@@ -2,7 +2,16 @@ import { createDb, migrateDb } from '@rakko/db';
 import { homedir } from 'node:os';
 import path from 'node:path';
 
-import { createBuiltinTools, createSecondToolset, FakeProvider, OpenAICompatibleProvider, PluginHost, ProviderGateway, ToolRegistry } from '@rakko/core';
+import {
+  createBuiltinTools,
+  createSecondToolset,
+  FakeProvider,
+  OpenAICompatibleEmbeddings,
+  OpenAICompatibleProvider,
+  PluginHost,
+  ProviderGateway,
+  ToolRegistry,
+} from '@rakko/core';
 
 import { createApp, FAKE_MODELS } from './app.js';
 import { loadAgentSettings, loadProviderSettings } from './config.js';
@@ -42,9 +51,19 @@ const gateway = new ProviderGateway({
   firstChunkTimeoutMs: settings.firstChunkTimeoutMs,
 });
 
+const embeddings = hasKey
+  ? new OpenAICompatibleEmbeddings({
+      baseUrl: settings.baseUrl,
+      apiKey: settings.apiKey,
+      model: settings.embedModel,
+      dims: settings.embedDims,
+    })
+  : undefined;
+
 if (hasKey) {
   console.log(`模型：${settings.baseUrl}`);
   console.log(`  标准档 ${settings.models.standard} · 快档 ${settings.models.fast}`);
+  console.log(`  语义检索 ${settings.embedModel}（${settings.embedDims} 维）`);
 } else {
   console.log('模型：假 provider（未配置 RAKKO_API_KEY，输出是固定文本）');
 }
@@ -89,6 +108,7 @@ const app = createApp({
   approvalTimeoutMs: agentSettings.approvalTimeoutMs,
   maxSteps: agentSettings.maxSteps,
   plugins,
+  ...(embeddings ? { embeddings } : {}),
 });
 
 const shutdown = async (signal: string): Promise<void> => {

@@ -8,7 +8,7 @@
 import { randomUUID } from 'node:crypto';
 
 import { currentPeriod, decideQuota, periodStart, planLimit, type QuotaDecision, type QuotaState } from '@rakko/core';
-import type { Automation, Memory, MemoryStatus, Message, MessageKind, MessageRole, RiskLevel, Run, RunEvent, Settings, Skill, Thread, Usage } from '@rakko/protocol';
+import type { Automation, Graph, Memory, MemoryStatus, Message, MessageKind, MessageRole, RiskLevel, Run, RunEvent, Settings, Skill, Thread, Usage } from '@rakko/protocol';
 
 export interface AppendMessageInput {
   threadId: string;
@@ -31,6 +31,23 @@ export type RunPatch = Partial<Pick<Run, 'state' | 'error' | 'finishedAt' | 'mod
 export type Listener = (event: RunEvent) => void;
 
 /** 重启后还等着人点头的那一次调用 */
+/** 一条「实体 —关系→ 实体」，从记忆里抽出来 */
+export interface TripleInput {
+  from: string;
+  relation: string;
+  to: string;
+  fromKind?: string;
+  toKind?: string;
+}
+
+export interface MemorySearchOptions {
+  /** 原始查询文本，关键词兜底用 */
+  query: string;
+  /** 查询向量；拿不到 embedding 时传 null */
+  embedding: number[] | null;
+  limit: number;
+}
+
 export interface PendingCall {
   callId: string;
   name: string;
@@ -63,7 +80,20 @@ export interface RunStore {
 
   /** 记忆：跨会话留下的东西 */
   listMemories(): Promise<Memory[]>;
-  createMemory(input: { kind: Memory['kind']; title: string; description?: string; body: string; status?: MemoryStatus }): Promise<Memory>;
+  createMemory(input: {
+    kind: Memory['kind'];
+    title: string;
+    description?: string;
+    body: string;
+    status?: MemoryStatus;
+    embedding?: number[] | null;
+  }): Promise<Memory>;
+  /** 语义检索（没有向量时退回关键词），只返回 active 的记忆 */
+  searchMemories(options: MemorySearchOptions): Promise<Memory[]>;
+  /** 知识图谱快照 */
+  listGraph(): Promise<Graph>;
+  /** 把一条记忆抽出的三元组写进图谱 */
+  saveTriples(memoryId: string, triples: TripleInput[]): Promise<void>;
   updateMemory(id: string, patch: Partial<Pick<Memory, 'kind' | 'title' | 'description' | 'body' | 'status'>>): Promise<Memory | undefined>;
   deleteMemory(id: string): Promise<boolean>;
 
@@ -98,6 +128,21 @@ export interface RunStore {
 }
 
 const now = (): string => new Date().toISOString();
+
+const cosine = (a: number[], b: number[]): number => {
+  if (a.length === 0 || a.length !== b.length) return 0;
+  let dot = 0;
+  let na = 0;
+  let nb = 0;
+  for (let index = 0; index < a.length; index += 1) {
+    const x = a[index] ?? 0;
+    const y = b[index] ?? 0;
+    dot += x * y;
+    na += x * x;
+    nb += y * y;
+  }
+  return na === 0 || nb === 0 ? 0 : dot / (Math.sqrt(na) * Math.sqrt(nb));
+};
 
 const slugify = (name: string): string => {
   const ascii = name
@@ -171,6 +216,9 @@ export class MemoryStore implements RunStore {
   private settings: Settings;
   private readonly automations = new Map<string, Automation>();
   private readonly memories = new Map<string, Memory>();
+  private readonly embeddings = new Map<string, number[]>();
+  private readonly graphNodes = new Map<string, { id: string; name: string; kind: string; memoryId: string | null; createdAt: string }>();
+  private readonly graphEdges = new Map<string, { id: string; fromId: string; toId: string; relation: string; memoryId: string | null; createdAt: string }>();
   private readonly skills = new Map<string, Skill>();
 
   constructor(options: MemoryStoreOptions = {}) {
@@ -212,6 +260,48 @@ export class MemoryStore implements RunStore {
 
   async resumableRuns(): Promise<ResumableRun[]> {
     return [];
+  }
+
+  async searchMemories(options: MemorySearchOptions): Promise<Memory[]> {
+    const active = [...this.memories.values()].filter((memory) => memory.status !== 'pending');
+    const keyword = options.query.toLowerCase();
+
+    const scored = active.map((memory) => {
+      const vector = this.embeddings.get(memory.id);
+      const semantic = options.embedding && vector ? cosine(vector, options.embedding) : 0;
+      const text = `${memory.title} ${memory.description} ${memory.body}`.toLowerCase();
+      const lexical = keyword && text.includes(keyword) ? 1 : 0;
+      return { memory, score: semantic + lexical };
+    });
+
+    const matched = scored.filter((item) => item.score > 0).sort((a, b) => b.score - a.score);
+    const rest = scored.filter((item) => item.score === 0).sort((a, b) => b.memory.updatedAt.localeCompare(a.memory.updatedAt));
+
+    return [...matched, ...rest].slice(0, options.limit).map((item) => item.memory);
+  }
+
+  async listGraph(): Promise<Graph> {
+    return { nodes: [...this.graphNodes.values()], edges: [...this.graphEdges.values()] };
+  }
+
+  async saveTriples(memoryId: string, triples: TripleInput[]): Promise<void> {
+    const at = now();
+    for (const triple of triples) {
+      const from = this.ensureNode(triple.from, triple.fromKind ?? 'concept', memoryId, at);
+      const to = this.ensureNode(triple.to, triple.toKind ?? 'concept', memoryId, at);
+      const key = `${from.id}|${to.id}|${triple.relation}`;
+      if (!this.graphEdges.has(key)) {
+        this.graphEdges.set(key, { id: randomUUID(), fromId: from.id, toId: to.id, relation: triple.relation, memoryId, createdAt: at });
+      }
+    }
+  }
+
+  private ensureNode(name: string, kind: string, memoryId: string, at: string) {
+    const existing = [...this.graphNodes.values()].find((node) => node.name === name);
+    if (existing) return existing;
+    const node = { id: randomUUID(), name, kind, memoryId, createdAt: at };
+    this.graphNodes.set(node.id, node);
+    return node;
   }
 
   async listSkills(): Promise<Skill[]> {
@@ -260,6 +350,7 @@ export class MemoryStore implements RunStore {
     description?: string;
     body: string;
     status?: MemoryStatus;
+    embedding?: number[] | null;
   }): Promise<Memory> {
     const at = now();
     const memory: Memory = {
@@ -273,6 +364,7 @@ export class MemoryStore implements RunStore {
       updatedAt: at,
     };
     this.memories.set(memory.id, memory);
+    if (input.embedding && input.embedding.length > 0) this.embeddings.set(memory.id, input.embedding);
     return memory;
   }
 
