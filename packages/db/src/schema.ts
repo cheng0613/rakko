@@ -169,7 +169,11 @@ export const memories = pgTable(
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
-  (table) => [index('memories_user_kind_idx').on(table.userId, table.kind)],
+  (table) => [
+    index('memories_user_kind_idx').on(table.userId, table.kind),
+    // 语义检索走余弦距离，用 HNSW 索引；数据量上千后差别很明显
+    index('memories_embedding_hnsw').using('hnsw', table.embedding.op('vector_cosine_ops')),
+  ],
 );
 
 /** 知识图谱的实体 */

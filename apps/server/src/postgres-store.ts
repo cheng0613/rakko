@@ -513,6 +513,57 @@ export class PostgresStore implements RunStore {
     return recent.map(toMemory);
   }
 
+  async expandFromMemories(memoryIds: string[], limit: number): Promise<Memory[]> {
+    if (memoryIds.length === 0) return [];
+    const userId = this.requireUserId();
+    const seeds = new Set(memoryIds);
+
+    // 1) 这些记忆里的实体
+    const startNodes = await this.db
+      .select({ id: kgNodes.id })
+      .from(kgNodes)
+      .where(and(eq(kgNodes.userId, userId), inArray(kgNodes.memoryId, memoryIds)));
+    if (startNodes.length === 0) return [];
+    const startIds = startNodes.map((node) => node.id);
+
+    // 2) 直接相连的实体（两个方向）
+    const edges = await this.db
+      .select({ fromId: kgEdges.fromId, toId: kgEdges.toId })
+      .from(kgEdges)
+      .where(and(eq(kgEdges.userId, userId), or(inArray(kgEdges.fromId, startIds), inArray(kgEdges.toId, startIds))));
+
+    const startSet = new Set(startIds);
+    const neighborIds = new Set<string>();
+    for (const edge of edges) {
+      if (startSet.has(edge.fromId)) neighborIds.add(edge.toId);
+      if (startSet.has(edge.toId)) neighborIds.add(edge.fromId);
+    }
+    for (const id of startSet) neighborIds.delete(id);
+    if (neighborIds.size === 0) return [];
+
+    // 3) 邻居实体指向的其他记忆
+    const rows = await this.db
+      .select({ memoryId: kgNodes.memoryId })
+      .from(kgNodes)
+      .where(and(eq(kgNodes.userId, userId), inArray(kgNodes.id, [...neighborIds]), isNotNull(kgNodes.memoryId)));
+
+    const wanted = [
+      ...new Set(
+        rows
+          .map((row) => row.memoryId)
+          .filter((id): id is string => typeof id === 'string' && !seeds.has(id)),
+      ),
+    ].slice(0, limit);
+    if (wanted.length === 0) return [];
+
+    const related = await this.db
+      .select()
+      .from(memories)
+      .where(and(eq(memories.userId, userId), eq(memories.status, 'active'), inArray(memories.id, wanted)));
+
+    return related.map(toMemory);
+  }
+
   async listGraph(): Promise<Graph> {
     const userId = this.requireUserId();
     const [nodes, edges] = await Promise.all([

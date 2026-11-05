@@ -943,13 +943,19 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
       }
     }
 
-    const items = await store.searchMemories({ query, embedding, limit: 8 });
-    if (items.length === 0) return '';
+    const direct = await store.searchMemories({ query, embedding, limit: 8 });
+    if (direct.length === 0) return '';
+
+    // 图谱扩展：沿实体关系再捞一跳，补上语义没召回但相关的记忆
+    const directIds = new Set(direct.map((memory) => memory.id));
+    const related = await store.expandFromMemories([...directIds], 4).catch(() => []);
+    const items = [...direct, ...related.filter((memory) => !directIds.has(memory.id))];
 
     const lines = items.slice(0, 20).map((memory) => {
       const body = memory.body.replace(/\s+/g, ' ').slice(0, 200);
       const note = memory.description ? `（${memory.description}）` : '';
-      return `- [${memory.kind}] ${memory.title}${note}：${body}`;
+      const linked = directIds.has(memory.id) ? '' : '（关联记忆）';
+      return `- [${memory.kind}]${linked} ${memory.title}${note}：${body}`;
     });
 
     return ['', '## 用户的记忆（跨会话）', ...lines, '这些是长期有效的偏好与背景，默认按它们行事；和当前指令冲突时以当前指令为准。'].join('\n');

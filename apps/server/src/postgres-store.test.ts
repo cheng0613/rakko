@@ -172,3 +172,20 @@ test('同一会话 20 条并发追加：全部成功且 seq 不重复', { skip: 
     await store.close();
   }
 });
+
+test('语义检索的 HNSW 索引确实建在库里', { skip: !databaseUrl }, async () => {
+  const handle = createDb(databaseUrl!, { max: 2 });
+  await migrateDb(handle);
+
+  try {
+    const rows = await handle.sql<{ indexdef: string }[]>`
+      select indexdef from pg_indexes
+      where tablename = 'memories' and indexname = 'memories_embedding_hnsw'
+    `;
+    assert.equal(rows.length, 1, '迁移应该建出 memories_embedding_hnsw');
+    assert.match(rows[0]?.indexdef ?? '', /USING hnsw/);
+    assert.match(rows[0]?.indexdef ?? '', /vector_cosine_ops/);
+  } finally {
+    await handle.close();
+  }
+});

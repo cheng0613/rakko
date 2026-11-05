@@ -966,3 +966,57 @@ test('记忆段会按查询挑：相关的进系统提示，不相关的排在�
   assert.ok(first < second, '相关的应该排在前面');
   await app.close();
 });
+
+test('图谱扩展：语义只召回一条，靠关系把相邻记忆也带进来', async () => {
+  const store = new MemoryStore();
+
+  // A 与查询语义相近；B 语义无关，但和 A 共享实体「Postgres」
+  const a = await store.createMemory({ kind: 'project', title: 'Postgres 独占事实源', body: '不做本地缓存。', embedding: [1, 0, 0] });
+  const b = await store.createMemory({ kind: 'feedback', title: '迁移必须先备份', body: '改表结构前先 dump。', embedding: [0, 1, 0] });
+
+  await store.saveTriples(a.id, [{ from: 'Rakko', fromKind: 'project', relation: '使用', to: 'Postgres', toKind: 'tool' }]);
+  await store.saveTriples(b.id, [{ from: 'Postgres', fromKind: 'tool', relation: '变更', to: '迁移备份', toKind: 'concept' }]);
+
+  const direct = await store.searchMemories({ query: '数据库', embedding: [1, 0, 0], limit: 8 });
+  assert.equal(direct[0]?.id, a.id);
+
+  const related = await store.expandFromMemories([a.id], 4);
+  assert.deepEqual(related.map((memory) => memory.title), ['迁移必须先备份']);
+});
+
+test('图谱扩展后的记忆会带「关联记忆」标记进系统提示', async () => {
+  const seen: string[] = [];
+  const provider: ModelProvider = {
+    id: 'peek-graph',
+    async *stream(request) {
+      seen.push(request.messages[0]?.content ?? '');
+      yield { kind: 'delta', text: '好。' };
+      yield { kind: 'done', finishReason: 'stop' };
+    },
+  };
+
+  const store = new MemoryStore();
+  // A 与查询同向；B 反向（语义上前 8 名进不去）；再放 7 条中性的把名额占满
+  const a = await store.createMemory({ kind: 'project', title: 'Postgres 独占事实源', body: '不做本地缓存。', embedding: [1, 0] });
+  const b = await store.createMemory({ kind: 'feedback', title: '迁移必须先备份', body: '改表结构前先 dump。', embedding: [-1, 0] });
+  for (let i = 0; i < 7; i += 1) {
+    await store.createMemory({ kind: 'user', title: `中性记忆 ${i}`, body: '和数据库无关', embedding: [0, 1] });
+  }
+
+  await store.saveTriples(a.id, [{ from: 'Rakko', relation: '使用', to: 'Postgres', fromKind: 'project', toKind: 'tool' }]);
+  await store.saveTriples(b.id, [{ from: 'Postgres', relation: '变更', to: '迁移备份', fromKind: 'tool', toKind: 'concept' }]);
+
+  const embeddings = { model: 'stub', dims: 2, embed: async () => [[1, 0]] };
+  const gateway = new ProviderGateway({ provider, models: FAKE_MODELS, firstChunkTimeoutMs: 2_000 });
+  const app = createApp({ store, gateway, embeddings });
+
+  const thread = (await app.inject({ method: 'POST', url: '/v1/threads', payload: {} })).json();
+  const run = (await app.inject({ method: 'POST', url: '/v1/runs', payload: { threadId: thread.id, prompt: '数据库用什么' } })).json();
+  await waitFor(app, run.id, (body) => body.state === 'succeeded');
+
+  const system = seen[0] ?? '';
+  assert.match(system, /Postgres 独占事实源/);
+  assert.match(system, /迁移必须先备份/, '相邻记忆要被带进来');
+  assert.ok(system.includes('[feedback]（关联记忆）'), '要标出来源');
+  await app.close();
+});

@@ -90,6 +90,8 @@ export interface RunStore {
   }): Promise<Memory>;
   /** 语义检索（没有向量时退回关键词），只返回 active 的记忆 */
   searchMemories(options: MemorySearchOptions): Promise<Memory[]>;
+  /** 图谱扩展：沿实体关系找 1 跳内的相邻记忆 */
+  expandFromMemories(memoryIds: string[], limit: number): Promise<Memory[]>;
   /** 知识图谱快照 */
   listGraph(): Promise<Graph>;
   /** 把一条记忆抽出的三元组写进图谱 */
@@ -278,6 +280,38 @@ export class MemoryStore implements RunStore {
     const rest = scored.filter((item) => item.score === 0).sort((a, b) => b.memory.updatedAt.localeCompare(a.memory.updatedAt));
 
     return [...matched, ...rest].slice(0, options.limit).map((item) => item.memory);
+  }
+
+  async expandFromMemories(memoryIds: string[], limit: number): Promise<Memory[]> {
+    if (memoryIds.length === 0) return [];
+    const seeds = new Set(memoryIds);
+
+    // 1) 这些记忆里的实体
+    const startNodes = [...this.graphNodes.values()].filter((node) => node.memoryId && seeds.has(node.memoryId));
+    if (startNodes.length === 0) return [];
+    const startIds = new Set(startNodes.map((node) => node.id));
+
+    // 2) 与它们直接相连的实体
+    const neighborIds = new Set<string>();
+    for (const edge of this.graphEdges.values()) {
+      if (startIds.has(edge.fromId)) neighborIds.add(edge.toId);
+      if (startIds.has(edge.toId)) neighborIds.add(edge.fromId);
+    }
+    for (const id of startIds) neighborIds.delete(id);
+
+    // 3) 邻居实体指向的其他记忆
+    const out: Memory[] = [];
+    const seen = new Set<string>();
+    for (const node of this.graphNodes.values()) {
+      if (!neighborIds.has(node.id) || !node.memoryId) continue;
+      if (seeds.has(node.memoryId) || seen.has(node.memoryId)) continue;
+      const memory = this.memories.get(node.memoryId);
+      if (!memory || memory.status === 'pending') continue;
+      seen.add(memory.id);
+      out.push(memory);
+      if (out.length >= limit) break;
+    }
+    return out;
   }
 
   async listGraph(): Promise<Graph> {
