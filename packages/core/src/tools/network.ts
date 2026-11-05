@@ -156,7 +156,7 @@ export function createSecondToolset(options: SecondToolsetOptions): ToolSpec[] {
     {
       name: 'apply_patch',
       description:
-        '按「原文 → 新文」精确替换来改文件。old 必须在文件里唯一出现；凭空改不了，也改不歧义的地方。需要用户审批。',
+        '按「原文 → 新文」精确替换来改文件。old 必须在文件里唯一出现；凭空改不了，也改不歧义的地方。需要用户审批。写法：{ path, hunks: [{ old, new }] }（单处改动也可以直接给 path/old/new）。',
       risk: 'high',
       requiresApproval: true,
       parameters: z.object({
@@ -168,17 +168,25 @@ export function createSecondToolset(options: SecondToolsetOptions): ToolSpec[] {
               new: z.string().describe('替换成什么，可以是空字符串（等于删除）'),
             }),
           )
-          .min(1)
-          .max(20),
+          .max(20)
+          .optional(),
+        // 单处改动的简写；模型经常把 old/new 提到顶层
+        old: z.string().min(1).optional(),
+        new: z.string().optional(),
       }),
-      run: async (args: { path: string; hunks: Array<{ old: string; new: string }> }) => {
+      run: async (args: { path: string; hunks?: Array<{ old: string; new: string }>; old?: string; new?: string }) => {
+        const hunks = args.hunks ?? (args.old ? [{ old: args.old, new: args.new ?? '' }] : null);
+        if (!hunks || hunks.length === 0) {
+          throw new Error('参数不合法：需要 hunks: [{ old, new }]（或单处变动直接给 path/old/new）');
+        }
+
         const target = resolveInside(workspace, args.path);
         const before = await readFile(target, 'utf8');
         let after = before;
         let added = 0;
         let removed = 0;
 
-        for (const [index, hunk] of args.hunks.entries()) {
+        for (const [index, hunk] of hunks.entries()) {
           const occurrences = after.split(hunk.old).length - 1;
           if (occurrences === 0) {
             throw new Error(`第 ${index + 1} 处：文件里找不到这段原文。先读一遍文件再改。`);
@@ -193,7 +201,7 @@ export function createSecondToolset(options: SecondToolsetOptions): ToolSpec[] {
 
         if (after === before) return `${args.path}：内容没变化，没有写盘`;
         await writeFile(target, after, 'utf8');
-        return `${args.path}：${args.hunks.length} 处改动（-${removed} 行 / +${added} 行），已写盘`;
+        return `${args.path}：${hunks.length} 处改动（-${removed} 行 / +${added} 行），已写盘`;
       },
     },
     {

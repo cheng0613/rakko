@@ -66,6 +66,41 @@ test('九张表真的写进 Postgres，重启后还读得到', { skip: !database
   }
 });
 
+test('并发追加 5 条消息全部成功，seq 不重复', { skip: !databaseUrl }, async () => {
+  const handle = createDb(databaseUrl!, { max: 10 });
+  await migrateDb(handle);
+
+  const email = `concurrent-append-${Date.now()}@rakko.app`;
+  const store = new PostgresStore(handle, { email, plan: 'free' });
+  await store.ready();
+
+  try {
+    const thread = await store.createThread('并发写消息');
+    const N = 5;
+
+    const results = await Promise.all(
+      Array.from({ length: N }, (_, i) =>
+        store.appendMessage({ threadId: thread.id, role: 'user', text: `并发消息 ${i + 1}` }),
+      ),
+    );
+
+    assert.equal(results.length, N, `期望 ${N} 条全部成功，实际返回 ${results.length} 条`);
+
+    // 直接查库验证 seq 不重复
+    const rows = await handle.db.query.messages.findMany({
+      where: (messages, { eq }) => eq(messages.threadId, thread.id),
+      columns: { seq: true },
+      orderBy: (messages, { asc }) => [asc(messages.seq)],
+    });
+    const seqs = rows.map((r) => r.seq);
+    assert.equal(seqs.length, N, `库中应有 ${N} 条消息`);
+    assert.equal(new Set(seqs).size, N, `seq 不应重复，实际 seqs: ${JSON.stringify(seqs)}`);
+  } finally {
+    await handle.sql`delete from users where email = ${email}`;
+    await store.close();
+  }
+});
+
 test('进程重启：queued/running 标失败，waiting_approval 留待恢复', { skip: !databaseUrl }, async () => {
   const handle = createDb(databaseUrl!, { max: 2 });
   await migrateDb(handle);
@@ -102,6 +137,36 @@ test('进程重启：queued/running 标失败，waiting_approval 留待恢复', 
     assert.ok(mine, 'should be resumable');
     assert.equal(mine?.pending?.callId, 'call_wait');
     assert.equal(mine?.pending?.name, 'write_file');
+  } finally {
+    await handle.sql`delete from users where email = ${email}`;
+    await store.close();
+  }
+});
+
+test('同一会话 20 条并发追加：全部成功且 seq 不重复', { skip: !databaseUrl }, async () => {
+  const handle = createDb(databaseUrl!, { max: 10 });
+  await migrateDb(handle);
+
+  const email = `stress-append-${Date.now()}@rakko.app`;
+  const store = new PostgresStore(handle, { email, plan: 'free' });
+  await store.ready();
+
+  try {
+    const thread = await store.createThread('并发压测');
+    const N = 20;
+    const results = await Promise.allSettled(
+      Array.from({ length: N }, (_, i) => store.appendMessage({ threadId: thread.id, role: 'user', text: `并发 ${i}` })),
+    );
+
+    const rejected = results.filter((item) => item.status === 'rejected');
+    assert.equal(rejected.length, 0, `不该有失败，实际失败 ${rejected.length} 条：${String(rejected[0]?.reason ?? '')}`);
+
+    const [row] = await handle.sql<{ count: number; distinct: number }[]>`
+      select count(*)::int as count, count(distinct seq)::int as distinct
+      from messages where thread_id = ${thread.id}
+    `;
+    assert.equal(row?.count, N);
+    assert.equal(row?.distinct, N, 'seq 不能重复');
   } finally {
     await handle.sql`delete from users where email = ${email}`;
     await store.close();

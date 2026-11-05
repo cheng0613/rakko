@@ -267,6 +267,7 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
       '2. 改完必须验证：跑相关测试或命令；失败就读输出找原因再改，不要靠猜。',
       '3. 没验证就不要说「完成了」。做不到就直说卡在哪一步。',
       '4. 不要假装执行过工具：只有工具结果里出现的东西才算做过。',
+      '5. 探索要克制：一次 grep + 一两次 read 就该动手；连续三个只读步骤还没改动，说明该改了。',
       '',
       '## 回答',
       '- 用中文，简洁，先说结论。代码、命令、路径、标识符保持原样。',
@@ -322,7 +323,8 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
 
     const finish = async (state: RunState, error?: string): Promise<void> => {
       await flushSegment();
-      await store.patchRun(run.id, { state, finishedAt: at(), ...(error ? { error } : {}) });
+      // 成功/取消都要把 error 清空：否则中途被误标过错的运行会一直挂着旧错误
+      await store.patchRun(run.id, { state, finishedAt: at(), error: error ?? null });
       await emit({ type: 'run.state', runId: run.id, at: at(), state });
       await emit({ type: 'run.done', runId: run.id, at: at(), state });
     };
@@ -537,9 +539,11 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
         return;
       }
       if (outcome.stopped === 'max_steps') {
-        const reason = `到步数上限（${outcome.steps} 轮）先停一下，任务可能没做完`;
-        await store.patchRun(run.id, { error: reason });
+        const reason = `到步数上限（${outcome.steps} 轮）先停一下，任务没做完`;
         await emit({ type: 'run.delta', runId: run.id, at: at(), text: `（${reason}）\n` });
+        await store.chargeRun(run);
+        await finish('failed', reason);
+        return;
       }
 
       await store.chargeRun(run);

@@ -103,10 +103,11 @@ export class PostgresStore implements RunStore {
    * waiting_approval 是可恢复的：审批还挂在库里，重启后接着等人点头。
    */
   async recoverOrphans(): Promise<number> {
+    // 只清自己账号下的：这是「启动时收尸」，不是可以随便调用的全局重写
     const rows = await this.db
       .update(runs)
       .set({ state: 'failed', error: '服务重启，这次运行被中断了', finishedAt: new Date() })
-      .where(inArray(runs.state, ['queued', 'running']))
+      .where(and(eq(runs.userId, this.requireUserId()), inArray(runs.state, ['queued', 'running'])))
       .returning({ id: runs.id });
     return rows.length;
   }
@@ -187,23 +188,38 @@ export class PostgresStore implements RunStore {
   }
 
   async appendMessage(input: AppendMessageInput): Promise<Message> {
-    const [row] = await this.db
-      .insert(messages)
-      .values({
-        threadId: input.threadId,
-        role: input.role,
-        kind: input.kind ?? 'text',
-        text: input.text,
-        payload: input.payload ?? null,
-        runId: input.runId ?? null,
-        // seq 交给数据库算：唯一索引 (thread_id, seq) 会在并发时挡住重复
-        seq: sql`coalesce((select max(${messages.seq}) from ${messages} where ${messages.threadId} = ${input.threadId}), 0) + 1`,
-      })
-      .returning();
-    if (!row) throw new Error('写消息失败');
+    /**
+     * seq 必须在「读 max + 写」之间不被插队，否则并发会撞 (thread_id, seq) 唯一索引。
+     * 只靠重试能撑住小并发，压到 20 并发就开始丢消息（实测 16/20）。
+     * 所以用会话行当锁：同一会话的追加排队进行，不同会话互不影响。
+     */
+    const created = await this.db.transaction(async (tx) => {
+      const [locked] = await tx
+        .select({ id: threads.id })
+        .from(threads)
+        .where(eq(threads.id, input.threadId))
+        .for('update');
+      if (!locked) throw new Error(`会话 ${input.threadId} 不存在，写不了消息`);
 
-    await this.db.update(threads).set({ updatedAt: row.createdAt }).where(eq(threads.id, input.threadId));
-    return toMessage(row);
+      const [row] = await tx
+        .insert(messages)
+        .values({
+          threadId: input.threadId,
+          role: input.role,
+          kind: input.kind ?? 'text',
+          text: input.text,
+          payload: input.payload ?? null,
+          runId: input.runId ?? null,
+          seq: sql`coalesce((select max(${messages.seq}) from ${messages} where ${messages.threadId} = ${input.threadId}), 0) + 1`,
+        })
+        .returning();
+      if (!row) throw new Error('写消息失败');
+
+      await tx.update(threads).set({ updatedAt: row.createdAt }).where(eq(threads.id, input.threadId));
+      return row;
+    });
+
+    return toMessage(created);
   }
 
   async createRun(input: CreateRunInput): Promise<Run> {
