@@ -12,9 +12,9 @@ import { and, asc, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import type { DbHandle } from '@rakko/db';
 import { messages, runEvents, runs, threads, usageLedger, users } from '@rakko/db';
 import { currentPeriod, decideQuota, periodStart, planLimit, type QuotaDecision } from '@rakko/core';
-import type { Message, MessageKind, Run, RunEvent, RunState, Thread, Usage } from '@rakko/protocol';
+import type { Message, MessageKind, RiskLevel, Run, RunEvent, RunState, Thread, Usage } from '@rakko/protocol';
 
-import type { AppendMessageInput, CreateRunInput, Listener, RunPatch, RunStore } from './store.js';
+import type { AppendMessageInput, CreateRunInput, Listener, PendingCall, ResumableRun, RunPatch, RunStore } from './store.js';
 
 const iso = (value: Date | null): string | null => (value ? value.toISOString() : null);
 
@@ -98,14 +98,60 @@ export class PostgresStore implements RunStore {
     await this.handle.close();
   }
 
-  /** 半路被重启打断的运行没有进程在推了，留在这里会把界面骗成「还在跑」。 */
+  /**
+   * 只有 queued / running 真的没救了（没有进程在推事件流）。
+   * waiting_approval 是可恢复的：审批还挂在库里，重启后接着等人点头。
+   */
   async recoverOrphans(): Promise<number> {
     const rows = await this.db
       .update(runs)
       .set({ state: 'failed', error: '服务重启，这次运行被中断了', finishedAt: new Date() })
-      .where(inArray(runs.state, ['queued', 'running', 'waiting_approval']))
+      .where(inArray(runs.state, ['queued', 'running']))
       .returning({ id: runs.id });
     return rows.length;
+  }
+
+  /** 找所有还在等审批的运行，并翻出那条没有结论的调用 */
+  async resumableRuns(): Promise<ResumableRun[]> {
+    const rows = await this.db.select().from(runs).where(eq(runs.state, 'waiting_approval'));
+    const out: ResumableRun[] = [];
+
+    for (const row of rows) {
+      const items = await this.listMessages(row.threadId);
+      const decided = new Set(
+        items.filter((item) => item.kind === 'approval_decision').map((item) => String(item.payload?.callId ?? '')),
+      );
+      const waiting = [...items]
+        .reverse()
+        .find((item) => item.kind === 'approval' && !decided.has(String(item.payload?.callId ?? '')));
+
+      const run = toRun(row);
+      if (!waiting) {
+        out.push({ run, pending: null });
+        continue;
+      }
+
+      const payload = waiting.payload ?? {};
+      const pending: PendingCall = {
+        callId: String(payload.callId ?? ''),
+        name: String(payload.name ?? ''),
+        args: (payload.args as Record<string, unknown>) ?? {},
+        risk: (payload.risk as RiskLevel) ?? 'high',
+      };
+      out.push({ run, pending });
+    }
+
+    return out;
+  }
+
+  async latestRunForThread(threadId: string): Promise<Run | undefined> {
+    const [row] = await this.db
+      .select()
+      .from(runs)
+      .where(eq(runs.threadId, threadId))
+      .orderBy(desc(runs.createdAt))
+      .limit(1);
+    return row ? toRun(row) : undefined;
   }
 
   async listThreads(): Promise<Thread[]> {

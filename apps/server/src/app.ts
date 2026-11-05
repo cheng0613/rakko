@@ -9,6 +9,8 @@ import {
   FakeProvider,
   ProviderGateway,
   ToolRegistry,
+  type AgentHooks,
+  type ChatMessage,
   type ModelProvider,
   type ModelTier,
 } from '@rakko/core';
@@ -16,12 +18,13 @@ import {
   approvalDecisionSchema,
   createRunInput,
   createThreadInput,
+  type Message,
   type Run,
   type RunEvent,
   type RunState,
 } from '@rakko/protocol';
 
-import { MemoryStore, type RunStore } from './store.js';
+import { MemoryStore, type PendingCall, type RunStore } from './store.js';
 
 const invalid = (issues: unknown[]) => ({ error: 'invalid_request', message: '请求体不合法', issues });
 
@@ -98,6 +101,14 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
     const parsed = createThreadInput.safeParse(request.body ?? {});
     if (!parsed.success) return reply.code(400).send(invalid(parsed.error.issues));
     return reply.code(201).send(await store.createThread(parsed.data.title));
+  });
+
+  app.get('/v1/threads/:id', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const thread = await store.getThread(id);
+    if (!thread) return reply.code(404).send({ error: 'thread_not_found', message: '会话不存在' });
+    const latestRun = (await store.latestRunForThread(id)) ?? null;
+    return { thread, latestRun, pendingApprovals: latestRun ? gate.list(latestRun.id) : [] };
   });
 
   app.get('/v1/threads/:id/messages', async (request, reply) => {
@@ -209,7 +220,48 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
     return reply;
   });
 
-  async function drive(run: Run, tier: ModelTier, notice: string | null): Promise<void> {
+  /** 把落库的消息还原成模型能读的历史（tool 消息必须带 toolCallId） */
+  function buildHistory(items: Message[]): ChatMessage[] {
+    const history: ChatMessage[] = [];
+    for (const item of items) {
+      const payload = item.payload ?? {};
+      if (item.kind === 'text' && item.role === 'user') {
+        history.push({ role: 'user', content: item.text });
+      } else if (item.kind === 'text' && item.role === 'assistant') {
+        history.push({ role: 'assistant', content: item.text });
+      } else if (item.kind === 'tool_call') {
+        const call = {
+          id: String(payload.callId ?? ''),
+          name: String(payload.name ?? ''),
+          args: (payload.args as Record<string, unknown>) ?? {},
+        };
+        const last = history.at(-1);
+        if (last && last.role === 'assistant' && last.toolCalls) last.toolCalls.push(call);
+        else history.push({ role: 'assistant', content: '', toolCalls: [call] });
+      } else if (item.kind === 'tool_result') {
+        history.push({
+          role: 'tool',
+          toolCallId: String(payload.callId ?? ''),
+          name: String(payload.name ?? ''),
+          content: JSON.stringify({ ok: payload.ok, output: payload.output }),
+        });
+      }
+      // approval / approval_decision / notice 不是模型上下文
+    }
+    return history;
+  }
+
+  /**
+   * 一次运行的实际执行：流、工具、审批、落库都在这里。
+   * drive() 从一句新指令开始；resumeRun() 从库里的历史 + 一个还挂着的审批继续。
+   */
+  async function executeRun(
+    run: Run,
+    tier: ModelTier,
+    messages: ChatMessage[],
+    pending: PendingCall | null,
+    notice: string | null,
+  ): Promise<void> {
     const at = (): string => new Date().toISOString();
     const emit = (event: RunEvent): Promise<void> => store.publish(event);
     const controller = new AbortController();
@@ -242,126 +294,173 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
       await store.appendMessage({ threadId: run.threadId, role, kind, text, payload, runId: run.id });
     };
 
+    const hooks: AgentHooks = {
+      onChunk: async (chunk) => {
+        if (chunk.kind === 'delta') {
+          segment += chunk.text;
+          await emit({ type: 'run.delta', runId: run.id, at: at(), text: chunk.text });
+        } else if (chunk.kind === 'reasoning') {
+          await emit({ type: 'run.reasoning', runId: run.id, at: at(), text: chunk.text });
+        } else if (chunk.kind === 'fallback') {
+          await store.patchRun(run.id, { model: gateway.models[chunk.to] });
+          await flushSegment();
+          await record(
+            'notice',
+            'system',
+            { reason: 'fallback', detail: chunk.reason, from: chunk.from, to: chunk.to },
+            chunk.reason,
+          );
+          await emit({
+            type: 'run.fallback',
+            runId: run.id,
+            at: at(),
+            from: chunk.from,
+            to: chunk.to,
+            reason: chunk.reason,
+          });
+        }
+      },
+
+      onToolCall: async (call) => {
+        await flushSegment();
+        await record('tool_call', 'assistant', { callId: call.id, name: call.name, args: call.args });
+        await emit({
+          type: 'run.tool_call',
+          runId: run.id,
+          at: at(),
+          callId: call.id,
+          name: call.name,
+          args: call.args,
+        });
+      },
+
+      onToolResult: async (call, result) => {
+        await record('tool_result', 'tool', {
+          callId: call.id,
+          name: call.name,
+          ok: result.ok,
+          output: result.output,
+          durationMs: result.durationMs,
+        });
+        await emit({
+          type: 'run.tool_result',
+          runId: run.id,
+          at: at(),
+          callId: call.id,
+          ok: result.ok,
+          output: result.output,
+        });
+      },
+
+      approve: async (call, tool) => {
+        await flushSegment();
+        await store.patchRun(run.id, { state: 'waiting_approval' });
+        await record('approval', 'system', {
+          callId: call.id,
+          name: call.name,
+          risk: tool.risk,
+          args: call.args,
+        });
+        await emit({
+          type: 'run.approval_requested',
+          runId: run.id,
+          at: at(),
+          callId: call.id,
+          name: call.name,
+          risk: tool.risk,
+          args: call.args,
+        });
+
+        const decision = await gate.request({
+          runId: run.id,
+          callId: call.id,
+          name: call.name,
+          risk: tool.risk,
+          args: call.args,
+        });
+
+        await record('approval_decision', 'system', {
+          callId: call.id,
+          decision: decision.decision,
+          ...(decision.reason ? { reason: decision.reason } : {}),
+        });
+        await emit({
+          type: 'run.approval_decided',
+          runId: run.id,
+          at: at(),
+          callId: call.id,
+          decision: decision.decision,
+          ...(decision.reason ? { reason: decision.reason } : {}),
+        });
+
+        if (!canceled.has(run.id)) await store.patchRun(run.id, { state: 'running' });
+        return decision.decision;
+      },
+    };
+
     try {
-      await store.patchRun(run.id, { state: 'running' });
-      await emit({ type: 'run.started', runId: run.id, at: at() });
-      await emit({ type: 'run.state', runId: run.id, at: at(), state: 'running' });
       if (notice) {
         await record('notice', 'system', { reason: 'quota', detail: notice, from: 'standard', to: 'fast' }, notice);
         await emit({ type: 'run.fallback', runId: run.id, at: at(), from: 'standard', to: 'fast', reason: notice });
       }
 
-      const outcome = await loop.run(
-        {
+      if (pending) {
+        // 重启后接着等同一个审批：不重新发 approval_requested，历史里已经有了
+        const decision = await gate.request({
           runId: run.id,
-          tier,
-          messages: [{ role: 'user', content: run.prompt }],
-          signal: controller.signal,
-        },
-        {
-          onChunk: async (chunk) => {
-            if (chunk.kind === 'delta') {
-              segment += chunk.text;
-              await emit({ type: 'run.delta', runId: run.id, at: at(), text: chunk.text });
-            } else if (chunk.kind === 'reasoning') {
-              await emit({ type: 'run.reasoning', runId: run.id, at: at(), text: chunk.text });
-            } else if (chunk.kind === 'fallback') {
-              await store.patchRun(run.id, { model: gateway.models[chunk.to] });
-              await flushSegment();
-              await record('notice', 'system', {
-                reason: 'fallback',
-                detail: chunk.reason,
-                from: chunk.from,
-                to: chunk.to,
-              }, chunk.reason);
-              await emit({
-                type: 'run.fallback',
-                runId: run.id,
-                at: at(),
-                from: chunk.from,
-                to: chunk.to,
-                reason: chunk.reason,
-              });
-            }
-          },
+          callId: pending.callId,
+          name: pending.name,
+          risk: pending.risk,
+          args: pending.args,
+        });
+        await record('approval_decision', 'system', {
+          callId: pending.callId,
+          decision: decision.decision,
+          ...(decision.reason ? { reason: decision.reason } : {}),
+        });
+        await emit({
+          type: 'run.approval_decided',
+          runId: run.id,
+          at: at(),
+          callId: pending.callId,
+          decision: decision.decision,
+          ...(decision.reason ? { reason: decision.reason } : {}),
+        });
 
-          onToolCall: async (call) => {
-            await flushSegment();
-            await record('tool_call', 'assistant', { callId: call.id, name: call.name, args: call.args });
-            await emit({
-              type: 'run.tool_call',
-              runId: run.id,
-              at: at(),
-              callId: call.id,
-              name: call.name,
-              args: call.args,
-            });
-          },
+        const tool = tools.get(pending.name);
+        await store.patchRun(run.id, { state: 'running' });
+        const result = tool
+          ? await tools.execute(
+              { id: pending.callId, name: pending.name, args: pending.args },
+              { approve: async () => decision.decision },
+            )
+          : { ok: false, output: `没有名为 ${pending.name} 的工具`, durationMs: 0 };
 
-          onToolResult: async (call, result) => {
-            await record('tool_result', 'tool', {
-              callId: call.id,
-              name: call.name,
-              ok: result.ok,
-              output: result.output,
-              durationMs: result.durationMs,
-            });
-            await emit({
-              type: 'run.tool_result',
-              runId: run.id,
-              at: at(),
-              callId: call.id,
-              ok: result.ok,
-              output: result.output,
-            });
-          },
+        await record('tool_result', 'tool', {
+          callId: pending.callId,
+          name: pending.name,
+          ok: result.ok,
+          output: result.output,
+          durationMs: result.durationMs,
+        });
+        await emit({
+          type: 'run.tool_result',
+          runId: run.id,
+          at: at(),
+          callId: pending.callId,
+          ok: result.ok,
+          output: result.output,
+        });
 
-          approve: async (call, tool) => {
-            await flushSegment();
-            await store.patchRun(run.id, { state: 'waiting_approval' });
-            await record('approval', 'system', {
-              callId: call.id,
-              name: call.name,
-              risk: tool.risk,
-              args: call.args,
-            });
-            await emit({
-              type: 'run.approval_requested',
-              runId: run.id,
-              at: at(),
-              callId: call.id,
-              name: call.name,
-              risk: tool.risk,
-              args: call.args,
-            });
+        messages.push({
+          role: 'tool',
+          toolCallId: pending.callId,
+          name: pending.name,
+          content: JSON.stringify(result),
+        });
+      }
 
-            const decision = await gate.request({
-              runId: run.id,
-              callId: call.id,
-              name: call.name,
-              risk: tool.risk,
-              args: call.args,
-            });
-
-            await record('approval_decision', 'system', {
-              callId: call.id,
-              decision: decision.decision,
-              ...(decision.reason ? { reason: decision.reason } : {}),
-            });
-            await emit({
-              type: 'run.approval_decided',
-              runId: run.id,
-              at: at(),
-              callId: call.id,
-              decision: decision.decision,
-              ...(decision.reason ? { reason: decision.reason } : {}),
-            });
-
-            if (!canceled.has(run.id)) await store.patchRun(run.id, { state: 'running' });
-            return decision.decision;
-          },
-        },
-      );
+      const outcome = await loop.run({ runId: run.id, tier, messages, signal: controller.signal }, hooks);
 
       if (canceled.has(run.id)) {
         await finish('canceled');
@@ -391,6 +490,32 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
       canceled.delete(run.id);
     }
   }
+
+  async function drive(run: Run, tier: ModelTier, notice: string | null): Promise<void> {
+    const at = (): string => new Date().toISOString();
+    await store.patchRun(run.id, { state: 'running' });
+    await store.publish({ type: 'run.started', runId: run.id, at: at() });
+    await store.publish({ type: 'run.state', runId: run.id, at: at(), state: 'running' });
+    await executeRun(run, tier, [{ role: 'user', content: run.prompt }], null, notice);
+  }
+
+  /** 重启后恢复：拿库里的历史 + 还挂着的审批，接着跑 */
+  async function resumeRun(run: Run, pending: PendingCall | null): Promise<void> {
+    const items = await store.listMessages(run.threadId);
+    const messages = buildHistory(items);
+    const tier: ModelTier = run.model === gateway.models.fast ? 'fast' : 'standard';
+    await executeRun(run, tier, messages, pending, null);
+  }
+
+  app.addHook('onReady', async () => {
+    const resumable = await store.resumableRuns();
+    for (const item of resumable) {
+      void resumeRun(item.run, item.pending).catch((error: unknown) => {
+        console.error('恢复运行失败：', error);
+      });
+    }
+    if (resumable.length > 0) console.log(`恢复 ${resumable.length} 个等待审批的运行`);
+  });
 
   app.addHook('onClose', async () => {
     for (const timer of timers) clearInterval(timer);

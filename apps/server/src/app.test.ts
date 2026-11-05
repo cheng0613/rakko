@@ -5,10 +5,12 @@ import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
+import { createDb, migrateDb } from '@rakko/db';
 import { createBuiltinTools, ProviderGateway, ToolRegistry } from '@rakko/core';
 import type { ModelProvider, ProviderChunk, ProviderRequest } from '@rakko/core';
 
 import { createApp, FAKE_MODELS, type AppOptions } from './app.js';
+import { PostgresStore } from './postgres-store.js';
 import { MemoryStore } from './store.js';
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -345,4 +347,81 @@ test('SSE 带 Last-Event-ID 只补没看过的事件', async () => {
   assert.equal(resumed.length, all.length - 3);
   assert.deepEqual(resumed.map((event) => event.type), all.slice(3).map((event) => event.type));
   await app.close();
+});
+
+test('线程详情带上最近一次运行，界面刷新后据此决定要不要接着看流', async () => {
+  const store = new MemoryStore();
+  const app = makeApp({ store });
+
+  const thread = (await app.inject({ method: 'POST', url: '/v1/threads', payload: {} })).json();
+  const detailBefore = (await app.inject({ method: 'GET', url: `/v1/threads/${thread.id}` })).json();
+  assert.equal(detailBefore.latestRun, null);
+
+  const run = (await app.inject({ method: 'POST', url: '/v1/runs', payload: { threadId: thread.id, prompt: '跑一下' } })).json();
+  const detail = (await app.inject({ method: 'GET', url: `/v1/threads/${thread.id}` })).json();
+  assert.equal(detail.latestRun.id, run.id);
+  assert.deepEqual(detail.pendingApprovals, []);
+  await app.close();
+});
+
+test('重启后停在等待审批的运行能接着批，把工具跑完', { skip: !process.env.DATABASE_URL }, async () => {
+  const handle = createDb(process.env.DATABASE_URL!, { max: 2 });
+  await migrateDb(handle);
+
+  const email = `resume-${Date.now()}@rakko.app`;
+  const workspace = await mkdtemp(path.join(tmpdir(), 'rakko-resume-'));
+  const tools = new ToolRegistry({ workspace });
+  for (const tool of createBuiltinTools({ workspace })) tools.register(tool);
+
+  // 1) 造出「上一个进程留下的现场」
+  const store1 = new PostgresStore(handle, { email, plan: 'pro' });
+  await store1.ready();
+  const thread = await store1.createThread('重启验收');
+  const run = await store1.createRun({ threadId: thread.id, prompt: '写个文件', model: 'fake-standard' });
+  await store1.patchRun(run.id, { state: 'waiting_approval' });
+  const args = { path: 'note.txt', content: '重启后写的' };
+  await store1.appendMessage({ threadId: thread.id, role: 'user', kind: 'text', text: '写个文件', runId: run.id });
+  await store1.appendMessage({
+    threadId: thread.id, role: 'assistant', kind: 'tool_call',
+    text: '', payload: { callId: 'call_resume', name: 'write_file', args }, runId: run.id,
+  });
+  await store1.appendMessage({
+    threadId: thread.id, role: 'system', kind: 'approval',
+    text: '', payload: { callId: 'call_resume', name: 'write_file', risk: 'high', args }, runId: run.id,
+  });
+
+  // 2) 换一个 store / app，模拟进程重启
+  const store2 = new PostgresStore(handle, { email, plan: 'pro' });
+  await store2.ready();
+  const gateway = new ProviderGateway({ provider: new WriteProvider(), models: FAKE_MODELS, firstChunkTimeoutMs: 2000 });
+  const app2 = createApp({ store: store2, gateway, tools, workspace, approvalTimeoutMs: 60_000 });
+  await app2.ready();
+
+  const resumed = (await app2.inject({ method: 'GET', url: `/v1/runs/${run.id}` })).json();
+  assert.equal(resumed.state, 'waiting_approval');
+  assert.equal(resumed.pendingApprovals.length, 1);
+  assert.equal(resumed.pendingApprovals[0].name, 'write_file');
+
+  const decided = await app2.inject({
+    method: 'POST', url: `/v1/runs/${run.id}/approvals/call_resume`, payload: { decision: 'allow' },
+  });
+  assert.equal(decided.statusCode, 200);
+
+  for (let i = 0; i < 200; i += 1) {
+    const body = (await app2.inject({ method: 'GET', url: `/v1/runs/${run.id}` })).json();
+    if (body.state === 'succeeded' || body.state === 'failed') break;
+    await sleep(20);
+  }
+
+  const final = (await app2.inject({ method: 'GET', url: `/v1/runs/${run.id}` })).json();
+  assert.equal(final.state, 'succeeded');
+  assert.equal(await readFile(path.join(workspace, 'note.txt'), 'utf8'), '重启后写的');
+
+  const items = await store2.listMessages(thread.id);
+  assert.ok(items.some((item) => item.kind === 'approval_decision'), '审批结论要落库');
+  assert.ok(items.some((item) => item.kind === 'tool_result' && item.payload?.ok === true), '工具结果要落库');
+
+  await app2.close();
+  await handle.sql`delete from users where email = ${email}`;
+  await store2.close();
 });

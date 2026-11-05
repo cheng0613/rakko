@@ -105,8 +105,13 @@ docker compose up -d --build                     # db + api 全容器化，api �
 ```
 
 `waiting_approval` 只是等一次点击，不是失败；**被拒也不算失败**——模型会读到拒绝理由并换路子。
-进程重启时，停在 `queued` / `running` / `waiting_approval` 的运行会被标成 `failed`（“服务重启，这次运行被中断了”），
-因为已经没有进程在推它了，留着只会把界面骗成“还在跑”。
+
+**重启是分两种处理的**：
+
+- `queued` / `running` 标成 `failed`（“服务重启，这次运行被中断了”）——没有进程在推事件流，救不回来；
+- `waiting_approval` **接着等**：审批请求早已落库，重启后重新挂起同一个调用，
+  你点「允许」它就接着执行工具、把结果塞回历史、让模型继续往下说。
+  界面刷新时通过 `GET /v1/threads/:id` 拿到 `latestRun` 与待批调用，自动把这条运行接回来看。
 
 ## 界面
 
@@ -186,7 +191,8 @@ GET  /health                                   服务、provider、模型、熔�
 GET  /v1/usage                                 配额（次数制，来自 usage_ledger）
 GET  /v1/threads                               会话列表
 POST /v1/threads                               新建会话
-GET  /v1/threads/:id/messages                  会话消息
+GET  /v1/threads/:id                           线程 + 最近一次运行 + 待批调用（刷新后据此接着看流）
+GET  /v1/threads/:id/messages                  会话消息（含 kind/payload，工具与审批可重放）
 POST /v1/runs                                  发起运行（202，返回 tier/degraded；配额不足时 429）
 GET  /v1/runs/:id                              运行状态 + pendingApprovals
 GET  /v1/runs/:id/events                       SSE 事件流，带 id；重连带 Last-Event-ID 只补没看过的

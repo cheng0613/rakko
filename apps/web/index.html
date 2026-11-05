@@ -937,7 +937,11 @@
     lastModel: '—',
     toolCalls: 0,
     pending: 0,
+    pendingCallId: null,
   };
+
+  /** 历史里最后一条助手消息，恢复运行时把新事件接在它后面 */
+  let historyTurn = null;
 
   /* ---------------- 主题：设计稿用 [data-theme] 定色板 ---------------- */
   const savedTheme = localStorage.getItem('rakko.theme');
@@ -1074,8 +1078,10 @@
     showLanding(false);
 
     let turn = null;
-    const cards = new Map();
-    const gates = new Map();
+    const cards = toolCards;
+    const gates = approvalCards;
+    cards.clear();
+    gates.clear();
     const ensureTurn = (createdAt) => {
       if (!turn) turn = openAssistant(createdAt);
       return turn;
@@ -1103,13 +1109,15 @@
       } else if (message.kind === 'tool_result') {
         cards.get(payload.callId)?.settle(payload.ok, payload.output);
       } else if (message.kind === 'approval') {
+        // 重启后这次运行还挂在 waiting_approval 时，历史里的这张卡就是当前要处理的那张
+        const isPending = payload.callId === state.pendingCallId;
         gates.set(payload.callId, addApproval(
           ensureTurn(message.createdAt),
           { callId: payload.callId, name: payload.name, args: payload.args || {} },
           payload.risk || 'high',
-          new Date(message.createdAt).getTime() + 10 * 60 * 1000,
-          () => {},
-          { interactive: false },
+          isPending ? null : new Date(message.createdAt).getTime() + 10 * 60 * 1000,
+          isPending ? (decision) => decideApproval(payload.callId, decision) : () => {},
+          { interactive: isPending },
         ));
       } else if (message.kind === 'approval_decision') {
         gates.get(payload.callId)?.settle(
@@ -1121,6 +1129,7 @@
       }
     }
 
+    historyTurn = turn;
     scrollBottom();
   };
 
@@ -1255,6 +1264,7 @@
     head.append(riskTag);
     const countdown = make('span', 'gate-left');
     head.append(countdown);
+    if (!expiresAt) countdown.textContent = '等你处理';
 
     const summary = make('div', 'gate-row');
     summary.append(make('span', undefined, '操作'));
@@ -1284,7 +1294,7 @@
     scrollBottom();
 
     let settled = false;
-    const timer = interactive ? setInterval(() => {
+    const timer = interactive && expiresAt ? setInterval(() => {
       const left = new Date(expiresAt).getTime() - Date.now();
       if (!isFinite(left)) { countdown.textContent = '—'; return; }
       if (left <= 0) { countdown.textContent = '到点'; return; }
@@ -1361,6 +1371,7 @@
         break;
       }
       case 'run.approval_requested': {
+        state.pendingCallId = event.callId;
         const tool = toolMeta(event.name);
         const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
         const pendingCard = addApproval(turn, event, event.risk || (tool && tool.risk) || 'high', expiresAt, (decision) => {
@@ -1371,6 +1382,7 @@
         break;
       }
       case 'run.approval_decided': {
+        if (state.pendingCallId === event.callId) state.pendingCallId = null;
         approvalCards.get(event.callId)?.settle(
           event.decision,
           event.reason ? (event.decision === 'allow' ? '已允许：' + event.reason : '已拒绝：' + event.reason) : undefined,
@@ -1456,17 +1468,39 @@
 
   const openThread = async (id) => {
     state.threadId = id;
+    state.pendingCallId = null;
+    closeStream();
+    let latest = null;
     try {
-      const body = await api('/v1/threads/' + id + '/messages');
-      state.messages = body.items || [];
+      const [messages, detail] = await Promise.all([
+        api('/v1/threads/' + id + '/messages'),
+        api('/v1/threads/' + id),
+      ]);
+      state.messages = messages.items || [];
+      latest = detail.latestRun;
+      if (detail.pendingApprovals && detail.pendingApprovals.length > 0) {
+        state.pendingCallId = detail.pendingApprovals[0].callId;
+      }
+      ui.title.textContent = detail.thread ? detail.thread.title : '对话';
     } catch {
       state.messages = [];
     }
-    const thread = state.threads.find((item) => item.id === id);
-    ui.title.textContent = thread ? thread.title : '对话';
     renderHistory();
     renderRecents();
     closeSide();
+
+    // 上次停在等待审批：把这次运行接回来，别人点了同意这边也能看到
+    if (latest && latest.state === 'waiting_approval') {
+      state.running = { id: latest.id };
+      state.lastModel = latest.model;
+      currentTurn = historyTurn;
+      setRunning(true);
+      ui.input.placeholder = '等你点一下「允许」，海獭才动手…';
+      setRunState('等你确认', '这次运行停在审批上', false);
+      // ?nowatch=1：静态截图/预览时不开流，页面才会 idle
+      if (params.get('nowatch') !== '1') listen(latest.id);
+      renderCtx();
+    }
   };
 
   const createThread = async () => {

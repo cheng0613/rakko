@@ -8,7 +8,7 @@
 import { randomUUID } from 'node:crypto';
 
 import { currentPeriod, decideQuota, periodStart, planLimit, type QuotaDecision, type QuotaState } from '@rakko/core';
-import type { Message, MessageKind, MessageRole, Run, RunEvent, Thread, Usage } from '@rakko/protocol';
+import type { Message, MessageKind, MessageRole, RiskLevel, Run, RunEvent, Thread, Usage } from '@rakko/protocol';
 
 export interface AppendMessageInput {
   threadId: string;
@@ -30,13 +30,31 @@ export type RunPatch = Partial<Pick<Run, 'state' | 'error' | 'finishedAt' | 'mod
 
 export type Listener = (event: RunEvent) => void;
 
+/** 重启后还等着人点头的那一次调用 */
+export interface PendingCall {
+  callId: string;
+  name: string;
+  args: Record<string, unknown>;
+  risk: RiskLevel;
+}
+
+export interface ResumableRun {
+  run: Run;
+  /** null 表示审批已经做过、只差继续跑 */
+  pending: PendingCall | null;
+}
+
 export interface RunStore {
   /** 供 /health 区分实现，运维一眼能看出接的哪个 */
   readonly kind: 'memory' | 'postgres';
   /** 建连接、迁移、准备默认用户 */
   ready(): Promise<void>;
-  /** 进程重启后，把停在半路的运行标成失败（否则会永远挂在 waiting_approval） */
+  /** 进程重启后，把停在半路的运行标成失败（queued / running 无法续跑） */
   recoverOrphans(): Promise<number>;
+  /** waiting_approval 的运行：重启后仍可恢复，返回待批的调用 */
+  resumableRuns(): Promise<ResumableRun[]>;
+  /** 线程最近一次运行，界面刷新后据此决定要不要接着看流 */
+  latestRunForThread(threadId: string): Promise<Run | undefined>;
   listThreads(): Promise<Thread[]>;
   getThread(id: string): Promise<Thread | undefined>;
   createThread(title?: string): Promise<Thread>;
@@ -88,6 +106,15 @@ export class MemoryStore implements RunStore {
 
   async recoverOrphans(): Promise<number> {
     return 0;
+  }
+
+  async resumableRuns(): Promise<ResumableRun[]> {
+    return [];
+  }
+
+  async latestRunForThread(threadId: string): Promise<Run | undefined> {
+    const list = [...this.runs.values()].filter((run) => run.threadId === threadId);
+    return list.sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
   }
 
   async listThreads(): Promise<Thread[]> {

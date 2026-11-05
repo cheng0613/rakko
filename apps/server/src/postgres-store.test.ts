@@ -66,7 +66,7 @@ test('九张表真的写进 Postgres，重启后还读得到', { skip: !database
   }
 });
 
-test('进程重启后，半路中断的运行不会被留在 waiting_approval', { skip: !databaseUrl }, async () => {
+test('进程重启：queued/running 标失败，waiting_approval 留待恢复', { skip: !databaseUrl }, async () => {
   const handle = createDb(databaseUrl!, { max: 2 });
   await migrateDb(handle);
 
@@ -76,16 +76,32 @@ test('进程重启后，半路中断的运行不会被留在 waiting_approval', 
 
   try {
     const thread = await store.createThread('孤儿运行');
-    const run = await store.createRun({ threadId: thread.id, prompt: '等我审批', model: 'fast' });
-    await store.patchRun(run.id, { state: 'waiting_approval' });
+    const halfDone = await store.createRun({ threadId: thread.id, prompt: '跑到一半', model: 'fast' });
+    await store.patchRun(halfDone.id, { state: 'running' });
+
+    const args = { path: 'note.txt', content: 'x' };
+    const waiting = await store.createRun({ threadId: thread.id, prompt: '等我审批', model: 'fast' });
+    await store.patchRun(waiting.id, { state: 'waiting_approval' });
+    await store.appendMessage({ threadId: thread.id, role: 'user', kind: 'text', text: '等我审批', runId: waiting.id });
+    await store.appendMessage({
+      threadId: thread.id, role: 'system', kind: 'approval', text: '',
+      payload: { callId: 'call_wait', name: 'write_file', risk: 'high', args }, runId: waiting.id,
+    });
 
     const recovered = await store.recoverOrphans();
     assert.ok(recovered >= 1);
 
-    const after = await store.getRun(run.id);
+    const after = await store.getRun(halfDone.id);
     assert.equal(after?.state, 'failed');
     assert.match(after?.error ?? '', /被中断/);
-    assert.ok(after?.finishedAt);
+
+    // 等审批的那次还活着，并且能翻出那条待批调用
+    assert.equal((await store.getRun(waiting.id))?.state, 'waiting_approval');
+    const resumable = await store.resumableRuns();
+    const mine = resumable.find((item) => item.run.id === waiting.id);
+    assert.ok(mine, 'should be resumable');
+    assert.equal(mine?.pending?.callId, 'call_wait');
+    assert.equal(mine?.pending?.name, 'write_file');
   } finally {
     await handle.sql`delete from users where email = ${email}`;
     await store.close();
