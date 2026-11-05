@@ -20,6 +20,7 @@ import { BUILTIN_SKILLS } from './store.js';
 import type {
   AppendMessageInput,
   CreateRunInput,
+  ForkInput,
   Listener,
   MemorySearchOptions,
   PendingCall,
@@ -272,6 +273,44 @@ export class PostgresStore implements RunStore {
       .where(and(eq(threads.id, id), eq(threads.userId, this.requireUserId())))
       .returning({ id: threads.id });
     return rows.length > 0;
+  }
+
+  async forkThread(input: ForkInput): Promise<{ thread: Thread; copied: number } | null> {
+    const origin = await this.getThread(input.threadId);
+    if (!origin) return null;
+
+    const [target] = await this.db
+      .select({ seq: messages.seq })
+      .from(messages)
+      .where(and(eq(messages.threadId, input.threadId), eq(messages.id, input.messageId)))
+      .limit(1);
+    if (!target) return null;
+
+    const upto = input.includeTarget ? target.seq : target.seq - 1;
+    // 取「seq 小于 upto+1」的前 upto 条；pageMessages 默认是往回取最近一页，别搞反
+    const source =
+      upto > 0
+        ? await this.pageMessages(input.threadId, { limit: upto, beforeSeq: upto + 1 }).then((page) => page.items)
+        : [];
+
+    const thread = await this.createThread(input.title ?? `${origin.title} · 分叉`);
+    if (source.length > 0) {
+      // seq 重新从 1 起，id 交给库生成；时间戳沿用原始值，重放时的先后与原来一致
+      await this.db.insert(messages).values(
+        source.map((message, index) => ({
+          threadId: thread.id,
+          role: message.role,
+          kind: message.kind,
+          text: message.text,
+          payload: message.payload ?? null,
+          runId: message.runId,
+          seq: index + 1,
+          createdAt: new Date(message.createdAt),
+        })),
+      );
+    }
+
+    return { thread, copied: source.length };
   }
 
   async listMessages(threadId: string): Promise<Message[]> {

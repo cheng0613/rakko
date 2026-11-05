@@ -154,6 +154,15 @@ export const messagesQuery = z.object({
 });
 export type MessagesQuery = z.infer<typeof messagesQuery>;
 
+/** 分叉：从某条消息起另开一枝 */
+export const forkThreadInput = z.object({
+  messageId: id,
+  /** 默认 false：只复制这条之前的历史（配合「编辑后重跑」） */
+  includeTarget: z.boolean().optional(),
+  title: z.string().trim().min(1).max(80).optional(),
+});
+export type ForkThreadInput = z.infer<typeof forkThreadInput>;
+
 export const createThreadInput = z.object({
   title: z.string().min(1).max(120).optional(),
 });

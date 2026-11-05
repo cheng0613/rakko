@@ -25,6 +25,7 @@ import {
   createMemoryInput,
   createSkillInput,
   createThreadInput,
+  forkThreadInput,
   messagesQuery,
   updateAutomationInput,
   updateMemoryInput,
@@ -352,6 +353,27 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
     if (!thread) return reply.code(404).send({ error: 'thread_not_found', message: '会话不存在' });
     const latestRun = (await store.latestRunForThread(id)) ?? null;
     return { thread, latestRun, pendingApprovals: latestRun ? gate.list(latestRun.id) : [] };
+  });
+
+  /**
+   * 分叉：从某条消息起另开一枝新会话。
+   * includeTarget=false 时复制到它之前 —— 配合「编辑这句话再问一遍」。
+   */
+  app.post('/v1/threads/:id/fork', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    if (!(await store.getThread(id))) return reply.code(404).send({ error: 'thread_not_found', message: '会话不存在' });
+
+    const parsed = forkThreadInput.safeParse(request.body ?? {});
+    if (!parsed.success) return reply.code(400).send(invalid(parsed.error.issues));
+
+    const result = await store.forkThread({
+      threadId: id,
+      messageId: parsed.data.messageId,
+      includeTarget: parsed.data.includeTarget ?? false,
+      ...(parsed.data.title ? { title: parsed.data.title } : {}),
+    });
+    if (!result) return reply.code(404).send({ error: 'message_not_found', message: '这条消息不在该会话里' });
+    return result;
   });
 
   app.get('/v1/threads/:id/messages', async (request, reply) => {

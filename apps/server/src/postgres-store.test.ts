@@ -224,3 +224,43 @@ test('真库分页：40 条消息按 15 条一页翻完，顺序不乱', { skip:
     await store.close();
   }
 });
+
+test('真库分叉：结构化消息一起搬走，seq 重排，原会话不动', { skip: !databaseUrl }, async () => {
+  const handle = createDb(databaseUrl!, { max: 2 });
+  await migrateDb(handle);
+
+  const email = `fork-${Date.now()}@rakko.app`;
+  const store = new PostgresStore(handle, { email, plan: 'pro' });
+  await store.ready();
+
+  try {
+    const thread = await store.createThread('分叉源');
+    await store.appendMessage({ threadId: thread.id, role: 'user', kind: 'text', text: '读一下 README' });
+    await store.appendMessage({
+      threadId: thread.id,
+      role: 'assistant',
+      kind: 'tool_call',
+      text: '',
+      payload: { callId: 'c1', name: 'read_file', args: { path: 'README.md' } },
+    });
+    const third = await store.appendMessage({ threadId: thread.id, role: 'user', kind: 'text', text: '再总结一下' });
+
+    const forked = await store.forkThread({ threadId: thread.id, messageId: third.id, includeTarget: false });
+    assert.ok(forked);
+    assert.equal(forked.copied, 2);
+
+    const copied = await store.pageMessages(forked.thread.id, { limit: 10 });
+    assert.deepEqual(copied.items.map((m) => m.seq), [1, 2]);
+    assert.deepEqual(copied.items.map((m) => m.kind), ['text', 'tool_call']);
+    assert.deepEqual(copied.items[1]?.payload, { callId: 'c1', name: 'read_file', args: { path: 'README.md' } });
+
+    const origin = await store.pageMessages(thread.id, { limit: 10 });
+    assert.equal(origin.items.length, 3, '原会话三条一条不少');
+
+    const alien = await store.forkThread({ threadId: thread.id, messageId: '00000000-0000-0000-0000-000000000000', includeTarget: true });
+    assert.equal(alien, null, '不存在的消息要返回 null');
+  } finally {
+    await handle.sql`delete from users where email = ${email}`;
+    await store.close();
+  }
+});

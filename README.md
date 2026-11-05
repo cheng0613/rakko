@@ -88,6 +88,14 @@ docker compose up -d --build                     # db + api 全容器化，api �
 - **改名**：点顶栏标题就地编辑，Enter 保存、Esc 取消。
 - **删除**：侧栏会话悬停出 ×，确认后连消息、运行、事件一起删（外键 cascade）。
 - **搜索**：⌘K 聚焦搜索框，按标题实时过滤；回车跳到第一条。`?q=关键词` 也能直接带过滤打开。
+- **消息级操作**：自己说过的话可以改，也可以从任意一条另开一枝。
+  - **分叉**：`POST /v1/threads/:id/fork` `{ messageId, includeTarget?, title? }` ——
+    把历史复制成新会话，原会话一条不动；复制过去的 seq 从 1 重排，结构化消息（工具卡、审批卡）连 payload 一起搬
+  - **编辑并重跑**：就地改那句话 → 从它之前分叉（`includeTarget: false`）→ 用新文字跑一轮。
+    改一句话不再毁掉整条会话，也不用重打上下文
+  - **界面**：自己那条气泡上悬停出「编辑 / 分叉」，回答头上是「记录 / 分叉」；编辑框里 Enter 保存、Esc 取消
+  - **为什么不做「删单条」**：删掉中间一条会让 tool_call 失去配对、seq 断档，
+    分叉已经覆盖了「从头再来」的需求，而删除只会制造不一致的历史
 - **运行记录**：每次运行都能翻账 —— `GET /v1/runs/:id/trace` 返回 run + 全量事件 + 一份体检报告
   （耗时、首响、首字、工具次数与失败数、降级、审批、错误）。界面是右侧抽屉：
   失败条上的「查看记录」、回答头上的「记录」都能打开，Esc 或点背景关掉。
@@ -321,7 +329,8 @@ pnpm --filter @rakko/desktop pack:win     # 出 NSIS 安装包到 release/
 - 窗口大小/位置记在 `%APPDATA%Rakkowindow-state.json`，换过屏幕会退回居中而不是丢到看不见的地方;
 - 内网拉不到 GitHub 时给 bins 镜像：`ELECTRON_BUILDER_BINARIES_MIRROR=https://registry.npmmirror.com/-/binary/electron-builder-binaries/`。
 
-**仍未做**：代码签名与公证、自动更新、托盘/菜单、macOS 与 Linux 的产物。
+**不做签名**：安装包只给自己用，不买证书、不进商店。代价是 SmartScreen 首次运行会拦一下
+（「更多信息 → 仍要运行」），换一次少一套证书维护。仍未做：自动更新、托盘/菜单、macOS 与 Linux 的产物。
 
 启动顺序：先探 `/health`，服务没起就用 Electron 自带的 node
 （`ELECTRON_RUN_AS_NODE=1`）把 `apps/server` 拉起来，等健康检查通过再开窗口；
@@ -331,7 +340,8 @@ pnpm --filter @rakko/desktop pack:win     # 出 NSIS 安装包到 release/
 显式传入的环境变量优先。冒烟会把窗口真实渲染的内容截一张图（`RAKKO_SMOKE_SHOT` 可指定路径），
 所以「页面加载成功」和「真的画出东西了」是两件事，这里验的是后者。
 
-**还没做**：打包成安装包、签名、自动更新。这一轮只是「能双击开」。
+`pack:win` 出来的就是自用安装包：`release/Rakko-<version>-setup.exe`，双击装到当前用户，
+不要管理员权限（NSIS `perMachine: false`），也不签名 —— 首次运行需要在 SmartScreen 里点「仍要运行」。
 
 ## 自己改自己（dogfood）
 

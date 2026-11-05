@@ -1159,3 +1159,64 @@ test('运行记录：接口给出 run + 事件流水 + 体检报告', async () =
   assert.equal(missing.statusCode, 404);
   await app.close();
 });
+
+test('分叉：复制到某条消息之前，原会话一点不动', async () => {
+  const store = new MemoryStore();
+  const provider: ModelProvider = {
+    id: 'fork',
+    async *stream() {
+      yield { kind: 'delta', text: '收到。' };
+      yield { kind: 'done', finishReason: 'stop' };
+    },
+  };
+  const app = createApp({ store, provider });
+
+  const thread = (await app.inject({ method: 'POST', url: '/v1/threads', payload: { title: '原会话' } })).json();
+  const first = await store.appendMessage({ threadId: thread.id, role: 'user', kind: 'text', text: '第一句' });
+  await store.appendMessage({ threadId: thread.id, role: 'assistant', kind: 'text', text: '第一答' });
+  const third = await store.appendMessage({ threadId: thread.id, role: 'user', kind: 'text', text: '第二句' });
+
+  const forked = (await app.inject({
+    method: 'POST',
+    url: `/v1/threads/${thread.id}/fork`,
+    payload: { messageId: third.id },
+  })).json();
+
+  assert.equal(forked.copied, 2, '第三句之前有两条');
+  assert.match(forked.thread.title, /分叉/);
+  const copied = (await app.inject({ method: 'GET', url: `/v1/threads/${forked.thread.id}/messages` })).json();
+  assert.deepEqual(copied.items.map((m: { text: string }) => m.text), ['第一句', '第一答'], '顺序与内容都要保住');
+  assert.deepEqual(copied.items.map((m: { seq: number }) => m.seq), [1, 2], 'seq 从 1 重新排');
+
+  const origin = (await app.inject({ method: 'GET', url: `/v1/threads/${thread.id}/messages` })).json();
+  assert.equal(origin.items.length, 3, '原会话不能被改');
+  assert.equal(origin.items[2].text, '第二句');
+
+  // 连自己一起复制
+  const through = (await app.inject({
+    method: 'POST',
+    url: `/v1/threads/${thread.id}/fork`,
+    payload: { messageId: third.id, includeTarget: true, title: '另开一枝' },
+  })).json();
+  assert.equal(through.copied, 3);
+  assert.equal(through.thread.title, '另开一枝', '可以指定标题');
+
+  // 从第一条之前分叉 = 空会话
+  const empty = (await app.inject({
+    method: 'POST',
+    url: `/v1/threads/${thread.id}/fork`,
+    payload: { messageId: first.id },
+  })).json();
+  assert.equal(empty.copied, 0);
+
+  // 消息不属于这个会话
+  const other = (await app.inject({ method: 'POST', url: '/v1/threads', payload: {} })).json();
+  const alien = await store.appendMessage({ threadId: other.id, role: 'user', kind: 'text', text: '别处的' });
+  const bad = await app.inject({ method: 'POST', url: `/v1/threads/${thread.id}/fork`, payload: { messageId: alien.id } });
+  assert.equal(bad.statusCode, 404);
+
+  const missing = await app.inject({ method: 'POST', url: '/v1/threads/nope/fork', payload: { messageId: third.id } });
+  assert.equal(missing.statusCode, 404);
+
+  await app.close();
+});

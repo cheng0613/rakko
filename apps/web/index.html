@@ -736,6 +736,18 @@
   .messages .older{align-self:center;font-size:12px;padding:6px 16px;border-radius:99px}
   .messages .older:hover{color:var(--text)}
 
+  /* 自己说的话可以改、也可以从这儿另开一枝：悬停才露，平时不占地方 */
+  .msg.user .body{position:relative}
+  .ub-actions{position:absolute;top:-11px;right:0;display:flex;gap:4px;opacity:0;transition:opacity .12s;background:var(--bg);padding:0 2px;border-radius:99px}
+  .msg.user:hover .ub-actions,.msg.user:focus-within .ub-actions{opacity:1}
+  .ub-actions button{font-size:10.5px;color:var(--faint);background:var(--surface);border:1px solid var(--line);border-radius:99px;padding:2px 9px;cursor:pointer}
+  .ub-actions button:hover{color:var(--accent);border-color:var(--accent)}
+  .ub-edit{width:100%;display:flex;flex-direction:column;gap:8px}
+  .ub-edit textarea{width:100%;font:inherit;font-size:14px;line-height:1.55;color:var(--text);background:var(--surface);border:1px solid var(--accent);border-radius:14px;padding:10px 13px;resize:vertical;min-height:64px;outline:none}
+  .ub-edit-actions{display:flex;gap:8px;justify-content:flex-end}
+  .who .fork-link{margin-left:8px;font-size:10.5px;color:var(--faint);background:none;border:0;padding:0;cursor:pointer}
+  .who .fork-link:hover{color:var(--accent)}
+
   /* 运行记录抽屉：右侧滑出，只在排查时才看，所以用安静的字色与细线 */
   .trace{position:fixed;inset:0;z-index:70;display:flex;justify-content:flex-end}
   .trace[hidden]{display:none}
@@ -1547,12 +1559,12 @@
       return turn;
     };
     const turnsWithRun = [];
-    // 一条运行可能只有工具卡、没有正文；只要挂在某个 turn 上，就把「记录」入口挂过去
-    const trackRun = (at, runId) => {
+    // 一条运行可能只有工具卡、没有正文；只要挂在某个 turn 上，就把「记录 / 分叉」入口挂过去
+    const trackTurn = (at, runId, messageId) => {
       const holder = ensureTurn(at);
-      if (!runId) return holder;
-      holder.runId = runId;
-      if (!turnsWithRun.includes(holder)) turnsWithRun.push(holder);
+      if (runId && !holder.runId) holder.runId = runId;
+      if (messageId && !holder.forkMessageId) holder.forkMessageId = messageId;
+      if ((runId || messageId) && !turnsWithRun.includes(holder)) turnsWithRun.push(holder);
       return holder;
     };
 
@@ -1560,16 +1572,16 @@
       const payload = message.payload || {};
 
       if (message.kind === 'text' && message.role === 'user') {
-        pushUserBubble(message.text, false, message.createdAt);
+        pushUserBubble(message.text, false, message.createdAt, message);
         turn = null;
       } else if (message.kind === 'text' && message.role === 'assistant') {
-        appendParagraph(trackRun(message.createdAt, message.runId), message.text);
+        appendParagraph(trackTurn(message.createdAt, message.runId, message.id), message.text);
       } else if (message.kind === 'tool_call') {
         // 兼容早期行：那时用 id 而不是 callId
         payload.callId = payload.callId || payload.id;
         const meta = toolMeta(payload.name);
         cards.set(payload.callId, addTool(
-          trackRun(message.createdAt, message.runId),
+          trackTurn(message.createdAt, message.runId, message.id),
           { callId: payload.callId, name: payload.name, args: payload.args || {} },
           meta ? meta.risk : 'low',
           meta ? meta.approval : false,
@@ -1581,7 +1593,7 @@
         // 重启后这次运行还挂在 waiting_approval 时，历史里的这张卡就是当前要处理的那张
         const isPending = payload.callId === state.pendingCallId;
         gates.set(payload.callId, addApproval(
-          trackRun(message.createdAt, message.runId),
+          trackTurn(message.createdAt, message.runId, message.id),
           { callId: payload.callId, name: payload.name, args: payload.args || {} },
           payload.risk || 'high',
           isPending ? null : new Date(message.createdAt).getTime() + 10 * 60 * 1000,
@@ -1594,11 +1606,14 @@
           payload.reason ? (payload.decision === 'allow' ? '已允许：' + payload.reason : '已拒绝：' + payload.reason) : undefined,
         );
       } else if (message.kind === 'notice') {
-        addNote(trackRun(message.createdAt, message.runId), message.text || payload.detail || '已切换模型', 'fallback');
+        addNote(trackTurn(message.createdAt, message.runId, message.id), message.text || payload.detail || '已切换模型', 'fallback');
       }
     }
 
-    for (const item of turnsWithRun) attachTraceLink(item, item.runId);
+    for (const item of turnsWithRun) {
+      attachTraceLink(item, item.runId);
+      attachForkLink(item, item.forkMessageId);
+    }
 
     historyTurn = turn;
     scrollBottom();
@@ -2082,6 +2097,83 @@
     turn.row.querySelector('.who')?.append(link);
   };
 
+  /** 从这条消息起另开一枝：原会话一条不动 */
+  const startFork = async (messageId, options = {}) => {
+    if (!state.threadId) return null;
+    try {
+      const forked = await api('/v1/threads/' + state.threadId + '/fork', {
+        method: 'POST',
+        body: JSON.stringify(Object.assign({ messageId }, options.includeTarget ? { includeTarget: true } : {})),
+      });
+      await openThread(forked.thread.id);
+      if (!options.silent) toast('已分叉：带过来 ' + forked.copied + ' 条，原会话没动');
+      return forked;
+    } catch (error) {
+      toast('分叉失败：' + error.message);
+      return null;
+    }
+  };
+
+  const attachForkLink = (turn, messageId) => {
+    if (!turn || !messageId || turn.forkLinked) return;
+    turn.forkLinked = true;
+    const link = make('button', 'fork-link', '分叉');
+    link.type = 'button';
+    link.title = '从这条消息另开一个新会话';
+    link.addEventListener('click', () => void startFork(messageId, { includeTarget: true }));
+    turn.row.querySelector('.who')?.append(link);
+  };
+
+  /** 就地改这句话：保存后从它之前分叉，再用新文字重跑 */
+  const startEdit = (bubble, message) => {
+    if (state.running) {
+      toast('等这次运行结束再改');
+      return;
+    }
+    const wrap = make('div', 'ub-edit');
+    const box = document.createElement('textarea');
+    box.value = message.text;
+    box.rows = Math.min(8, Math.max(2, Math.ceil(message.text.length / 40)));
+    const actions = make('div', 'ub-edit-actions');
+    const cancel = make('button', 'btn quiet', '取消');
+    const save = make('button', 'btn primary', '保存并重跑');
+    cancel.type = 'button';
+    save.type = 'button';
+
+    const restore = () => {
+      wrap.replaceWith(bubble);
+    };
+    cancel.addEventListener('click', restore);
+    box.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') restore();
+      if (event.key === 'Enter' && !event.shiftKey) {
+        event.preventDefault();
+        save.click();
+      }
+    });
+
+    save.addEventListener('click', async () => {
+      const text = box.value.trim();
+      if (!text) return;
+      save.disabled = true;
+      save.textContent = '正在分叉…';
+      const forked = await startFork(message.id, { silent: true });
+      if (!forked) {
+        save.disabled = false;
+        save.textContent = '保存并重跑';
+        return;
+      }
+      // 新会话已带上这句之前的历史，接着用新话发出去
+      await sendReal(text);
+    });
+
+    actions.append(cancel, save);
+    wrap.append(box, actions);
+    bubble.replaceWith(wrap);
+    box.focus();
+    box.setSelectionRange(box.value.length, box.value.length);
+  };
+
   /* ---------------- 事件处理 ---------------- */
   let currentTurn = null;
   const toolCards = new Map();
@@ -2266,7 +2358,7 @@
     return thread;
   };
 
-  const pushUserBubble = (text, remember = true, createdAt) => {
+  const pushUserBubble = (text, remember = true, createdAt, message = null) => {
     showLanding(false);
     const row = make('div', 'msg user');
     row.append(make('div', 'avatar sm', 'C'));
@@ -2274,6 +2366,20 @@
     const bubble = make('div', 'ububble');
     bubble.textContent = text;
     body.append(bubble);
+
+    // 有 message.id 才能分叉（历史重放时才有），现场刚发出去的那条等重新打开再做
+    if (message && message.id) {
+      const actions = make('div', 'ub-actions');
+      const edit = make('button', undefined, '编辑');
+      edit.type = 'button';
+      edit.addEventListener('click', () => startEdit(bubble, message));
+      const fork = make('button', undefined, '分叉');
+      fork.type = 'button';
+      fork.addEventListener('click', () => void startFork(message.id, { includeTarget: true }));
+      actions.append(edit, fork);
+      body.append(actions);
+    }
+
     row.append(body);
     ui.messages.append(row);
     if (remember) {

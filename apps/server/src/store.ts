@@ -20,6 +20,14 @@ export interface AppendMessageInput {
   runId?: string | null;
 }
 
+export interface ForkInput {
+  threadId: string;
+  messageId: string;
+  /** true = 连这条消息一起复制；false = 只复制它之前的 */
+  includeTarget: boolean;
+  title?: string;
+}
+
 export interface CreateRunInput {
   threadId: string;
   prompt: string;
@@ -118,6 +126,12 @@ export interface RunStore {
   renameThread(id: string, title: string): Promise<Thread | undefined>;
   deleteThread(id: string): Promise<boolean>;
   listMessages(threadId: string): Promise<Message[]>;
+  /**
+   * 分叉：把某条消息之前（或含它）的历史复制成一个新会话。
+   * 「编辑后再问」= 复制到这条之前，然后用新文本跑一轮；「从这里另开一枝」= 连它一起复制。
+   * 消息找不到就返回 null。
+   */
+  forkThread(input: ForkInput): Promise<{ thread: Thread; copied: number } | null>;
   /** 分页：取比 beforeSeq 更早的 limit 条（升序返回），hasMore 表示还有更早的 */
   pageMessages(threadId: string, options: { limit: number; beforeSeq?: number }): Promise<{ items: Message[]; hasMore: boolean }>;
   appendMessage(input: AppendMessageInput): Promise<Message>;
@@ -569,6 +583,31 @@ export class MemoryStore implements RunStore {
     const stop = end === -1 ? all.length : end;
     const start = Math.max(0, stop - options.limit);
     return { items: all.slice(start, stop), hasMore: start > 0 };
+  }
+
+  async forkThread(input: ForkInput): Promise<{ thread: Thread; copied: number } | null> {
+    const origin = this.threads.get(input.threadId);
+    if (!origin) return null;
+
+    const all = this.messages.get(input.threadId) ?? [];
+    const target = all.find((message) => message.id === input.messageId);
+    if (!target) return null;
+
+    const upto = input.includeTarget ? target.seq : target.seq - 1;
+    const kept = all.filter((message) => message.seq <= upto);
+
+    const thread = await this.createThread(input.title ?? `${origin.title} · 分叉`);
+    for (const message of kept) {
+      await this.appendMessage({
+        threadId: thread.id,
+        role: message.role,
+        kind: message.kind,
+        text: message.text,
+        payload: message.payload ?? null,
+        runId: message.runId,
+      });
+    }
+    return { thread, copied: kept.length };
   }
 
   async appendMessage(input: AppendMessageInput): Promise<Message> {
