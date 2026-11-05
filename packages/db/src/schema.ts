@@ -161,6 +161,8 @@ export const memories = pgTable(
     title: text('title').notNull(),
     description: text('description').notNull(),
     body: text('body').notNull(),
+    /** active = 已生效；pending = 自动提取出来、等用户确认 */
+    status: text('status').notNull().default('active'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },

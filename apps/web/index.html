@@ -706,6 +706,8 @@
 
   .field select{font:inherit;font-size:13px;color:var(--text);background:var(--surface-2);border:1px solid var(--line);border-radius:10px;padding:8px 11px;outline:none}
   .mem-card{display:flex;flex-direction:column;gap:8px}
+  .mem-card.mem-pending{border-color:color-mix(in srgb,var(--accent) 40%,var(--line))}
+  .mem-card .mem-foot .btn.primary{padding:4px 12px}
   .mem-card h3{margin:0;font-size:13.5px;font-weight:560}
   .mem-card .mem-desc{margin:0;font-size:12px;color:var(--muted)}
   .mem-card .mem-body{margin:0;font-size:12.8px;color:var(--text-2);line-height:1.66;white-space:pre-wrap;max-height:96px;overflow:auto}
@@ -1056,6 +1058,13 @@
             </div>
             <div style="padding:0 0 12px">
               <div class="kvbar"><i id="setUsageBar" style="width:0%"></i></div>
+            </div>
+            <div class="set-row">
+              <div class="txt"><b>自动提取记忆</b><span>运行成功后用快档模型挑几条候选，等你确认才生效</span></div>
+              <label class="switch">
+                <input type="checkbox" id="setAutoMemory" />
+                <span class="track"></span>
+              </label>
             </div>
             <div class="set-row">
               <div class="txt"><b>用超了怎么办</b><span id="setDegradeHint">先降级到快模型继续跑，不中断任务</span></div>
@@ -2213,6 +2222,7 @@
       $('#setUsageBar').style.width = pct + '%';
       $('#setUsageBar').style.background = pct >= 100 ? 'var(--orange)' : 'var(--accent)';
       $('#setDegrade').checked = usage.degradeOnExceed !== false;
+      $('#setAutoMemory').checked = !state.settings || state.settings.autoExtractMemory !== false;
       $('#setDegradeHint').textContent = usage.degradeOnExceed === false
         ? '用超了直接拦下，等下周重置'
         : '先降级到快模型继续跑，不中断任务';
@@ -2272,6 +2282,18 @@
         : choice;
       renderSettings();
     });
+  });
+
+  $('#setAutoMemory').addEventListener('change', async (event) => {
+    const next = event.target.checked;
+    try {
+      await api('/v1/settings', { method: 'PATCH', body: JSON.stringify({ autoExtractMemory: next }) });
+      state.settings = { ...(state.settings || {}), autoExtractMemory: next };
+      toast(next ? '运行后会挑记忆候选' : '不再自动提取记忆');
+    } catch (error) {
+      event.target.checked = !next;
+      toast('保存失败：' + error.message);
+    }
   });
 
   $('#setDegrade').addEventListener('change', async (event) => {
@@ -2416,17 +2438,22 @@
   const renderMemories = () => {
     const list = $('#memList');
     list.innerHTML = '';
-    const items = state.memories ?? [];
-    $('#memEmpty').hidden = items.length > 0;
-    $('#memSummary').textContent = items.length > 0
-      ? `共 ${items.length} 条 · ${Object.keys(MEMORY_LABELS).map((kind) => `${MEMORY_LABELS[kind]} ${items.filter((item) => item.kind === kind).length}`).join(' · ')}`
+    const all = state.memories ?? [];
+    const items = [...all.filter((item) => item.status === 'pending'), ...all.filter((item) => item.status !== 'pending')];
+    $('#memEmpty').hidden = all.length > 0;
+    $('#memSummary').textContent = all.length > 0
+      ? `共 ${all.length} 条（${all.filter((item) => item.status === 'pending').length} 条待确认）· ${Object.keys(MEMORY_LABELS).map((kind) => `${MEMORY_LABELS[kind]} ${all.filter((item) => item.kind === kind).length}`).join(' · ')}`
       : '值得跨会话留下的东西';
 
     for (const item of items) {
       const card = make('article', 'card mem-card');
 
+      const pending = item.status === 'pending';
+      if (pending) card.classList.add('mem-pending');
+
       const head = make('div', 'auto-meta');
       head.append(make('span', 'tag ' + (item.kind === 'feedback' ? 'violet' : item.kind === 'project' ? 'accent' : 'mint'), MEMORY_LABELS[item.kind] ?? item.kind));
+      if (pending) head.append(make('span', 'tag orange', '待确认'));
       card.append(head);
 
       card.append(make('h3', undefined, item.title));
@@ -2434,7 +2461,36 @@
       card.append(make('p', 'mem-body', item.body));
 
       const foot = make('div', 'mem-foot');
-      foot.append(make('span', undefined, '更新于 ' + relTime(item.updatedAt)));
+      foot.append(make('span', undefined, pending ? '自动提取 · 采用后才会进系统提示' : '更新于 ' + relTime(item.updatedAt)));
+
+      if (pending) {
+        const adopt = make('button', 'btn primary', '采用');
+        adopt.addEventListener('click', async () => {
+          try {
+            await api('/v1/memories/' + item.id, { method: 'PATCH', body: JSON.stringify({ status: 'active' }) });
+            item.status = 'active';
+            renderMemories();
+            toast('已采用，下次对话就会带上');
+          } catch (error) {
+            toast('采用失败：' + error.message);
+          }
+        });
+        const drop = make('button', 'btn quiet', '忽略');
+        drop.addEventListener('click', async () => {
+          try {
+            await api('/v1/memories/' + item.id, { method: 'DELETE' });
+            state.memories = state.memories.filter((other) => other.id !== item.id);
+            renderMemories();
+          } catch (error) {
+            toast('忽略失败：' + error.message);
+          }
+        });
+        foot.append(adopt, drop);
+        card.append(foot);
+        list.append(card);
+        continue;
+      }
+
       const del = make('button', 'btn quiet', '删除');
       del.addEventListener('click', async () => {
         if (!window.confirm(`删掉「${item.title}」？`)) return;

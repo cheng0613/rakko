@@ -148,6 +148,17 @@ export async function run(args, context) {
   最多 20 条、每条正文截 200 字；和当前指令冲突时以当前指令为准。
 - 记忆不进对话记录，只在系统提示里出现 —— 换会话也生效，删掉就立刻不生效。
 
+**自动提取**：一次运行成功后，用**快档模型**（多花一次调用）从最近 12 条对话里挑最多 3 条候选：
+
+- 四类筛选规则写在提示里：长期偏好 / 纠正过的做法 / 项目稳定事实 / 外部参考；
+- 明确排除：一次性细节、临时状态、能从代码里读到的东西、与已有记忆重复的；
+- **候选是 pending 状态**，记忆页标「待确认」，点「采用」才进系统提示，点「忽略」直接删；
+- 对话短于 120 字就不提取（省一次调用）；模型报错、输出不是 JSON 都当没提取到，绝不影响主流程；
+- 设置页有开关「自动提取记忆」，关掉就完全不调用。
+
+实测：一次对话里我拒绝了一个工具调用，提取器捞出的候选是
+「文档改动要先征得同意 —— 用户拒绝未经确认就改 README」，正好是我想要的那类。
+
 ## 自动化
 
 侧栏「任务与自动化」：一条 cron + 一句任务描述，到点自己起一个运行。
@@ -442,7 +453,7 @@ PATCH /v1/skills/:id                           改内容，或 { enabled } 挂�
 DELETE /v1/skills/:id                          删自建技能（内置给 409）
 GET  /v1/memories                              记忆列表（按更新时间倒序）
 POST /v1/memories                              记一条（kind / title / description / body）
-PATCH /v1/memories/:id                         改
+PATCH /v1/memories/:id                         改（含 status: active/pending）
 DELETE /v1/memories/:id                        删
 GET  /v1/automations                           自动化列表（含 human 描述）
 POST /v1/automations                           新建（名字 / cron / 任务）

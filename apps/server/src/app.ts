@@ -37,6 +37,7 @@ import {
 } from '@rakko/protocol';
 
 import { describeCron, selectDue, validateCron } from './automation.js';
+import { extractMemories } from './memory-extract.js';
 import { MemoryStore, type PendingCall, type RunStore } from './store.js';
 
 const invalid = (issues: unknown[]) => ({ error: 'invalid_request', message: '请求体不合法', issues });
@@ -806,6 +807,9 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
 
       await store.chargeRun(run);
       await finish('succeeded');
+
+      // 记忆自动提取：失败静默，绝不回写运行状态
+      void suggestMemories(run).catch(() => {});
     } catch (error) {
       if (canceled.has(run.id) || controller.signal.aborted) {
         await finish('canceled');
@@ -830,6 +834,40 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
     const history = trimHistory(buildHistory(await store.listMessages(run.threadId)));
     const systemPrompt = buildSystemPrompt() + (await buildSkillSection()) + (await buildMemorySection());
     await executeRun(run, tier, [{ role: 'system', content: systemPrompt }, ...history], null, notice);
+  }
+
+  /** 运行成功后挑几条记忆候选，写进 pending 等用户确认 */
+  const extracting = new Set<string>();
+  async function suggestMemories(run: Run): Promise<void> {
+    if (extracting.has(run.id)) return;
+    const settings = await store.getSettings();
+    if (settings.autoExtractMemory === false) return;
+
+    extracting.add(run.id);
+    try {
+      const items = await store.listMessages(run.threadId);
+      const messages = buildHistory(items);
+      const existing = await store.listMemories();
+      const candidates = await extractMemories({
+        gateway,
+        messages,
+        existingTitles: existing.map((memory) => memory.title),
+        model: gateway.models.fast,
+      });
+
+      for (const candidate of candidates) {
+        await store.createMemory({
+          kind: candidate.kind,
+          title: candidate.title,
+          description: candidate.description ?? '',
+          body: candidate.body,
+          status: 'pending',
+        });
+      }
+      if (candidates.length > 0) console.log(`记忆候选：${candidates.length} 条待确认`);
+    } finally {
+      extracting.delete(run.id);
+    }
   }
 
   /** 挂载的技能若声明了 tools，就取交集；restricted 为 null 表示不限制 */

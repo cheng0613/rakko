@@ -225,9 +225,15 @@ export const MEMORY_KINDS = ['user', 'feedback', 'project', 'reference'] as cons
 export const memoryKindSchema = z.enum(MEMORY_KINDS);
 export type MemoryKind = (typeof MEMORY_KINDS)[number];
 
+export const MEMORY_STATUSES = ['active', 'pending'] as const;
+export const memoryStatusSchema = z.enum(MEMORY_STATUSES);
+export type MemoryStatus = (typeof MEMORY_STATUSES)[number];
+
 export const memorySchema = z.object({
   id,
   kind: memoryKindSchema,
+  /** active = 已生效；pending = 自动提取、等确认 */
+  status: memoryStatusSchema.default('active'),
   title: z.string(),
   description: z.string(),
   body: z.string(),
@@ -246,6 +252,7 @@ export type CreateMemoryInput = z.infer<typeof createMemoryInput>;
 
 export const updateMemoryInput = z.object({
   kind: memoryKindSchema.optional(),
+  status: memoryStatusSchema.optional(),
   title: z.string().trim().min(1).max(120).optional(),
   description: z.string().trim().max(200).optional(),
   body: z.string().min(1).max(8000).optional(),
@@ -288,6 +295,8 @@ export const settingsSchema = z.object({
   approvedTools: z.array(z.string()).default([]),
   /** 挂载中的技能 slug：内容会被拼进系统提示 */
   enabledSkills: z.array(z.string()).default([]),
+  /** 运行成功后自动提取记忆（默认开） */
+  autoExtractMemory: z.boolean().default(true),
 });
 export type Settings = z.infer<typeof settingsSchema>;
 
@@ -295,6 +304,7 @@ export const updateSettingsInput = z.object({
   degradeOnExceed: z.boolean().optional(),
   approvedTools: z.array(z.string()).optional(),
   enabledSkills: z.array(z.string()).optional(),
+  autoExtractMemory: z.boolean().optional(),
 });
 export type UpdateSettingsInput = z.infer<typeof updateSettingsInput>;
 

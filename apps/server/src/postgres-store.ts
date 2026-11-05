@@ -12,7 +12,7 @@ import { and, asc, desc, eq, inArray, isNull, or, sql } from 'drizzle-orm';
 import type { DbHandle } from '@rakko/db';
 import { automations, memories, messages, runEvents, runs, skills, threads, usageLedger, users } from '@rakko/db';
 import { currentPeriod, decideQuota, periodStart, planLimit, type QuotaDecision } from '@rakko/core';
-import type { Automation, Memory, MemoryKind, Message, MessageKind, RiskLevel, Run, RunEvent, RunState, Settings, Skill, Thread, Usage } from '@rakko/protocol';
+import type { Automation, Memory, MemoryKind, MemoryStatus, Message, MessageKind, RiskLevel, Run, RunEvent, RunState, Settings, Skill, Thread, Usage } from '@rakko/protocol';
 
 import { BUILTIN_SKILLS } from './store.js';
 import type { AppendMessageInput, CreateRunInput, Listener, PendingCall, ResumableRun, RunPatch, RunStore } from './store.js';
@@ -51,6 +51,7 @@ const toSkill = (row: typeof skills.$inferSelect): Skill => ({
 const toMemory = (row: typeof memories.$inferSelect): Memory => ({
   id: row.id,
   kind: row.kind as MemoryKind,
+  status: row.status as MemoryStatus,
   title: row.title,
   description: row.description,
   body: row.body,
@@ -418,7 +419,7 @@ export class PostgresStore implements RunStore {
     return rows.map(toMemory);
   }
 
-  async createMemory(input: { kind: MemoryKind; title: string; description?: string; body: string }): Promise<Memory> {
+  async createMemory(input: { kind: MemoryKind; title: string; description?: string; body: string; status?: MemoryStatus }): Promise<Memory> {
     const [row] = await this.db
       .insert(memories)
       .values({
@@ -427,6 +428,7 @@ export class PostgresStore implements RunStore {
         title: input.title,
         description: input.description ?? '',
         body: input.body,
+        status: input.status ?? 'active',
       })
       .returning();
     if (!row) throw new Error('写记忆失败');
@@ -435,7 +437,7 @@ export class PostgresStore implements RunStore {
 
   async updateMemory(
     id: string,
-    patch: Partial<Pick<Memory, 'kind' | 'title' | 'description' | 'body'>>,
+    patch: Partial<Pick<Memory, 'kind' | 'title' | 'description' | 'body' | 'status'>>,
   ): Promise<Memory | undefined> {
     const [row] = await this.db
       .update(memories)
@@ -444,6 +446,7 @@ export class PostgresStore implements RunStore {
         ...(patch.title !== undefined ? { title: patch.title } : {}),
         ...(patch.description !== undefined ? { description: patch.description } : {}),
         ...(patch.body !== undefined ? { body: patch.body } : {}),
+        ...(patch.status !== undefined ? { status: patch.status } : {}),
         updatedAt: new Date(),
       })
       .where(and(eq(memories.id, id), eq(memories.userId, this.requireUserId())))
@@ -519,6 +522,7 @@ export class PostgresStore implements RunStore {
       degradeOnExceed: typeof raw.degradeOnExceed === 'boolean' ? raw.degradeOnExceed : this.degradeOnExceed,
       approvedTools: Array.isArray(raw.approvedTools) ? raw.approvedTools.filter((name) => typeof name === 'string') : [],
       enabledSkills: Array.isArray(raw.enabledSkills) ? raw.enabledSkills.filter((name) => typeof name === 'string') : [],
+      autoExtractMemory: typeof raw.autoExtractMemory === 'boolean' ? raw.autoExtractMemory : true,
     };
   }
 
@@ -528,6 +532,8 @@ export class PostgresStore implements RunStore {
       degradeOnExceed: typeof patch.degradeOnExceed === 'boolean' ? patch.degradeOnExceed : current.degradeOnExceed,
       approvedTools: Array.isArray(patch.approvedTools) ? [...new Set(patch.approvedTools)] : current.approvedTools,
       enabledSkills: Array.isArray(patch.enabledSkills) ? [...new Set(patch.enabledSkills)] : current.enabledSkills,
+      autoExtractMemory:
+        typeof patch.autoExtractMemory === 'boolean' ? patch.autoExtractMemory : current.autoExtractMemory,
     };
     // 只认白名单里的键，别的脏数据不写进去
     await this.db
@@ -537,6 +543,7 @@ export class PostgresStore implements RunStore {
           degradeOnExceed: next.degradeOnExceed,
           approvedTools: next.approvedTools,
           enabledSkills: next.enabledSkills,
+          autoExtractMemory: next.autoExtractMemory,
         })}::jsonb`,
       })
       .where(eq(users.id, this.requireUserId()));

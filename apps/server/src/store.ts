@@ -8,7 +8,7 @@
 import { randomUUID } from 'node:crypto';
 
 import { currentPeriod, decideQuota, periodStart, planLimit, type QuotaDecision, type QuotaState } from '@rakko/core';
-import type { Automation, Memory, Message, MessageKind, MessageRole, RiskLevel, Run, RunEvent, Settings, Skill, Thread, Usage } from '@rakko/protocol';
+import type { Automation, Memory, MemoryStatus, Message, MessageKind, MessageRole, RiskLevel, Run, RunEvent, Settings, Skill, Thread, Usage } from '@rakko/protocol';
 
 export interface AppendMessageInput {
   threadId: string;
@@ -63,8 +63,8 @@ export interface RunStore {
 
   /** 记忆：跨会话留下的东西 */
   listMemories(): Promise<Memory[]>;
-  createMemory(input: { kind: Memory['kind']; title: string; description?: string; body: string }): Promise<Memory>;
-  updateMemory(id: string, patch: Partial<Pick<Memory, 'kind' | 'title' | 'description' | 'body'>>): Promise<Memory | undefined>;
+  createMemory(input: { kind: Memory['kind']; title: string; description?: string; body: string; status?: MemoryStatus }): Promise<Memory>;
+  updateMemory(id: string, patch: Partial<Pick<Memory, 'kind' | 'title' | 'description' | 'body' | 'status'>>): Promise<Memory | undefined>;
   deleteMemory(id: string): Promise<boolean>;
 
   /** 自动化：cron + 一句任务描述 */
@@ -175,7 +175,7 @@ export class MemoryStore implements RunStore {
 
   constructor(options: MemoryStoreOptions = {}) {
     const degradeOnExceed = options.degradeOnExceed ?? true;
-    this.settings = { degradeOnExceed, approvedTools: [], enabledSkills: [] };
+    this.settings = { degradeOnExceed, approvedTools: [], enabledSkills: [], autoExtractMemory: true };
     this.quota = {
       limit: options.limit ?? planLimit('pro'),
       used: options.used ?? 0,
@@ -254,11 +254,18 @@ export class MemoryStore implements RunStore {
     return [...this.memories.values()].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
 
-  async createMemory(input: { kind: Memory['kind']; title: string; description?: string; body: string }): Promise<Memory> {
+  async createMemory(input: {
+    kind: Memory['kind'];
+    title: string;
+    description?: string;
+    body: string;
+    status?: MemoryStatus;
+  }): Promise<Memory> {
     const at = now();
     const memory: Memory = {
       id: randomUUID(),
       kind: input.kind,
+      status: input.status ?? 'active',
       title: input.title,
       description: input.description ?? '',
       body: input.body,
@@ -271,7 +278,7 @@ export class MemoryStore implements RunStore {
 
   async updateMemory(
     id: string,
-    patch: Partial<Pick<Memory, 'kind' | 'title' | 'description' | 'body'>>,
+    patch: Partial<Pick<Memory, 'kind' | 'title' | 'description' | 'body' | 'status'>>,
   ): Promise<Memory | undefined> {
     const current = this.memories.get(id);
     if (!current) return undefined;
@@ -340,6 +347,9 @@ export class MemoryStore implements RunStore {
     }
     if (Array.isArray(patch.enabledSkills)) {
       this.settings = { ...this.settings, enabledSkills: [...new Set(patch.enabledSkills)] };
+    }
+    if (typeof patch.autoExtractMemory === 'boolean') {
+      this.settings = { ...this.settings, autoExtractMemory: patch.autoExtractMemory };
     }
     return this.getSettings();
   }
