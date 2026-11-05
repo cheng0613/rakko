@@ -728,3 +728,51 @@ test('记忆会被带进系统提示，下一次对话就能用上', async () =>
   assert.match(seen[0] ?? '', /不要客套/, '记忆的正文要出现');
   await app.close();
 });
+
+test('技能：内置三个、可挂载、挂上之后进系统提示', async () => {
+  const seen: string[] = [];
+  const provider: ModelProvider = {
+    id: 'peek-skill',
+    async *stream(request) {
+      seen.push(request.messages[0]?.content ?? '');
+      yield { kind: 'delta', text: '好。' };
+      yield { kind: 'done', finishReason: 'stop' };
+    },
+  };
+
+  const store = new MemoryStore();
+  const gateway = new ProviderGateway({ provider, models: FAKE_MODELS, firstChunkTimeoutMs: 2_000 });
+  const app = createApp({ store, gateway });
+
+  const listed = (await app.inject({ method: 'GET', url: '/v1/skills' })).json();
+  assert.equal(listed.items.length, 3);
+  assert.ok(listed.items.every((item: { builtin: boolean; enabled: boolean }) => item.builtin && !item.enabled));
+
+  const review = listed.items.find((item: { slug: string }) => item.slug === 'code-review');
+  const on = await app.inject({ method: 'PATCH', url: `/v1/skills/${review.id}`, payload: { enabled: true } });
+  assert.equal(on.statusCode, 200);
+  assert.equal(on.json().enabled, true);
+
+  const thread = (await app.inject({ method: 'POST', url: '/v1/threads', payload: {} })).json();
+  const run = (await app.inject({ method: 'POST', url: '/v1/runs', payload: { threadId: thread.id, prompt: '看看这段改动' } })).json();
+  await waitFor(app, run.id, (body) => body.state === 'succeeded');
+
+  assert.match(seen[0] ?? '', /## 已挂载的技能/, '系统提示里要有技能段');
+  assert.match(seen[0] ?? '', /代码审查/, '技能名要出现');
+  assert.match(seen[0] ?? '', /只报能复现的问题/, '技能正文要出现');
+
+  // 关掉之后就不再带
+  await app.inject({ method: 'PATCH', url: `/v1/skills/${review.id}`, payload: { enabled: false } });
+  const second = (await app.inject({ method: 'POST', url: '/v1/threads', payload: {} })).json();
+  const run2 = (await app.inject({ method: 'POST', url: '/v1/runs', payload: { threadId: second.id, prompt: '再来一次' } })).json();
+  await waitFor(app, run2.id, (body) => body.state === 'succeeded');
+  assert.doesNotMatch(seen.at(-1) ?? '', /## 已挂载的技能/);
+
+  // 自建技能可以删，内置的不能
+  const created = await app.inject({ method: 'POST', url: '/v1/skills', payload: { name: '我的规矩', description: '自定义', body: '每次先复述需求。' } });
+  assert.equal(created.statusCode, 201);
+  assert.equal(created.json().builtin, false);
+  assert.equal((await app.inject({ method: 'DELETE', url: `/v1/skills/${review.id}` })).statusCode, 409);
+  assert.equal((await app.inject({ method: 'DELETE', url: `/v1/skills/${created.json().id}` })).statusCode, 200);
+  await app.close();
+});

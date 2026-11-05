@@ -7,13 +7,14 @@
  * - 配额只认 usage_ledger 的求和，用户改不动这个数。
  */
 
-import { and, asc, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, isNull, or, sql } from 'drizzle-orm';
 
 import type { DbHandle } from '@rakko/db';
-import { automations, memories, messages, runEvents, runs, threads, usageLedger, users } from '@rakko/db';
+import { automations, memories, messages, runEvents, runs, skills, threads, usageLedger, users } from '@rakko/db';
 import { currentPeriod, decideQuota, periodStart, planLimit, type QuotaDecision } from '@rakko/core';
-import type { Automation, Memory, MemoryKind, Message, MessageKind, RiskLevel, Run, RunEvent, RunState, Settings, Thread, Usage } from '@rakko/protocol';
+import type { Automation, Memory, MemoryKind, Message, MessageKind, RiskLevel, Run, RunEvent, RunState, Settings, Skill, Thread, Usage } from '@rakko/protocol';
 
+import { BUILTIN_SKILLS } from './store.js';
 import type { AppendMessageInput, CreateRunInput, Listener, PendingCall, ResumableRun, RunPatch, RunStore } from './store.js';
 
 const iso = (value: Date | null): string | null => (value ? value.toISOString() : null);
@@ -33,6 +34,16 @@ const toMessage = (row: typeof messages.$inferSelect): Message => ({
   text: row.text,
   payload: (row.payload as Record<string, unknown> | null) ?? null,
   runId: row.runId,
+  createdAt: row.createdAt.toISOString(),
+});
+
+const toSkill = (row: typeof skills.$inferSelect): Skill => ({
+  id: row.id,
+  slug: row.slug,
+  name: row.name,
+  description: row.description,
+  body: row.body,
+  builtin: row.userId === null,
   createdAt: row.createdAt.toISOString(),
 });
 
@@ -112,6 +123,20 @@ export class PostgresStore implements RunStore {
     const [user] = await this.db.select().from(users).where(eq(users.email, this.email)).limit(1);
     if (!user) throw new Error(`默认用户 ${this.email} 建不出来`);
     this.userId = user.id;
+
+    // 内置技能：userId 为 null，内容写死在代码里，可挂载不可删
+    for (const builtin of BUILTIN_SKILLS) {
+      await this.db
+        .insert(skills)
+        .values({
+          userId: null,
+          slug: builtin.slug,
+          name: builtin.name,
+          description: builtin.description,
+          body: builtin.body,
+        })
+        .onConflictDoNothing({ target: skills.slug });
+    }
   }
 
   async close(): Promise<void> {
@@ -329,6 +354,57 @@ export class PostgresStore implements RunStore {
     return decideQuota({ limit: usage.limit, used: usage.used, degradeOnExceed: usage.degradeOnExceed });
   }
 
+  async listSkills(): Promise<Skill[]> {
+    const rows = await this.db
+      .select()
+      .from(skills)
+      .where(or(isNull(skills.userId), eq(skills.userId, this.requireUserId())))
+      .orderBy(asc(skills.userId), asc(skills.name));
+    return rows.map(toSkill);
+  }
+
+  async createSkill(input: { name: string; description?: string; body: string }): Promise<Skill> {
+    const slug = input.name
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '') || `skill-${Date.now().toString(36)}`;
+
+    const [row] = await this.db
+      .insert(skills)
+      .values({
+        userId: this.requireUserId(),
+        slug: `${slug}-${Date.now().toString(36)}`,
+        name: input.name,
+        description: input.description ?? '',
+        body: input.body,
+      })
+      .returning();
+    if (!row) throw new Error('建技能失败');
+    return toSkill(row);
+  }
+
+  async updateSkill(id: string, patch: Partial<Pick<Skill, 'name' | 'description' | 'body'>>): Promise<Skill | undefined> {
+    const [row] = await this.db
+      .update(skills)
+      .set({
+        ...(patch.name !== undefined ? { name: patch.name } : {}),
+        ...(patch.description !== undefined ? { description: patch.description } : {}),
+        ...(patch.body !== undefined ? { body: patch.body } : {}),
+      })
+      .where(and(eq(skills.id, id), eq(skills.userId, this.requireUserId())))
+      .returning();
+    return row ? toSkill(row) : undefined;
+  }
+
+  async deleteSkill(id: string): Promise<boolean> {
+    // 内置技能的 userId 是 null，条件天然挡掉
+    const rows = await this.db
+      .delete(skills)
+      .where(and(eq(skills.id, id), eq(skills.userId, this.requireUserId())))
+      .returning({ id: skills.id });
+    return rows.length > 0;
+  }
+
   async listMemories(): Promise<Memory[]> {
     const rows = await this.db
       .select()
@@ -438,6 +514,7 @@ export class PostgresStore implements RunStore {
     return {
       degradeOnExceed: typeof raw.degradeOnExceed === 'boolean' ? raw.degradeOnExceed : this.degradeOnExceed,
       approvedTools: Array.isArray(raw.approvedTools) ? raw.approvedTools.filter((name) => typeof name === 'string') : [],
+      enabledSkills: Array.isArray(raw.enabledSkills) ? raw.enabledSkills.filter((name) => typeof name === 'string') : [],
     };
   }
 
@@ -446,6 +523,7 @@ export class PostgresStore implements RunStore {
     const next: Settings = {
       degradeOnExceed: typeof patch.degradeOnExceed === 'boolean' ? patch.degradeOnExceed : current.degradeOnExceed,
       approvedTools: Array.isArray(patch.approvedTools) ? [...new Set(patch.approvedTools)] : current.approvedTools,
+      enabledSkills: Array.isArray(patch.enabledSkills) ? [...new Set(patch.enabledSkills)] : current.enabledSkills,
     };
     // 只认白名单里的键，别的脏数据不写进去
     await this.db
@@ -454,6 +532,7 @@ export class PostgresStore implements RunStore {
         settings: sql`coalesce(${users.settings}, '{}'::jsonb) || ${JSON.stringify({
           degradeOnExceed: next.degradeOnExceed,
           approvedTools: next.approvedTools,
+          enabledSkills: next.enabledSkills,
         })}::jsonb`,
       })
       .where(eq(users.id, this.requireUserId()));

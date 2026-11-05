@@ -21,9 +21,11 @@ import {
   continueRunInput,
   createAutomationInput,
   createMemoryInput,
+  createSkillInput,
   createThreadInput,
   updateAutomationInput,
   updateMemoryInput,
+  updateSkillInput,
   TERMINAL_STATES,
   updateSettingsInput,
   updateThreadInput,
@@ -109,6 +111,58 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
     } catch {
       return reply.code(404).send({ error: 'web_missing', message: '界面文件 apps/web/index.html 不在' });
     }
+  });
+
+  /* ---------------- 技能 ---------------- */
+
+  const skillsWithState = async () => {
+    const [items, settings] = await Promise.all([store.listSkills(), store.getSettings()]);
+    const enabled = new Set(settings.enabledSkills);
+    return items.map((item) => ({ ...item, enabled: enabled.has(item.slug) }));
+  };
+
+  app.get('/v1/skills', async () => ({ items: await skillsWithState() }));
+
+  app.post('/v1/skills', async (request, reply) => {
+    const parsed = createSkillInput.safeParse(request.body ?? {});
+    if (!parsed.success) return reply.code(400).send(invalid(parsed.error.issues));
+    const skill = await store.createSkill(parsed.data);
+    return reply.code(201).send({ ...skill, enabled: false });
+  });
+
+  app.patch('/v1/skills/:id', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const body = (request.body ?? {}) as Record<string, unknown>;
+
+    // 挂载状态存在用户设置里（按 slug），改内容才动技能本身
+    if (typeof body.enabled === 'boolean') {
+      const skills = await store.listSkills();
+      const skill = skills.find((item) => item.id === id);
+      if (!skill) return reply.code(404).send({ error: 'skill_not_found', message: '技能不存在' });
+
+      const settings = await store.getSettings();
+      const next = new Set(settings.enabledSkills);
+      if (body.enabled) next.add(skill.slug);
+      else next.delete(skill.slug);
+      await store.updateSettings({ enabledSkills: [...next] });
+      return { ...skill, enabled: body.enabled };
+    }
+
+    const parsed = updateSkillInput.safeParse(body);
+    if (!parsed.success) return reply.code(400).send(invalid(parsed.error.issues));
+    const skill = await store.updateSkill(id, parsed.data);
+    if (!skill) return reply.code(404).send({ error: 'skill_not_found', message: '技能不存在' });
+    return { ...skill, enabled: false };
+  });
+
+  app.delete('/v1/skills/:id', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    if (!(await store.deleteSkill(id))) {
+      return reply
+        .code(409)
+        .send({ error: 'skill_not_deletable', message: '内置技能不能删，可以关掉它' });
+    }
+    return { ok: true };
   });
 
   /* ---------------- 记忆 ---------------- */
@@ -741,8 +795,23 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
 
     // 整条会话都带上：上一轮说过什么、调过什么工具，模型都看得到
     const history = trimHistory(buildHistory(await store.listMessages(run.threadId)));
-    const systemPrompt = buildSystemPrompt() + (await buildMemorySection());
+    const systemPrompt = buildSystemPrompt() + (await buildSkillSection()) + (await buildMemorySection());
     await executeRun(run, tier, [{ role: 'system', content: systemPrompt }, ...history], null, notice);
+  }
+
+  /** 把挂载中的技能拼成系统提示的一段：最多 3 个、每个 1500 字 */
+  async function buildSkillSection(): Promise<string> {
+    const [items, settings] = await Promise.all([store.listSkills(), store.getSettings()]);
+    const enabled = new Set(settings.enabledSkills);
+    const active = items.filter((item) => enabled.has(item.slug)).slice(0, 3);
+    if (active.length === 0) return '';
+
+    const blocks = active.map((skill) => {
+      const body = skill.body.length > 1500 ? `${skill.body.slice(0, 1500)}…` : skill.body;
+      return `### ${skill.name}\n${body}`;
+    });
+
+    return ['', '## 已挂载的技能（按它们做事）', ...blocks].join('\n');
   }
 
   /** 把记忆拼成系统提示的一段：跨会话的偏好与背景，最多 20 条、每条 200 字 */
@@ -784,7 +853,7 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
   async function resumeRun(run: Run, pending: PendingCall | null): Promise<void> {
     const items = await store.listMessages(run.threadId);
     const messages: ChatMessage[] = [
-      { role: 'system', content: buildSystemPrompt() + (await buildMemorySection()) },
+      { role: 'system', content: buildSystemPrompt() + (await buildSkillSection()) + (await buildMemorySection()) },
       ...buildHistory(items),
     ];
     const tier: ModelTier = run.model === gateway.models.fast ? 'fast' : 'standard';

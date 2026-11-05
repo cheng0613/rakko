@@ -90,6 +90,18 @@ docker compose up -d --build                     # db + api 全容器化，api �
   失败时默认追加「接着刚才的做，不要从头开始。」，取消时追加「继续。」，
   也可以带 `instruction` 换成自己的说法。代价是一次配额，跟正常运行一样。
 
+## 技能
+
+侧栏「技能」：一整段可挂载的规则，挂上之后**每次运行都拼进系统提示**。
+
+- 三个内置：代码审查 / 先写测试 / 说人话（代码里写死，userId 为 null，只能关不能删）；
+- 自建技能可编辑可删；挂载状态存在 `users.settings.enabledSkills`（按 slug）；
+- 最多同时挂 3 个、每个截 1500 字，避免把上下文吃光；
+- 顺序：系统提示 → 已挂载的技能 → 记忆 → 会话历史。
+
+**能力边界要说清**：技能现在只影响提示词，不能新增工具 —— 工具集是固定的七个。
+真要让技能带工具，得给工具加命名空间与按技能启用，那是下一步的事。
+
 ## 记忆
 
 侧栏「记忆」：四类跨会话的东西 —— 关于我 / 偏好纠正 / 项目 / 参考。
@@ -385,6 +397,10 @@ agent 的文件工具锁在工作区里，读这个目录会直接 `路径越界
 ```
 GET  /health                                   服务、provider、模型、熔断、工具、等待中的审批
 GET  /v1/usage                                 配额（次数制，来自 usage_ledger）
+GET  /v1/skills                                技能列表（含 enabled）
+POST /v1/skills                                新建技能
+PATCH /v1/skills/:id                           改内容，或 { enabled } 挂载/关闭
+DELETE /v1/skills/:id                          删自建技能（内置给 409）
 GET  /v1/memories                              记忆列表（按更新时间倒序）
 POST /v1/memories                              记一条（kind / title / description / body）
 PATCH /v1/memories/:id                         改

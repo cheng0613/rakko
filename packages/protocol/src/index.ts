@@ -188,6 +188,33 @@ export type ApprovalDecisionInput = z.infer<typeof approvalDecisionSchema>;
 export const riskLevelSchema = z.enum(['low', 'medium', 'high']);
 export type RiskLevel = z.infer<typeof riskLevelSchema>;
 
+/** 技能：一段可挂载的规则，挂上之后每次运行都会带进系统提示 */
+export const skillSchema = z.object({
+  id,
+  slug: z.string(),
+  name: z.string(),
+  description: z.string(),
+  body: z.string(),
+  /** 内置技能不可删，但可以关掉 */
+  builtin: z.boolean(),
+  createdAt: at,
+});
+export type Skill = z.infer<typeof skillSchema>;
+
+export const createSkillInput = z.object({
+  name: z.string().trim().min(1).max(60),
+  description: z.string().trim().max(200).optional(),
+  body: z.string().min(1).max(8000),
+});
+export type CreateSkillInput = z.infer<typeof createSkillInput>;
+
+export const updateSkillInput = z.object({
+  name: z.string().trim().min(1).max(60).optional(),
+  description: z.string().trim().max(200).optional(),
+  body: z.string().min(1).max(8000).optional(),
+});
+export type UpdateSkillInput = z.infer<typeof updateSkillInput>;
+
 /** 记忆：值得跨会话留下的四类东西 */
 export const MEMORY_KINDS = ['user', 'feedback', 'project', 'reference'] as const;
 export const memoryKindSchema = z.enum(MEMORY_KINDS);
@@ -254,12 +281,15 @@ export const settingsSchema = z.object({
   degradeOnExceed: z.boolean(),
   /** 用户点过「允许这类」的工具，之后不再问 */
   approvedTools: z.array(z.string()).default([]),
+  /** 挂载中的技能 slug：内容会被拼进系统提示 */
+  enabledSkills: z.array(z.string()).default([]),
 });
 export type Settings = z.infer<typeof settingsSchema>;
 
 export const updateSettingsInput = z.object({
   degradeOnExceed: z.boolean().optional(),
   approvedTools: z.array(z.string()).optional(),
+  enabledSkills: z.array(z.string()).optional(),
 });
 export type UpdateSettingsInput = z.infer<typeof updateSettingsInput>;
 

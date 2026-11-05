@@ -910,6 +910,30 @@
 
 
 
+
+      <section class="view" id="view-skills">
+        <div class="auto-toolbar">
+          <span class="muted" id="skillSummary">挂上的技能会在每次运行时带进系统提示</span>
+          <button class="btn" id="skillRefresh">刷新</button>
+          <button class="btn primary" id="skillNew">＋ 新建技能</button>
+        </div>
+
+        <div class="card" id="skillForm" hidden style="margin-bottom:16px">
+          <div class="auto-form">
+            <label class="field"><span>名字</span><input id="skillName" placeholder="我的规矩" /></label>
+            <label class="field"><span>一句话（可选）</span><input id="skillDesc" placeholder="什么时候该用" /></label>
+            <label class="field"><span>规则</span><textarea id="skillBody" rows="4" placeholder="每次先复述需求，再给方案。"></textarea></label>
+            <div class="auto-form-actions">
+              <span class="muted">最多同时挂 3 个，每个截 1500 字</span>
+              <button class="btn" id="skillCancel">取消</button>
+              <button class="btn primary" id="skillSave">保存</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="grid two" id="skillList"></div>
+      </section>
+
       <section class="view" id="view-memory">
         <div class="auto-toolbar">
           <span class="muted" id="memSummary">值得跨会话留下的东西</span>
@@ -1114,6 +1138,7 @@
     settings: null,
     automations: [],
     memories: [],
+    skills: [],
   };
 
   /** 历史里最后一条助手消息，恢复运行时把新事件接在它后面 */
@@ -2060,7 +2085,7 @@
     item.addEventListener('click', () => {
       document.querySelectorAll('.nav-item').forEach((other) => other.classList.remove('active'));
       item.classList.add('active');
-      if (['chat', 'tasks', 'memory', 'settings'].includes(item.dataset.nav)) setView(item.dataset.nav);
+      if (['chat', 'tasks', 'memory', 'skills', 'settings'].includes(item.dataset.nav)) setView(item.dataset.nav);
       else toast('「' + item.textContent.trim() + '」还没做');
       closeSide();
     });
@@ -2091,7 +2116,13 @@
 
 
   /* ---------------- 视图切换：对话 / 设置 ---------------- */
-  const views = { chat: $('#view-chat'), tasks: $('#view-tasks'), memory: $('#view-memory'), settings: $('#view-settings') };
+  const views = {
+    chat: $('#view-chat'),
+    tasks: $('#view-tasks'),
+    memory: $('#view-memory'),
+    skills: $('#view-skills'),
+    settings: $('#view-settings'),
+  };
   let currentView = 'chat';
 
   const setView = (name) => {
@@ -2112,6 +2143,10 @@
       ui.title.textContent = '记忆';
       ui.sub.textContent = '跨会话留下的偏好、项目与参考';
       void loadMemories();
+    } else if (name === 'skills') {
+      ui.title.textContent = '技能';
+      ui.sub.textContent = '挂上的技能会进每次运行的系统提示';
+      void loadSkills();
     } else {
       ui.title.textContent = state.threadId ? (state.threads.find((t) => t.id === state.threadId)?.title || '对话') : '对话';
       ui.sub.textContent = state.health ? (state.health.tools ? state.health.tools.length + ' 个工具' : '') + ' · ' + state.health.store + ' 存储' : '长任务会自己接着做，你可以随时插入新的指令';
@@ -2421,6 +2456,108 @@
       $('#memForm').hidden = true;
       await loadMemories();
       toast('记住了');
+    } catch (error) {
+      toast('保存失败：' + error.message);
+    }
+  });
+
+  /* ---------------- 技能 ---------------- */
+
+  const renderSkills = () => {
+    const list = $('#skillList');
+    list.innerHTML = '';
+    const items = state.skills ?? [];
+    const mounted = items.filter((item) => item.enabled).length;
+    $('#skillSummary').textContent = items.length > 0
+      ? `${mounted} 个已挂载 · 共 ${items.length} 个（最多同时挂 3 个）`
+      : '挂上的技能会在每次运行时带进系统提示';
+
+    for (const item of items) {
+      const card = make('article', 'card mem-card');
+
+      const head = make('div', 'auto-meta');
+      head.append(make('span', 'tag ' + (item.builtin ? 'accent' : 'mint'), item.builtin ? '内置' : '自建'));
+      if (item.enabled) head.append(make('span', 'tag violet', '已挂载'));
+
+      const toggle = make('label', 'switch');
+      toggle.style.marginLeft = 'auto';
+      const checkbox = make('input');
+      checkbox.type = 'checkbox';
+      checkbox.checked = item.enabled;
+      checkbox.addEventListener('change', async () => {
+        try {
+          await api('/v1/skills/' + item.id, { method: 'PATCH', body: JSON.stringify({ enabled: checkbox.checked }) });
+          item.enabled = checkbox.checked;
+          renderSkills();
+        } catch (error) {
+          checkbox.checked = !checkbox.checked;
+          toast('切换失败：' + error.message);
+        }
+      });
+      toggle.append(checkbox, make('span', 'track'));
+      head.append(toggle);
+      card.append(head);
+
+      card.append(make('h3', undefined, item.name));
+      if (item.description) card.append(make('p', 'mem-desc', item.description));
+      card.append(make('p', 'mem-body', item.body));
+
+      const foot = make('div', 'mem-foot');
+      foot.append(make('span', undefined, item.builtin ? '内置 · 只能关' : '更新 ' + relTime(item.createdAt)));
+      if (!item.builtin) {
+        const del = make('button', 'btn quiet', '删除');
+        del.addEventListener('click', async () => {
+          if (!window.confirm(`删掉「${item.name}」？`)) return;
+          try {
+            await api('/v1/skills/' + item.id, { method: 'DELETE' });
+            state.skills = state.skills.filter((other) => other.id !== item.id);
+            renderSkills();
+          } catch (error) {
+            toast('删除失败：' + error.message);
+          }
+        });
+        foot.append(del);
+      }
+      card.append(foot);
+
+      list.append(card);
+    }
+  };
+
+  const loadSkills = async () => {
+    try {
+      const body = await api('/v1/skills');
+      state.skills = body.items ?? [];
+      renderSkills();
+    } catch (error) {
+      toast('读技能失败：' + error.message);
+    }
+  };
+
+  $('#skillRefresh').addEventListener('click', () => void loadSkills());
+  $('#skillNew').addEventListener('click', () => {
+    $('#skillForm').hidden = false;
+    $('#skillName').focus();
+  });
+  $('#skillCancel').addEventListener('click', () => {
+    $('#skillForm').hidden = true;
+  });
+  $('#skillSave').addEventListener('click', async () => {
+    const name = $('#skillName').value.trim();
+    const description = $('#skillDesc').value.trim();
+    const body = $('#skillBody').value.trim();
+    if (!name || !body) {
+      toast('名字和规则都要填');
+      return;
+    }
+    try {
+      await api('/v1/skills', { method: 'POST', body: JSON.stringify({ name, description, body }) });
+      $('#skillName').value = '';
+      $('#skillDesc').value = '';
+      $('#skillBody').value = '';
+      $('#skillForm').hidden = true;
+      await loadSkills();
+      toast('建好了，记得挂上');
     } catch (error) {
       toast('保存失败：' + error.message);
     }

@@ -8,7 +8,7 @@
 import { randomUUID } from 'node:crypto';
 
 import { currentPeriod, decideQuota, periodStart, planLimit, type QuotaDecision, type QuotaState } from '@rakko/core';
-import type { Automation, Memory, Message, MessageKind, MessageRole, RiskLevel, Run, RunEvent, Settings, Thread, Usage } from '@rakko/protocol';
+import type { Automation, Memory, Message, MessageKind, MessageRole, RiskLevel, Run, RunEvent, Settings, Skill, Thread, Usage } from '@rakko/protocol';
 
 export interface AppendMessageInput {
   threadId: string;
@@ -55,6 +55,12 @@ export interface RunStore {
   resumableRuns(): Promise<ResumableRun[]>;
   /** 线程最近一次运行，界面刷新后据此决定要不要接着看流 */
   latestRunForThread(threadId: string): Promise<Run | undefined>;
+  /** 技能：可挂载的规则块 */
+  listSkills(): Promise<Skill[]>;
+  createSkill(input: { name: string; description?: string; body: string }): Promise<Skill>;
+  updateSkill(id: string, patch: Partial<Pick<Skill, 'name' | 'description' | 'body'>>): Promise<Skill | undefined>;
+  deleteSkill(id: string): Promise<boolean>;
+
   /** 记忆：跨会话留下的东西 */
   listMemories(): Promise<Memory[]>;
   createMemory(input: { kind: Memory['kind']; title: string; description?: string; body: string }): Promise<Memory>;
@@ -93,6 +99,55 @@ export interface RunStore {
 
 const now = (): string => new Date().toISOString();
 
+const slugify = (name: string): string => {
+  const ascii = name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return ascii || 'skill-' + Math.random().toString(36).slice(2, 8);
+};
+
+/** 三个开箱可用的技能：挂上就生效，内容直接拼进系统提示 */
+export const BUILTIN_SKILLS: Array<{ slug: string; name: string; description: string; body: string }> = [
+  {
+    slug: 'code-review',
+    name: '代码审查',
+    description: '提交前按这份清单过一遍',
+    body: [
+      '审查改动时按这个顺序看：',
+      '1. 行为：边界、并发、失败路径、空值——先问「什么情况下会坏」。',
+      '2. 一致性：有没有第二套写法做同一件事；有没有绕过既有的抽象。',
+      '3. 证据：改完必须跑相关测试；测试没覆盖的地方要说明。',
+      '4. 表达：注释解释「为什么」，不解释「是什么」。',
+      '只报能复现的问题，不猜「可能有问题」。',
+    ].join('\n'),
+  },
+  {
+    slug: 'write-tests-first',
+    name: '先写测试',
+    description: '修 bug 前先把它变成一条会红的测试',
+    body: [
+      '修 bug 的固定动作：',
+      '1. 先写一条能稳定复现的测试，确认它现在红。',
+      '2. 再改实现，让这条测试变绿，别顺手改测试让它通过。',
+      '3. 测试要能挡住回归：换个错误的实现，它应该变红。',
+      '4. 边界写进测试里（并发、超时、空输入），不要只测顺利路径。',
+    ].join('\n'),
+  },
+  {
+    slug: 'plain-chinese',
+    name: '说人话',
+    description: '中文回复的具体要求',
+    body: [
+      '回复要求：',
+      '- 先说结论，再说理由；不要「好的，我来帮你…」这种开场。',
+      '- 代码、命令、路径、标识符保持原样，不翻译。',
+      '- 不确定就说不确定，并指出缺什么信息。',
+      '- 一段话只讲一件事；长清单先给一句总述。',
+    ].join('\n'),
+  },
+];
+
 export interface MemoryStoreOptions {
   limit?: number;
   used?: number;
@@ -106,15 +161,29 @@ export class MemoryStore implements RunStore {
   private settings: Settings;
   private readonly automations = new Map<string, Automation>();
   private readonly memories = new Map<string, Memory>();
+  private readonly skills = new Map<string, Skill>();
 
   constructor(options: MemoryStoreOptions = {}) {
     const degradeOnExceed = options.degradeOnExceed ?? true;
-    this.settings = { degradeOnExceed, approvedTools: [] };
+    this.settings = { degradeOnExceed, approvedTools: [], enabledSkills: [] };
     this.quota = {
       limit: options.limit ?? planLimit('pro'),
       used: options.used ?? 0,
       degradeOnExceed,
     };
+
+    for (const builtin of BUILTIN_SKILLS) {
+      const skill: Skill = {
+        id: randomUUID(),
+        slug: builtin.slug,
+        name: builtin.name,
+        description: builtin.description,
+        body: builtin.body,
+        builtin: true,
+        createdAt: now(),
+      };
+      this.skills.set(skill.id, skill);
+    }
   }
   private readonly threads = new Map<string, Thread>();
   private readonly runs = new Map<string, Run>();
@@ -132,6 +201,41 @@ export class MemoryStore implements RunStore {
 
   async resumableRuns(): Promise<ResumableRun[]> {
     return [];
+  }
+
+  async listSkills(): Promise<Skill[]> {
+    return [...this.skills.values()].sort((a, b) => {
+      if (a.builtin !== b.builtin) return a.builtin ? -1 : 1;
+      return a.name.localeCompare(b.name);
+    });
+  }
+
+  async createSkill(input: { name: string; description?: string; body: string }): Promise<Skill> {
+    const skill: Skill = {
+      id: randomUUID(),
+      slug: slugify(input.name),
+      name: input.name,
+      description: input.description ?? '',
+      body: input.body,
+      builtin: false,
+      createdAt: now(),
+    };
+    this.skills.set(skill.id, skill);
+    return skill;
+  }
+
+  async updateSkill(id: string, patch: Partial<Pick<Skill, 'name' | 'description' | 'body'>>): Promise<Skill | undefined> {
+    const current = this.skills.get(id);
+    if (!current) return undefined;
+    const next: Skill = { ...current, ...patch };
+    this.skills.set(id, next);
+    return next;
+  }
+
+  async deleteSkill(id: string): Promise<boolean> {
+    const current = this.skills.get(id);
+    if (!current || current.builtin) return false;
+    return this.skills.delete(id);
   }
 
   async listMemories(): Promise<Memory[]> {
@@ -207,7 +311,11 @@ export class MemoryStore implements RunStore {
   }
 
   async getSettings(): Promise<Settings> {
-    return { ...this.settings, approvedTools: [...this.settings.approvedTools] };
+    return {
+      ...this.settings,
+      approvedTools: [...this.settings.approvedTools],
+      enabledSkills: [...this.settings.enabledSkills],
+    };
   }
 
   async updateSettings(patch: Partial<Settings>): Promise<Settings> {
@@ -217,6 +325,9 @@ export class MemoryStore implements RunStore {
     }
     if (Array.isArray(patch.approvedTools)) {
       this.settings = { ...this.settings, approvedTools: [...new Set(patch.approvedTools)] };
+    }
+    if (Array.isArray(patch.enabledSkills)) {
+      this.settings = { ...this.settings, enabledSkills: [...new Set(patch.enabledSkills)] };
     }
     return this.getSettings();
   }
