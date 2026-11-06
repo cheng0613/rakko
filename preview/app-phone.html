@@ -41,24 +41,26 @@
   .dot{width:8px;height:8px;border-radius:50%;background:var(--mint);margin-top:6px;flex:none}
 
   .app{flex:1;overflow:auto;padding:14px 16px 12px;display:flex;flex-direction:column;gap:12px;-webkit-overflow-scrolling:touch}
-  .card{border:1px solid var(--line);border-radius:16px;background:var(--surface);padding:13px 14px}
+  .card{border:1px solid var(--line);border-radius:18px;background:var(--surface);padding:16px}
   .card h2{margin:0 0 9px;font-size:12px;font-weight:590;color:var(--text)}
   .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-  .text{font-size:13px;line-height:1.6;color:var(--text-2)}
+  .text{font-size:13.8px;line-height:1.72;color:var(--text-2)}
   .muted{color:var(--muted);font-size:11.5px}
 
-  table{width:100%;border-collapse:collapse;font-size:12.5px}
-  th{text-align:left;font-weight:560;color:var(--muted);font-size:11px;padding:6px 6px;border-bottom:1px solid var(--line-strong)}
-  td{padding:7px 6px;border-bottom:1px solid var(--line);color:var(--text-2);vertical-align:top}
+  table{width:100%;border-collapse:collapse;font-size:12.3px}
+  th{text-align:left;font-weight:500;color:var(--faint);font-size:11px;letter-spacing:.06em;padding:0 10px 9px;border-bottom:1px solid var(--line)}
+  td{padding:10px;border-bottom:1px solid var(--line);color:var(--text-2);vertical-align:top}
+  td:first-child{color:var(--muted);font-family:var(--mono);font-size:11px}
   tr:last-child td{border-bottom:0}
   th:last-child,td:last-child{white-space:nowrap;text-align:right}
-  .runs td:nth-child(2){max-width:132px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .runs td:nth-child(2){max-width:126px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .runs td:nth-child(3),.runs th:nth-child(3){white-space:nowrap}
   .ok{color:var(--mint)} .bad{color:var(--danger)}
   .caption{font-size:11px;color:var(--faint);margin-top:7px}
 
-  .btn{border:1px solid var(--line-strong);background:var(--surface-2);color:var(--text);
-       border-radius:99px;padding:5px 13px;font-size:12px;cursor:pointer;font-family:inherit}
-  .btn[data-on="1"]{background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}
+  .btn{display:inline-flex;align-items:center;gap:7px;border:1px solid transparent;background:var(--surface-2);color:var(--text);
+       border-radius:980px;padding:7px 15px;font-size:13px;font-weight:500;cursor:pointer;font-family:inherit}
+  .btn[data-on="1"]{background:var(--accent);color:var(--accent-ink);font-weight:590}
 
   .callout{border-left:2px solid var(--orange);background:var(--surface-2);border-radius:0 10px 10px 0;
            padding:9px 12px;font-size:12.5px;line-height:1.6;color:var(--text-2)}
@@ -120,12 +122,12 @@
 
   /* ---------- 数据：这次对话里产出的几块界面 ---------- */
   const runs = [
-    ['16:51', '以后帮我写东西，先给结论…', '5 次', '5 分 0 秒', '成功'],
-    ['16:06', '随便聊两句：我偏爱先看结论…', '0 次', '3.3 s', '成功'],
-    ['15:48', '记一下：以后帮我写东西…', '16 次（失败 3）', '24 s', '失败'],
-    ['15:45', '以后帮我写东西，先给结论…', '10 次（失败 1）', '21 分 25 秒', '成功'],
-    ['15:43', '以后帮我写东西，先给结论…', '15 次（失败 1）', '39 s', '失败'],
-    ['14:40', '用 git_log 看一下最近 3 次提交', '2 次', '8.2 s', '成功'],
+    ['15:48', '记一下：以后帮我写东西…', '24 s', '失败'],
+    ['15:43', '以后帮我写东西，先给结论…', '39 s', '失败'],
+    ['16:51', '以后帮我写东西，先给结论…', '5 分 0 秒', '成功'],
+    ['15:45', '以后帮我写东西，先给结论…', '21 分 25 秒', '成功'],
+    ['16:06', '随便聊两句：我偏爱先看结论…', '3.3 s', '成功'],
+    ['14:40', '用 git_log 看一下最近 3 次提交', '8.2 s', '成功'],
   ];
 
   const state = { result: '' };
@@ -218,11 +220,11 @@
     }
     overview.insertBefore(stats, overview.children[1]);
 
-    overview.append(table(['时间', '任务', '工具', '耗时', '结果'], runs, {
+    overview.append(table(['时间', '任务', '耗时', '结果'], runs, {
       className: 'runs',
       key: 'result',
-      field: 4,
-      statusColumn: 4,
+      field: 3,
+      statusColumn: 3,
       caption: '点下面的按钮筛选，只动本地，不发请求',
     }));
 

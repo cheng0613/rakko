@@ -843,44 +843,42 @@
   .app-composer button{flex:none;width:36px;height:36px;border-radius:50%;border:0;background:var(--accent);color:var(--accent-ink);font-size:15px;cursor:pointer}
   .app-composer button:disabled{opacity:.5;cursor:default}
 
-  /* 生成式界面：跟正文同一套字色与线，别让它看起来像插件 */
+  /*
+   * 生成式界面。
+   * 卡片、表格、按钮直接用设计稿自己的 .card / table.log / .btn —— 之前另起了一套 g-* 样式，
+   * 结果是同一个产品里两种表格、两种按钮，一眼就不对。这里只补设计稿里没有的容器。
+   */
   .genui{display:flex;flex-direction:column;gap:10px;margin:10px 0 4px}
-  .g-card{border:1px solid var(--line);border-radius:14px;background:var(--surface);padding:12px 14px}
-  .g-card-title{font-size:12px;font-weight:590;margin-bottom:8px}
-  .g-text{font-size:13px;line-height:1.6;color:var(--text-2)}
-  .g-md{font-size:13px;line-height:1.7;color:var(--text-2)}
-  .g-md p{margin:0 0 8px}
+  .g-card{border:1px solid var(--line);border-radius:var(--radius);background:var(--surface);padding:16px}
+  .g-card .card{margin-bottom:0}
+  .g-card-title{font-size:12.5px;font-weight:590;margin:0 0 10px;color:var(--text)}
+  .g-text{font-size:13.8px;line-height:1.72;color:var(--text-2)}
+  .g-md{font-size:13.8px;line-height:1.72;color:var(--text-2)}
+  .g-md p{margin:0 0 10px}
   .g-md p:last-child{margin:0}
   .g-stack{display:flex;flex-direction:column;gap:8px}
   .g-row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-  .g-list{margin:0;padding-left:18px;font-size:13px;line-height:1.6;color:var(--text-2);display:flex;flex-direction:column;gap:4px}
-  .g-table-wrap{overflow-x:auto}
-  /* 窄窗口里表格要挤得下：数字列不换行，任务列允许折两行 */
-  .app-window .g-table{font-size:11.5px}
-  .app-window .g-table th,.app-window .g-table td{padding:6px 4px;white-space:nowrap}
-  .app-window .g-table td:nth-child(2),.app-window .g-table th:nth-child(2){white-space:normal;max-width:118px}
-  .g-table{width:100%;border-collapse:collapse;font-size:12.5px}
-  .g-table th{text-align:left;font-weight:560;color:var(--muted);font-size:11px;padding:6px 8px;border-bottom:1px solid var(--line-strong)}
-  .g-table td{padding:7px 8px;border-bottom:1px solid var(--line);color:var(--text-2)}
-  .g-table tr:last-child td{border-bottom:0}
-  .g-caption{font-size:11px;color:var(--faint);margin-top:6px}
-  .g-btn{border:1px solid var(--line-strong);background:var(--surface-2);border-radius:99px;padding:5px 13px;font-size:12px;color:var(--text);cursor:pointer}
-  .g-btn:hover{border-color:var(--accent);color:var(--accent)}
-  .g-btn[data-on="1"]{background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}
-  .g-form{display:flex;flex-direction:column;gap:9px}
-  .g-field{display:flex;flex-direction:column;gap:4px}
+  .g-list{margin:0;padding-left:18px;font-size:13.8px;line-height:1.72;color:var(--text-2);display:flex;flex-direction:column;gap:5px}
+  .g-table-wrap{overflow-x:auto;margin:0 -2px}
+  /* 窄窗口（应用）里让长文本列折行，其余保持一行，必要时横向滚 */
+  .app-window .g-table th,.app-window .g-table td{padding:9px 6px;white-space:nowrap}
+  .app-window .g-table td:nth-child(2),.app-window .g-table th:nth-child(2){white-space:normal;min-width:96px}
+  .g-caption{font-size:11px;color:var(--faint);margin-top:8px}
+  .g-form{display:flex;flex-direction:column;gap:10px}
+  .g-field{display:flex;flex-direction:column;gap:5px}
   .g-field span{font-size:11px;color:var(--muted)}
-  .g-field input,.g-field select{font:inherit;font-size:13px;padding:7px 10px;border-radius:10px;border:1px solid var(--line);background:var(--bg);color:var(--text)}
+  .g-field input,.g-field select{font:inherit;font-size:13px;padding:8px 11px;border-radius:11px;border:1px solid var(--line);background:var(--bg);color:var(--text)}
   .g-field input:focus,.g-field select:focus{outline:none;border-color:var(--accent)}
-  .g-callout{border-left:2px solid var(--accent);background:var(--surface-2);border-radius:0 10px 10px 0;padding:9px 12px;font-size:12.5px;line-height:1.6;color:var(--text-2)}
+  .g-callout{border-left:2px solid var(--accent);background:var(--surface-2);border-radius:0 12px 12px 0;padding:10px 13px;font-size:13px;line-height:1.65;color:var(--text-2)}
   .g-callout[data-tone="warn"]{border-color:var(--orange)}
   .g-callout[data-tone="danger"]{border-color:var(--danger)}
-  .g-code{font-family:var(--mono);font-size:11.5px;background:var(--surface-2);border:1px solid var(--line);border-radius:10px;padding:10px 12px;overflow:auto;white-space:pre-wrap;margin:0}
-  .g-bars{display:flex;flex-direction:column;gap:6px}
+  .g-code{font-family:var(--mono);font-size:11.5px;line-height:1.6;background:var(--surface-2);border:1px solid var(--line);border-radius:12px;padding:11px 13px;overflow:auto;white-space:pre-wrap;margin:0;color:var(--text-2)}
+  .g-bars{display:flex;flex-direction:column;gap:7px}
   .g-bar{display:grid;grid-template-columns:96px minmax(0,1fr) 56px;gap:8px;align-items:center;font-size:11.5px;color:var(--text-2)}
   .g-bar i{display:block;height:6px;border-radius:99px;background:var(--accent);opacity:.85}
   .g-bar b{font-weight:400;color:var(--muted);text-align:right;font-family:var(--mono);font-size:10.5px}
   .g-err{font-size:11.5px;color:var(--danger)}
+  .g-btn{font-size:12.5px;padding:6px 14px}
 
   .retry .trace-open{margin-left:auto}
   .retry .trace-open + .btn{margin-left:8px}
@@ -2541,9 +2539,8 @@
 
           const row = gEl('div', 'app-approval-actions');
           const choice = (label, decision, scope) => {
-            const btn = gEl('button', 'g-btn', label);
+            const btn = gEl('button', 'btn g-btn' + (decision === 'allow' ? ' primary' : ''), label);
             btn.type = 'button';
-            if (decision === 'allow') btn.dataset.on = '1';
             btn.addEventListener('click', () => {
               for (const other of row.querySelectorAll('button')) other.disabled = true;
               card.classList.add('done');
@@ -2800,7 +2797,7 @@
         return box;
       }
       case 'card': {
-        const box = gEl('div', 'g-card');
+        const box = gEl('div', 'card g-card');
         if (props.title) box.append(gEl('div', 'g-card-title', fill(props.title)));
         box.append(...kids());
         return box;
@@ -2814,7 +2811,7 @@
         const columns = Array.isArray(props.columns) ? props.columns : [];
         const rows = Array.isArray(props.rows) ? props.rows : [];
         const visible = api.filterRows(columns, rows, props.filterBy, ctx.state);
-        const table = gEl('table', 'g-table');
+        const table = gEl('table', 'log g-table');
         const head = document.createElement('thead');
         const headRow = document.createElement('tr');
         for (const column of columns) headRow.append(gEl('th', undefined, column));
@@ -2858,15 +2855,15 @@
         return box;
       }
       case 'button': {
-        const btn = gEl('button', 'g-btn', fill(props.label));
-        btn.type = 'button';
         const action = props.action || {};
-        if (props.tone === 'primary') btn.dataset.on = '1';
-        // 筛选类按钮：状态值对上了就高亮，看起来像选中
-        if (action.set) {
-          const on = Object.entries(action.set).some(([key, value]) => String(ctx.state[key]) === String(value));
-          if (on) btn.dataset.on = '1';
-        }
+        // 选中态：set 动作里的值正好等于当前状态；主按钮用 tone: 'primary'
+        const selected = action.set
+          ? Object.entries(action.set).some(([key, value]) => String(ctx.state[key]) === String(value))
+          : false;
+        const primary = props.tone === 'primary' || (action.send !== undefined && props.tone !== 'quiet');
+        const btn = gEl('button', 'btn g-btn' + (primary || selected ? ' primary' : ''), fill(props.label));
+        btn.type = 'button';
+        btn.setAttribute('aria-pressed', selected ? 'true' : 'false');
         btn.addEventListener('click', () => void runGenuiAction(action, ctx));
         return btn;
       }
@@ -2903,7 +2900,7 @@
         form.append(...kids());
         const footer = gEl('div', 'g-row');
         if (props.hint) footer.append(gEl('span', 'g-caption', fill(props.hint)));
-        const submit = gEl('button', 'g-btn', String(props.submitLabel || '提交'));
+        const submit = gEl('button', 'btn primary g-btn', String(props.submitLabel || '提交'));
         submit.type = 'submit';
         footer.append(submit);
         form.append(footer);
