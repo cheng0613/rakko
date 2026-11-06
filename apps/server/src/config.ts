@@ -38,7 +38,8 @@ export function loadProviderSettings(env: NodeJS.ProcessEnv = process.env): Prov
     },
     timeoutMs: num(env.RAKKO_TIMEOUT_MS, 180_000),
     firstChunkTimeoutMs: num(env.RAKKO_FIRST_CHUNK_MS, 45_000),
-    embedModel: env.RAKKO_EMBED_MODEL ?? 'kinfra-text-embedding-0.6b',
+    // 没配就当作不支持向量：退回关键词检索（有些网关没有 embeddings 接口）
+    embedModel: env.RAKKO_EMBED_MODEL ?? '',
     embedDims: num(env.RAKKO_EMBED_DIMS, 1024),
   };
 }
