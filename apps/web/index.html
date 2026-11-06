@@ -2440,7 +2440,8 @@
           frame = document.createElement('iframe');
           frame.className = 'app-frame';
           frame.src = '/app/' + encodeURIComponent(slugOf(app.name)) + '/?v=' + Date.now();
-          frame.setAttribute('sandbox', 'allow-scripts allow-forms allow-popups');
+          // allow-same-origin：localStorage 才能用（草稿先落本地），也方便排查
+          frame.setAttribute('sandbox', 'allow-scripts allow-forms allow-popups allow-same-origin');
           body.append(frame);
           return;
         }
