@@ -1,0 +1,105 @@
+/* 设计稿的 token：应用只要引这个文件，颜色字号就长在产品里 */
+:root{
+  --radius:18px;
+  --sans:-apple-system,BlinkMacSystemFont,"SF Pro Display","SF Pro Text","Helvetica Neue","PingFang SC","Microsoft YaHei",sans-serif;
+  --mono:"SF Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+  --ease:cubic-bezier(.32,.72,0,1);
+  --bg:#f5f5f7; --surface:#ffffff; --surface-2:#f2f2f7; --surface-3:#e5e5ea;
+  --line:rgba(60,60,67,.18); --line-strong:rgba(60,60,67,.28);
+  --text:#1d1d1f; --text-2:#3a3a3c; --muted:#6e6e73; --faint:#a1a1a6;
+  --accent:#0071e3; --accent-ink:#ffffff; --accent-soft:rgba(0,113,227,.1);
+  --mint:#34c759; --mint-soft:rgba(52,199,89,.13);
+  --violet:#af52de; --orange:#ff9500; --danger:#ff3b30;
+  --shadow:0 1px 2px rgba(0,0,0,.05), 0 16px 36px -20px rgba(0,0,0,.16);
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#000000; --surface:#1c1c1e; --surface-2:#2c2c2e; --surface-3:#3a3a3c;
+    --line:rgba(84,84,88,.5); --line-strong:rgba(120,120,128,.55);
+    --text:#f5f5f7; --text-2:#c7c7cc; --muted:#98989f; --faint:#6e6e73;
+    --accent:#0a84ff; --accent-ink:#ffffff; --accent-soft:rgba(10,132,255,.15);
+    --mint:#30d158; --mint-soft:rgba(48,209,88,.15);
+    --violet:#bf5af2; --orange:#ff9f0a; --danger:#ff453a;
+    --shadow:0 1px 1px rgba(0,0,0,.45), 0 16px 40px -20px rgba(0,0,0,.85);
+  }
+}
+
+*{box-sizing:border-box}
+body{
+  margin:0;background:var(--bg);color:var(--text);
+  font-family:var(--sans);font-size:13.8px;line-height:1.72;
+  -webkit-font-smoothing:antialiased;
+}
+h1,h2,h3,h4{margin:0;font-weight:590;letter-spacing:-.01em}
+h1{font-size:17px} h2{font-size:14px} h3{font-size:13px} h4{font-size:12.5px}
+p{margin:0 0 10px} p:last-child{margin-bottom:0}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+code,pre{font-family:var(--mono);font-size:11.5px}
+pre{background:var(--surface-2);border:1px solid var(--line);border-radius:12px;padding:11px 13px;overflow:auto;white-space:pre-wrap;margin:0}
+small{font-size:11px;color:var(--faint)}
+
+/* 容器 */
+.card{border:1px solid var(--line);border-radius:var(--radius);background:var(--surface);padding:16px}
+.stack{display:flex;flex-direction:column;gap:12px}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.muted{color:var(--muted)}
+.faint{color:var(--faint)}
+.num{font-variant-numeric:tabular-nums}
+
+/* 按钮：和产品里同一个形状 */
+.btn{
+  display:inline-flex;align-items:center;gap:7px;padding:6px 14px;border-radius:980px;
+  font-family:inherit;font-size:12.5px;font-weight:500;line-height:1.4;
+  border:1px solid transparent;background:var(--surface-2);color:var(--text);
+  cursor:pointer;white-space:nowrap;transition:.18s var(--ease);
+}
+.btn:hover{background:var(--surface-3)}
+.btn.primary{background:var(--accent);color:var(--accent-ink);font-weight:590}
+.btn.primary:hover{filter:brightness(1.06)}
+.btn.quiet{background:none;color:var(--muted)}
+.btn.quiet:hover{color:var(--text);background:var(--surface-2)}
+.btn.danger{background:none;color:var(--danger);border-color:color-mix(in srgb,var(--danger) 40%,transparent)}
+.btn[disabled]{opacity:.5;cursor:default}
+
+/* 标签 */
+.chip{
+  display:inline-flex;align-items:center;gap:5px;font-size:11.5px;padding:3px 9px;
+  border-radius:99px;background:var(--surface-2);border:1px solid var(--line);color:var(--text-2);
+}
+.chip.ok{color:var(--mint);border-color:color-mix(in srgb,var(--mint) 35%,transparent)}
+.chip.bad{color:var(--danger);border-color:color-mix(in srgb,var(--danger) 35%,transparent)}
+.chip.warn{color:var(--orange)}
+
+/* 表格：设计稿的 table.log */
+table.log{width:100%;border-collapse:collapse;font-size:12.3px}
+table.log th{
+  text-align:left;font-weight:500;font-size:11px;letter-spacing:.06em;text-transform:uppercase;
+  color:var(--faint);padding:0 10px 9px;border-bottom:1px solid var(--line);
+}
+table.log td{padding:10px;border-bottom:1px solid var(--line);color:var(--text-2)}
+table.log tr:last-child td{border-bottom:0}
+table.log td:first-child{color:var(--muted);font-family:var(--mono);font-size:11px}
+
+/* 表单 */
+label.field{display:flex;flex-direction:column;gap:5px}
+label.field > span{font-size:11px;color:var(--muted)}
+input,select,textarea{
+  font:inherit;font-size:13px;padding:8px 11px;border-radius:11px;
+  border:1px solid var(--line);background:var(--bg);color:var(--text);outline:none;width:100%;
+}
+input:focus,select:focus,textarea:focus{border-color:var(--accent)}
+textarea{resize:vertical;min-height:72px}
+
+/* 导航：顶部一排页码 */
+.nav{display:flex;gap:4px;align-items:center;padding:10px 14px;border-bottom:1px solid var(--line);background:var(--surface);position:sticky;top:0;z-index:5}
+.nav .brand{font-size:12.5px;font-weight:590;margin-right:8px}
+.nav button{background:none;border:0;font:inherit;font-size:12.5px;color:var(--muted);padding:5px 11px;border-radius:99px;cursor:pointer}
+.nav button:hover{background:var(--surface-2);color:var(--text)}
+.nav button[aria-current="page"]{background:var(--accent-soft);color:var(--accent);font-weight:590}
+
+/* 空态与提示 */
+.empty{border:1px dashed var(--line-strong);border-radius:var(--radius);padding:26px 16px;text-align:center;color:var(--muted);font-size:12.5px}
+.callout{border-left:2px solid var(--accent);background:var(--surface-2);border-radius:0 12px 12px 0;padding:10px 13px;font-size:12.5px;line-height:1.65;color:var(--text-2)}
+.callout.warn{border-color:var(--orange)}
+.callout.bad{border-color:var(--danger)}

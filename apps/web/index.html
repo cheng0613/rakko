@@ -814,6 +814,8 @@
   .app-window-head h3{margin:0;font-size:14.5px;font-weight:590}
   .app-window-head p{margin:2px 0 0;font-size:11px;color:var(--muted)}
   .app-window-body{flex:1;overflow:auto;padding:14px 16px 10px}
+  .app-window-body:has(> .app-frame){padding:0;overflow:hidden}
+  .app-frame{width:100%;height:100%;border:0;background:var(--bg);display:block}
   .app-head-tools{display:flex;gap:4px;margin-left:auto;flex:none}
   .app-head-tools .btn{font-size:11.5px;padding:4px 10px}
   .app-editor{display:flex;flex-direction:column;gap:10px;height:100%}
@@ -2370,6 +2372,12 @@
   };
 
   /* ---------------- 小应用 ---------------- */
+  /** 应用名 → 托管路径，跟服务端 slugOf 同一套规则 */
+  const slugOf = (name) => {
+    const base = String(name || '').trim().toLowerCase().replace(/[^p{L}p{N}]+/gu, '-').replace(/^-|-$/g, '');
+    return base || 'app';
+  };
+
   const openAppShell = async (id) => {
     try {
       let app = await api('/v1/apps/' + id);
@@ -2416,9 +2424,21 @@
 
       close.addEventListener('click', () => shell.remove());
 
+      /** 代码应用走 iframe（真代码真执行）；旧的 spec 应用仍用 genui 画 */
+      let frame = null;
       const drawApp = () => {
         body.innerHTML = '';
-        mountGenui(body, app.spec);
+        const hasCode = app.files && typeof app.files['index.html'] === 'string';
+        if (hasCode) {
+          frame = document.createElement('iframe');
+          frame.className = 'app-frame';
+          frame.src = '/app/' + encodeURIComponent(slugOf(app.name)) + '/?v=' + Date.now();
+          frame.setAttribute('sandbox', 'allow-scripts allow-forms allow-popups');
+          body.append(frame);
+          return;
+        }
+        frame = null;
+        mountGenui(body, app.spec || {});
       };
       drawApp();
 

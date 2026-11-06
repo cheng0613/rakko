@@ -12,6 +12,12 @@ import { currentPeriod, decideQuota, entityKey, normalizeEntityName, periodStart
 import { buildOverview, type RunOverviewRow, type RunsOverview, type ToolTally } from './overview.js';
 import type { App, AppVersion, Automation, Graph, Memory, MemoryStatus, Message, MessageKind, MessageRole, RiskLevel, Run, RunEvent, Settings, Skill, Thread, Usage } from '@rakko/protocol';
 
+/** 应用名 → URL 片段：中文名保留可读性，用 id 兜底 */
+export function slugOf(name: string): string {
+  const base = name.trim().toLowerCase().replace(/[^p{L}p{N}]+/gu, '-').replace(/^-|-$/g, '');
+  return base || 'app';
+}
+
 export interface AppendMessageInput {
   threadId: string;
   role: MessageRole;
@@ -91,9 +97,15 @@ export interface RunStore {
   /** 小应用：从对话里沉淀下来的界面 */
   listApps(): Promise<App[]>;
   getApp(id: string): Promise<App | null>;
-  createApp(input: { name: string; description?: string; spec: unknown; threadId?: string }): Promise<App>;
-  updateApp(id: string, patch: { name?: string; description?: string; spec?: unknown; threadId?: string | null }): Promise<App | null>;
+  createApp(input: { name: string; description?: string; spec?: unknown; files?: Record<string, string>; threadId?: string }): Promise<App>;
+  updateApp(id: string, patch: { name?: string; description?: string; spec?: unknown; files?: Record<string, string>; threadId?: string | null }): Promise<App | null>;
   deleteApp(id: string): Promise<boolean>;
+  /** 写一个文件进应用（会自动建应用）；返回最新的文件表 */
+  writeAppFile(appId: string, path: string, content: string): Promise<Record<string, string> | null>;
+  getAppBySlug(slug: string): Promise<App | null>;
+  /** 应用自己的键值：草稿、选中页 */
+  getAppKv(appId: string, key: string): Promise<unknown>;
+  setAppKv(appId: string, key: string, value: unknown): Promise<void>;
   /** 应用的历史版本（新的在前，最多留 20 个） */
   listAppVersions(appId: string): Promise<AppVersion[]>;
   /** 回滚到某个版本：当前版本会先被存成历史 */
@@ -745,13 +757,14 @@ export class MemoryStore implements RunStore {
     return this.apps.get(id) ?? null;
   }
 
-  async createApp(input: { name: string; description?: string; spec: unknown; threadId?: string }): Promise<App> {
+  async createApp(input: { name: string; description?: string; spec?: unknown; files?: Record<string, string>; threadId?: string }): Promise<App> {
     const at = now();
     const app: App = {
       id: randomUUID(),
       name: input.name,
       description: input.description ?? '',
-      spec: input.spec,
+      spec: input.spec ?? {},
+      files: input.files ?? null,
       threadId: input.threadId ?? null,
       createdAt: at,
       updatedAt: at,
@@ -760,7 +773,7 @@ export class MemoryStore implements RunStore {
     return app;
   }
 
-  async updateApp(id: string, patch: { name?: string; description?: string; spec?: unknown; threadId?: string | null }): Promise<App | null> {
+  async updateApp(id: string, patch: { name?: string; description?: string; spec?: unknown; files?: Record<string, string>; threadId?: string | null }): Promise<App | null> {
     const current = this.apps.get(id);
     if (!current) return null;
 
@@ -773,6 +786,7 @@ export class MemoryStore implements RunStore {
       ...(patch.name !== undefined ? { name: patch.name } : {}),
       ...(patch.description !== undefined ? { description: patch.description } : {}),
       ...(patch.spec !== undefined ? { spec: patch.spec } : {}),
+      ...(patch.files !== undefined ? { files: patch.files } : {}),
       ...(patch.threadId !== undefined ? { threadId: patch.threadId } : {}),
       updatedAt: now(),
     };
@@ -783,6 +797,28 @@ export class MemoryStore implements RunStore {
   async deleteApp(id: string): Promise<boolean> {
     this.versions.delete(id);
     return this.apps.delete(id);
+  }
+
+  private readonly kv = new Map<string, unknown>();
+
+  async writeAppFile(appId: string, path: string, content: string): Promise<Record<string, string> | null> {
+    const current = this.apps.get(appId);
+    if (!current) return null;
+    const files = { ...(current.files ?? {}), [path]: content };
+    await this.updateApp(appId, { files });
+    return files;
+  }
+
+  async getAppBySlug(slug: string): Promise<App | null> {
+    return [...this.apps.values()].find((app) => slugOf(app.name) === slug) ?? null;
+  }
+
+  async getAppKv(appId: string, key: string): Promise<unknown> {
+    return this.kv.get(appId + '/' + key) ?? null;
+  }
+
+  async setAppKv(appId: string, key: string, value: unknown): Promise<void> {
+    this.kv.set(appId + '/' + key, value);
   }
 
   private readonly versions = new Map<string, AppVersion[]>();

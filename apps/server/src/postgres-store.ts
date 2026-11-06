@@ -10,13 +10,13 @@
 import { and, asc, desc, eq, ilike, inArray, isNotNull, isNull, lt, notInArray, or, sql } from 'drizzle-orm';
 
 import type { DbHandle } from '@rakko/db';
-import { appVersions, apps, automations, kgEdges, kgNodes, memories, messages, runEvents, runs, skills, threads, usageLedger, users } from '@rakko/db';
+import { appKv, appVersions, apps, automations, kgEdges, kgNodes, memories, messages, runEvents, runs, skills, threads, usageLedger, users } from '@rakko/db';
 import { currentPeriod, decideQuota, periodStart, planLimit, type QuotaDecision } from '@rakko/core';
 import type { App, AppVersion, Automation, Graph, KgEdge, KgNode, Memory, MemoryKind, MemoryStatus, Message, MessageKind, RiskLevel, Run, RunEvent, RunState, Settings, Skill, Thread, Usage } from '@rakko/protocol';
 
 import { entityKey, normalizeEntityName, toVectorLiteral } from '@rakko/core';
 
-import { BUILTIN_SKILLS } from './store.js';
+import { BUILTIN_SKILLS, slugOf } from './store.js';
 import { buildOverview, type RunOverviewRow, type RunsOverview, type ToolTally } from './overview.js';
 import type {
   AppendMessageInput,
@@ -57,6 +57,7 @@ const toApp = (row: typeof apps.$inferSelect): App => ({
   name: row.name,
   description: row.description,
   spec: row.spec,
+  files: (row.files as Record<string, string> | null) ?? null,
   threadId: row.threadId,
   createdAt: row.createdAt.toISOString(),
   updatedAt: row.updatedAt.toISOString(),
@@ -250,6 +251,38 @@ export class PostgresStore implements RunStore {
    * 跨运行概览。列表用一条 SQL 出（事件表按 run_id 聚合，不把几千条事件读进来），
    * 工具成败单独数一条 —— 只有它需要把 tool_call 和 tool_result 按 callId 配上对。
    */
+  async writeAppFile(appId: string, path: string, content: string): Promise<Record<string, string> | null> {
+    const app = await this.getApp(appId);
+    if (!app) return null;
+    const files = { ...(app.files ?? {}), [path]: content };
+    const updated = await this.updateApp(appId, { files });
+    return updated ? files : null;
+  }
+
+  async getAppBySlug(slug: string): Promise<App | null> {
+    const items = await this.listApps();
+    return items.find((app) => slugOf(app.name) === slug) ?? null;
+  }
+
+  async getAppKv(appId: string, key: string): Promise<unknown> {
+    const [row] = await this.db
+      .select()
+      .from(appKv)
+      .where(and(eq(appKv.appId, appId), eq(appKv.key, key)))
+      .limit(1);
+    return row ? row.value : null;
+  }
+
+  async setAppKv(appId: string, key: string, value: unknown): Promise<void> {
+    await this.db
+      .insert(appKv)
+      .values({ appId, key, value: value as never })
+      .onConflictDoUpdate({
+        target: [appKv.appId, appKv.key],
+        set: { value: value as never, updatedAt: new Date() },
+      });
+  }
+
   async listAppVersions(appId: string): Promise<AppVersion[]> {
     const userId = this.requireUserId();
     const [app] = await this.db
@@ -295,7 +328,7 @@ export class PostgresStore implements RunStore {
     return row ? toApp(row) : null;
   }
 
-  async createApp(input: { name: string; description?: string; spec: unknown; threadId?: string }): Promise<App> {
+  async createApp(input: { name: string; description?: string; spec?: unknown; files?: Record<string, string>; threadId?: string }): Promise<App> {
     const userId = this.requireUserId();
     const [row] = await this.db
       .insert(apps)
@@ -303,7 +336,8 @@ export class PostgresStore implements RunStore {
         userId,
         name: input.name,
         description: input.description ?? '',
-        spec: input.spec,
+        spec: (input.spec ?? {}) as never,
+        files: (input.files ?? null) as never,
         threadId: input.threadId ?? null,
       })
       .returning();
@@ -311,7 +345,7 @@ export class PostgresStore implements RunStore {
     return toApp(row);
   }
 
-  async updateApp(id: string, patch: { name?: string; description?: string; spec?: unknown; threadId?: string | null }): Promise<App | null> {
+  async updateApp(id: string, patch: { name?: string; description?: string; spec?: unknown; files?: Record<string, string>; threadId?: string | null }): Promise<App | null> {
     const userId = this.requireUserId();
 
     // 界面真变了先存一份旧版本；只改名字/线程不动历史
@@ -348,7 +382,8 @@ export class PostgresStore implements RunStore {
       .set({
         ...(patch.name !== undefined ? { name: patch.name } : {}),
         ...(patch.description !== undefined ? { description: patch.description } : {}),
-        ...(patch.spec !== undefined ? { spec: patch.spec } : {}),
+        ...(patch.spec !== undefined ? { spec: patch.spec as never } : {}),
+        ...(patch.files !== undefined ? { files: patch.files as never } : {}),
         ...(patch.threadId !== undefined ? { threadId: patch.threadId } : {}),
         updatedAt: new Date(),
       })

@@ -255,8 +255,10 @@ export const apps = pgTable(
       .references(() => users.id, { onDelete: 'cascade' }),
     name: text('name').notNull(),
     description: text('description').notNull().default(''),
-    /** genui 组件树；打开时按它渲染，不是代码 */
+    /** genui 组件树（旧的应用形态，留着读，不再写） */
     spec: jsonb('spec').notNull(),
+    /** 代码应用的文件表：{ "index.html": "...", "app.js": "..." } */
+    files: jsonb('files'),
     /** 从哪个会话来的，方便回看上下文 */
     threadId: uuid('thread_id').references(() => threads.id, { onDelete: 'set null' }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
@@ -279,6 +281,21 @@ export const appVersions = pgTable(
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [index('app_versions_app_idx').on(table.appId, table.createdAt)],
+);
+
+/** 应用自己的键值：存草稿、记住选中页，关掉再打开还在 */
+export const appKv = pgTable(
+  'app_kv',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    appId: uuid('app_id')
+      .notNull()
+      .references(() => apps.id, { onDelete: 'cascade' }),
+    key: text('key').notNull(),
+    value: jsonb('value'),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [uniqueIndex('app_kv_app_key_uq').on(table.appId, table.key)],
 );
 
 export const threadsRelations = relations(threads, ({ many }) => ({
@@ -306,6 +323,7 @@ export const TABLES = [
   kgEdges,
   apps,
   appVersions,
+  appKv,
 ] as const;
 
 export type User = typeof users.$inferSelect;
@@ -321,3 +339,4 @@ export type KgNode = typeof kgNodes.$inferSelect;
 export type KgEdge = typeof kgEdges.$inferSelect;
 export type App = typeof apps.$inferSelect;
 export type AppVersion = typeof appVersions.$inferSelect;
+export type AppKvRow = typeof appKv.$inferSelect;

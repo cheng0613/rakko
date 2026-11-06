@@ -115,6 +115,8 @@ export const appSchema = z.object({
   name: z.string(),
   description: z.string(),
   spec: z.unknown(),
+  /** 代码应用的文件表；spec 是旧形态 */
+  files: z.record(z.string(), z.string()).nullable(),
   threadId: id.nullable(),
   createdAt: at,
   updatedAt: at,
@@ -135,7 +137,8 @@ export type AppVersion = z.infer<typeof appVersionSchema>;
 export const createAppInput = z.object({
   name: z.string().trim().min(1).max(40),
   description: z.string().trim().max(200).optional(),
-  spec: z.unknown(),
+  spec: z.unknown().optional(),
+  files: z.record(z.string(), z.string()).optional(),
   threadId: id.optional(),
 });
 export type CreateAppInput = z.infer<typeof createAppInput>;
@@ -144,6 +147,7 @@ export const updateAppInput = z.object({
   name: z.string().trim().min(1).max(40).optional(),
   description: z.string().trim().max(200).optional(),
   spec: z.unknown().optional(),
+  files: z.record(z.string(), z.string()).optional(),
   /** 应用自己的对话线程：底部输入框把话发到这里 */
   threadId: id.nullable().optional(),
 });

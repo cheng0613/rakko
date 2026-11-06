@@ -48,7 +48,7 @@ import { describeCron, selectDue, validateCron } from './automation.js';
 import { extractMemories } from './memory-extract.js';
 import { summarizeTrace } from './trace.js';
 import { validateTree } from '@rakko/genui';
-import { MemoryStore, type PendingCall, type RunStore } from './store.js';
+import { MemoryStore, slugOf, type PendingCall, type RunStore } from './store.js';
 
 const invalid = (issues: unknown[]) => ({ error: 'invalid_request', message: '请求体不合法', issues });
 
@@ -170,6 +170,57 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
     },
   };
 
+  /**
+   * 让 agent 直接写应用的文件。
+   * 一个应用 = 一个目录（存在 apps.files 里），index.html 是入口，平台从 /app/<name>/ 托管。
+   */
+  const writeAppFileTool: ToolSpec = {
+    name: 'write_app_file',
+    description:
+      '写一个文件进「小应用」。应用名不存在就新建。path 用相对路径，入口必须是 index.html。' +
+      '应用跑在 /app/<应用名>/ 下，是真正的 HTML/JS/CSS（不是 genui 树）。' +
+      '可以引用 /tokens.css（设计稿的颜色字号圆角）和 /app-runtime.js（RakkoApp.api / RakkoApp.state / RakkoApp.agent）；' +
+      '数据接口有 /app-api/runs、/app-api/automations、/app-api/memories、/app-api/apps、/app-api/me。',
+    risk: 'medium',
+    requiresApproval: false,
+    jsonSchema: {
+      type: 'object',
+      properties: {
+        app: { type: 'string', description: '应用名，例如「运行体检」' },
+        path: { type: 'string', description: '文件相对路径，例如 index.html / app.js / style.css' },
+        content: { type: 'string', description: '完整文件内容' },
+        description: { type: 'string', description: '一句话说明（只在新建时使用）' },
+      },
+      required: ['app', 'path', 'content'],
+    },
+    run: async (args) => {
+      const input = args as { app?: unknown; path?: unknown; content?: unknown; description?: unknown };
+      const name = typeof input.app === 'string' ? input.app.trim().slice(0, 40) : '';
+      const rel = typeof input.path === 'string' ? input.path.trim().replace(/^[./]+/, '') : '';
+      const content = typeof input.content === 'string' ? input.content : '';
+      if (!name) return JSON.stringify({ ok: false, error: 'app 不能为空' });
+      if (!rel || rel.includes('..') || rel.startsWith('/')) return JSON.stringify({ ok: false, error: 'path 必须是应用内的相对路径' });
+      if (content.length > 200_000) return JSON.stringify({ ok: false, error: '文件太大（上限 200KB），拆成多个文件' });
+
+      const existing = (await store.listApps()).find((item) => item.name === name);
+      const target =
+        existing ??
+        (await store.createApp({
+          name,
+          ...(typeof input.description === 'string' ? { description: input.description.trim().slice(0, 200) } : {}),
+        }));
+
+      const files = await store.writeAppFile(target.id, rel, content);
+      const hasEntry = Boolean(files && typeof files['index.html'] === 'string');
+      return JSON.stringify({
+        ok: true,
+        app: { id: target.id, name: target.name, url: `/app/${slugOf(target.name)}/` },
+        files: Object.keys(files ?? {}),
+        ...(hasEntry ? {} : { hint: '还差 index.html —— 没有入口，应用打不开' }),
+      });
+    },
+  };
+
   const tools = options.tools ?? new ToolRegistry({ workspace });
   if (!options.tools) {
     for (const tool of createBuiltinTools({ workspace })) tools.register(tool);
@@ -177,6 +228,7 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
   // save_app 依赖 store，属于服务端能力，不管有没有传 tools 都要有
   if (!tools.get('save_app')) tools.register(saveAppTool);
   if (!tools.get('read_overview')) tools.register(overviewTool);
+  if (!tools.get('write_app_file')) tools.register(writeAppFileTool);
 
   const gate = new ApprovalGate({ timeoutMs: options.approvalTimeoutMs ?? 10 * 60_000 });
   /** 用户点过「允许这类」的工具；启动时从设置里读回来 */
@@ -226,6 +278,109 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
     try {
       const body = await readFile(path.join(webDir, 'vendor', file), 'utf8');
       return reply.type('application/javascript; charset=utf-8').header('cache-control', 'no-store').send(body);
+    } catch {
+      return reply.code(404).send({ error: 'not_found', message: '没有这个文件' });
+    }
+  });
+
+  /* ---------------- 代码应用的托管 ---------------- */
+
+  const CONTENT_TYPES: Record<string, string> = {
+    html: 'text/html; charset=utf-8',
+    js: 'application/javascript; charset=utf-8',
+    css: 'text/css; charset=utf-8',
+    json: 'application/json; charset=utf-8',
+    svg: 'image/svg+xml',
+    txt: 'text/plain; charset=utf-8',
+  };
+
+  async function resolveApp(slug: string): Promise<App | null> {
+    const byStore = await resolveApp(slug).catch(() => null);
+    if (byStore) return byStore;
+    const items = await store.listApps();
+    const needle = slug.trim().toLowerCase();
+    return (
+      items.find((app) => app.id === slug) ??
+      items.find((app) => app.name.toLowerCase() === needle) ??
+      items.find((app) => slugOf(app.name) === needle) ??
+      null
+    );
+  }
+
+  app.get('/app/:slug', async (request, reply) => reply.redirect(`/app/${(request.params as { slug: string }).slug}/`));
+
+  app.get('/app/:slug/', async (request, reply) => {
+    const { slug } = request.params as { slug: string };
+    const target = await resolveApp(slug);
+    if (!target) return reply.code(404).type('text/html; charset=utf-8').send('<p>没有这个应用</p>');
+    const html = target.files?.['index.html'];
+    if (typeof html !== 'string') {
+      return reply
+        .code(409)
+        .type('text/html; charset=utf-8')
+        .send('<p>这个应用还没有 index.html。让它写一个就开始。</p>');
+    }
+    return reply.type('text/html; charset=utf-8').header('cache-control', 'no-store').send(html);
+  });
+
+  app.get('/app/:slug/:file', async (request, reply) => {
+    const { slug, file } = request.params as { slug: string; file: string };
+    const target = await resolveApp(slug);
+    if (!target) return reply.code(404).send({ error: 'app_not_found', message: '没有这个应用' });
+    const body = target.files?.[file];
+    if (typeof body !== 'string') return reply.code(404).send({ error: 'file_not_found', message: '没有这个文件' });
+    const ext = file.split('.').pop() ?? '';
+    return reply.type(CONTENT_TYPES[ext] ?? 'application/octet-stream').header('cache-control', 'no-store').send(body);
+  });
+
+  /**
+   * 应用专用的数据接口。
+   * 只读平台自己的东西 —— 不碰工作区、不发外网；写得越窄，生成的代码越安全。
+   */
+  app.get('/app-api/runs', async () => store.runsOverview(30));
+  app.get('/app-api/automations', async () => {
+    const items = await store.listAutomations();
+    return { items: items.map((item) => ({ ...item, human: describeCron(item.schedule) })) };
+  });
+  app.get('/app-api/memories', async () => ({ items: await store.listMemories() }));
+  app.get('/app-api/apps', async () => {
+    const items = await store.listApps();
+    return { items: items.map((item) => ({ id: item.id, name: item.name, description: item.description })) };
+  });
+  app.get('/app-api/me', async () => {
+    const [usage, settings] = await Promise.all([store.usage(), store.getSettings()]);
+    return { usage, settings: { theme: (settings as Record<string, unknown>).theme ?? 'auto', plan: usage.plan } };
+  });
+
+  /** 应用自己的键值：草稿、记住选中页 */
+  app.get('/app-api/kv/:slug/:key', async (request, reply) => {
+    const { slug, key } = request.params as { slug: string; key: string };
+    const target = await resolveApp(slug);
+    if (!target) return reply.code(404).send({ error: 'app_not_found', message: '没有这个应用' });
+    return { value: await store.getAppKv(target.id, key) };
+  });
+
+  app.put('/app-api/kv/:slug/:key', async (request, reply) => {
+    const { slug, key } = request.params as { slug: string; key: string };
+    const target = await resolveApp(slug);
+    if (!target) return reply.code(404).send({ error: 'app_not_found', message: '没有这个应用' });
+    await store.setAppKv(target.id, key, (request.body as { value?: unknown } | null)?.value ?? null);
+    return { ok: true };
+  });
+
+  app.get('/app-runtime.js', async (_request, reply) => {
+    try {
+      const body = await readFile(path.join(webDir, 'vendor', 'app-runtime.js'), 'utf8');
+      return reply.type('application/javascript; charset=utf-8').header('cache-control', 'no-store').send(body);
+    } catch {
+      return reply.code(404).send({ error: 'not_found', message: '没有这个文件' });
+    }
+  });
+
+  app.get('/tokens.css', async (_request, reply) => {
+    try {
+      const body = await readFile(path.join(webDir, 'vendor', 'tokens.css'), 'utf8');
+      return reply.type('text/css; charset=utf-8').header('cache-control', 'no-store').send(body);
     } catch {
       return reply.code(404).send({ error: 'not_found', message: '没有这个文件' });
     }
@@ -670,8 +825,10 @@ export function createApp(options: AppOptions = {}): FastifyInstance {
   app.post('/v1/apps', async (request, reply) => {
     const parsed = createAppInput.safeParse(request.body ?? {});
     if (!parsed.success) return reply.code(400).send(invalid(parsed.error.issues));
-    const problem = validSpec(parsed.data.spec);
-    if (problem) return reply.code(400).send({ error: 'invalid_spec', message: `界面不合法：${problem}` });
+    if (parsed.data.spec !== undefined) {
+      const problem = validSpec(parsed.data.spec);
+      if (problem) return reply.code(400).send({ error: 'invalid_spec', message: `界面不合法：${problem}` });
+    }
     return reply.code(201).send(await store.createApp(parsed.data));
   });
 
