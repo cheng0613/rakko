@@ -2716,7 +2716,11 @@
       const body = await api('/v1/apps');
       renderApps(body.items || []);
     } catch (error) {
-      toast('读不到应用：' + error.message);
+      const empty = $('#appsEmpty');
+      if (empty) {
+        empty.hidden = false;
+        empty.textContent = '读不到应用列表：' + error.message;
+      }
     }
   };
 
@@ -3105,8 +3109,9 @@
     renderRecents();
   };
 
-  const openThread = async (id) => {
-    if (currentView !== 'chat') setView('chat');
+  const openThread = async (id, options = {}) => {
+    // boot 会自动打开最近会话；如果用户已经点了别的页，就别把他拽回对话
+    if (!options.keepView && currentView !== 'chat') setView('chat');
     state.threadId = id;
     state.pendingCallId = null;
     closeStream();
@@ -3385,7 +3390,8 @@
     item.addEventListener('click', () => {
       document.querySelectorAll('.nav-item').forEach((other) => other.classList.remove('active'));
       item.classList.add('active');
-      if (['chat', 'tasks', 'memory', 'skills', 'settings'].includes(item.dataset.nav)) setView(item.dataset.nav);
+      // 用视图表判断，加了新页就不会漏（之前漏了「应用」，点了只会提示「还没做」）
+      if (item.dataset.nav && item.dataset.nav in views) setView(item.dataset.nav);
       else toast('「' + item.textContent.trim() + '」还没做');
       closeSide();
     });
@@ -4219,8 +4225,11 @@
       try { state.settings = await api('/v1/settings'); } catch { state.settings = null; }
       // ?thread=<id> 直接打开某个会话（深链，调试截图也靠它）
       const wantedThread = params.get('thread');
-      if (wantedThread) await openThread(wantedThread);
-      else if (state.threads[0]) await openThread(state.threads[0].id);
+      if (wantedThread) {
+        await openThread(wantedThread);
+      } else if (state.threads[0] && currentView === 'chat') {
+        await openThread(state.threads[0].id, { keepView: true });
+      }
 
       const query = params.get('q');
       if (query) {
