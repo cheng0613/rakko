@@ -2374,8 +2374,15 @@
   /* ---------------- 小应用 ---------------- */
   /** 应用名 → 托管路径，跟服务端 slugOf 同一套规则 */
   const slugOf = (name) => {
-    const base = String(name || '').trim().toLowerCase().replace(/[^p{L}p{N}]+/gu, '-').replace(/^-|-$/g, '');
-    return base || 'app';
+    let out = '';
+    for (const ch of String(name || '').trim().toLowerCase()) {
+      const code = ch.codePointAt(0) || 0;
+      const keep = (code >= 48 && code <= 57) || (code >= 97 && code <= 122) || code >= 0x2e80;
+      if (keep) out += ch;
+      else if (!out.endsWith('-')) out += '-';
+    }
+    const trimmed = out.replace(/^-+|-+$/g, '');
+    return trimmed || 'app';
   };
 
   const openAppShell = async (id) => {

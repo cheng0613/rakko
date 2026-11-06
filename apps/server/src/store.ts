@@ -14,8 +14,15 @@ import type { App, AppVersion, Automation, Graph, Memory, MemoryStatus, Message,
 
 /** 应用名 → URL 片段：中文名保留可读性，用 id 兜底 */
 export function slugOf(name: string): string {
-  const base = name.trim().toLowerCase().replace(/[^p{L}p{N}]+/gu, '-').replace(/^-|-$/g, '');
-  return base || 'app';
+  let out = '';
+  for (const ch of String(name || '').trim().toLowerCase()) {
+    const code = ch.codePointAt(0) || 0;
+    const keep = (code >= 48 && code <= 57) || (code >= 97 && code <= 122) || code >= 0x2e80;
+    if (keep) out += ch;
+    else if (!out.endsWith('-')) out += '-';
+  }
+  const trimmed = out.replace(/^-+|-+$/g, '');
+  return trimmed || 'app';
 }
 
 export interface AppendMessageInput {

@@ -293,6 +293,7 @@ export const appKv = pgTable(
       .references(() => apps.id, { onDelete: 'cascade' }),
     key: text('key').notNull(),
     value: jsonb('value'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [uniqueIndex('app_kv_app_key_uq').on(table.appId, table.key)],
