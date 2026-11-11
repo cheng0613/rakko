@@ -4,4 +4,8 @@ export * from "./pi/resolve-pi.js";
 export * from "./pi/env.js";
 export * from "./pi/translator.js";
 export * from "./pi/host.js";
+export * from "./pi/bridge-source.js";
 export * from "./session/runtime.js";
+export * from "./session/permission-store.js";
+export * from "./provider/store.js";
+export * from "./provider/probe.js";

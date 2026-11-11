@@ -16,9 +16,14 @@ import type {
   StartSessionInput,
 } from "@rakko/shared";
 import type { SessionManager } from "../session/manager.js";
+import type { ProviderService } from "../provider/service.js";
 import { readBootstrapProviders, toModelSummaries } from "../bootstrap-config.js";
 
-export function registerIpc(ipcMain: IpcMain, sessions: SessionManager): void {
+export function registerIpc(
+  ipcMain: IpcMain,
+  sessions: SessionManager,
+  providers: ProviderService,
+): void {
   ipcMain.handle(IPC.getAppInfo, () => ({
     name: PRODUCT_NAME,
     version: app.getVersion(),
@@ -28,6 +33,43 @@ export function registerIpc(ipcMain: IpcMain, sessions: SessionManager): void {
   ipcMain.handle(IPC.listModels, () => {
     const { providers } = readBootstrapProviders();
     return toModelSummaries(providers);
+  });
+
+  // ── 运营商配置 ──
+  ipcMain.handle(IPC.listProviders, async () => providers.list());
+
+  ipcMain.handle(IPC.createProvider, async (_e, input: unknown) => {
+    assertShape(input, ["id", "name", "api", "baseUrl", "models"], "createProvider");
+    return providers.create(input as Parameters<ProviderService["create"]>[0]);
+  });
+
+  ipcMain.handle(IPC.updateProvider, async (_e, payload: unknown) => {
+    assertShape(payload, ["id", "patch"], "updateProvider");
+    const { id, patch } = payload as { id: string; patch: Record<string, unknown> };
+    if (typeof id !== "string" || id.length === 0) {
+      throw new Error("updateProvider: id 必须是非空字符串");
+    }
+    if (typeof patch !== "object" || patch === null) {
+      throw new Error("updateProvider: patch 必须是对象");
+    }
+    return providers.update(id, patch as Parameters<ProviderService["update"]>[1]);
+  });
+
+  ipcMain.handle(IPC.deleteProvider, async (_e, id: unknown) => {
+    if (typeof id !== "string" || id.length === 0) {
+      throw new Error("deleteProvider: id 必须是非空字符串");
+    }
+    await providers.remove(id);
+  });
+
+  ipcMain.handle(IPC.listRemoteModels, async (_e, input: unknown) => {
+    assertShape(input, ["baseUrl", "apiKey"], "listRemoteModels");
+    return providers.listRemote(input as Parameters<ProviderService["listRemote"]>[0]);
+  });
+
+  ipcMain.handle(IPC.testProvider, async (_e, input: unknown) => {
+    assertShape(input, ["baseUrl", "apiKey", "model"], "testProvider");
+    return providers.test(input as Parameters<ProviderService["test"]>[0]);
   });
 
   // ── 项目与会话（P0 先返回空，持久化在后续步骤）──

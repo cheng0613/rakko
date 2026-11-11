@@ -4,6 +4,7 @@
  * 只放类型，不放实现。preload 与 renderer 都 import 这里，保证两端签名一致。
  */
 import type { AgentEvent, PermissionDecision } from "./agent-event.js";
+import type { ModelDescriptor, PiApiForm } from "./model-catalog.js";
 import type { PermissionMode } from "./permission.js";
 
 export interface ProjectInfo {
@@ -46,6 +47,65 @@ export interface ModelSummary {
   modelId: string;
   modelName: string;
   contextWindow: number;
+}
+
+/**
+ * 运营商（provider）在渲染层的视图。
+ * **没有 key**，只有掩码与「是否已配置」。
+ */
+export interface ProviderView {
+  id: string;
+  name: string;
+  api: PiApiForm;
+  baseUrl: string;
+  models: ModelDescriptor[];
+  /** 掩码后的 key，如 sk-•••••abcd */
+  keyMask: string;
+  hasKey: boolean;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** 新建或更新 provider 的输入 */
+export interface UpsertProviderInput {
+  id: string;
+  name: string;
+  api: PiApiForm;
+  baseUrl: string;
+  models: ModelDescriptor[];
+  /**
+   * key 三态：
+   *   - 省略：保持原值（更新时）／不设 key（新建时）
+   *   - 空串：清空
+   *   - 非空：替换
+   */
+  apiKey?: string;
+}
+
+export interface ListRemoteModelsInput {
+  baseUrl: string;
+  apiKey: string;
+}
+
+export interface ListRemoteModelsResult {
+  ok: boolean;
+  models: Array<{ id: string }>;
+  status: number;
+  error?: string;
+}
+
+export interface TestProviderInput {
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+}
+
+export interface TestProviderResult {
+  ok: boolean;
+  latencyMs: number;
+  status: number;
+  reply?: string;
+  error?: string;
 }
 
 export interface PermissionResolveInput {
@@ -106,6 +166,20 @@ export interface RakkoApi {
    */
   listModels(): Promise<ModelSummary[]>;
 
+  // ── 运营商配置 ──
+  /** 列出已配置的运营商（不含 key） */
+  listProviders(): Promise<ProviderView[]>;
+  /** 新建 */
+  createProvider(input: UpsertProviderInput): Promise<ProviderView>;
+  /** 更新 */
+  updateProvider(id: string, input: Partial<UpsertProviderInput>): Promise<ProviderView>;
+  /** 删除 */
+  deleteProvider(id: string): Promise<void>;
+  /** 从上游拉模型列表（用临时 key，不落盘） */
+  listRemoteModels(input: ListRemoteModelsInput): Promise<ListRemoteModelsResult>;
+  /** 测试连通性（发一条 1 token 的请求） */
+  testProvider(input: TestProviderInput): Promise<TestProviderResult>;
+
   /** 应用配置（目前只有产品名与版本，给窗口标题用） */
   getAppInfo(): Promise<{ name: string; version: string }>;
 }
@@ -125,4 +199,10 @@ export const IPC = {
   agentEvent: "rakko:agent-event",
   getAppInfo: "rakko:get-app-info",
   listModels: "rakko:list-models",
+  listProviders: "rakko:list-providers",
+  createProvider: "rakko:create-provider",
+  updateProvider: "rakko:update-provider",
+  deleteProvider: "rakko:delete-provider",
+  listRemoteModels: "rakko:list-remote-models",
+  testProvider: "rakko:test-provider",
 } as const;

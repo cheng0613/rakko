@@ -16,9 +16,11 @@ const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 import { PRODUCT_NAME } from "@rakko/shared";
 import { registerIpc } from "./ipc/register.js";
 import { SessionManager } from "./session/manager.js";
+import { ProviderService } from "./provider/service.js";
 
 let mainWindow: BrowserWindow | null = null;
 let sessions: SessionManager | null = null;
+let providerService: ProviderService | null = null;
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({
@@ -55,7 +57,8 @@ function createWindow(): void {
 
 void app.whenReady().then(() => {
   sessions = new SessionManager({ getWindow: () => mainWindow });
-  registerIpc(ipcMain, sessions);
+  providerService = new ProviderService();
+  registerIpc(ipcMain, sessions, providerService);
 
   createWindow();
 

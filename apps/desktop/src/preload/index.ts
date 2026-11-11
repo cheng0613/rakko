@@ -21,6 +21,13 @@ const api: RakkoApi = {
   getAppInfo: () => ipcRenderer.invoke(IPC.getAppInfo),
   listModels: () => ipcRenderer.invoke(IPC.listModels),
 
+  listProviders: () => ipcRenderer.invoke(IPC.listProviders),
+  createProvider: (input) => ipcRenderer.invoke(IPC.createProvider, input),
+  updateProvider: (id, patch) => ipcRenderer.invoke(IPC.updateProvider, { id, patch }),
+  deleteProvider: (id) => ipcRenderer.invoke(IPC.deleteProvider, id),
+  listRemoteModels: (input) => ipcRenderer.invoke(IPC.listRemoteModels, input),
+  testProvider: (input) => ipcRenderer.invoke(IPC.testProvider, input),
+
   onAgentEvent: (sessionId: string, handler: (event: AgentEvent) => void): Unsubscribe => {
     const listener = (_e: unknown, payload: { sessionId: string; event: AgentEvent }) => {
       if (payload.sessionId !== sessionId) return;
