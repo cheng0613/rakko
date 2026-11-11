@@ -1,0 +1,9 @@
+packages:
+  - "packages/*"
+  - "apps/*"
+
+# pnpm 12：构建脚本白名单。只有确实需要编译的依赖才放行，其余一律不跑脚本。
+allowBuilds:
+  esbuild: true
+  electron: true
+  better-sqlite3: true

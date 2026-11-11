@@ -1,0 +1,20 @@
+node_modules/
+dist/
+out/
+build/
+*.tsbuildinfo
+
+# 环境变量与凭据：任何情况下都不进仓库
+.env
+.env.*
+!.env.example
+
+# 运行时产物
+.local/
+*.log
+coverage/
+
+# 编辑器
+.vscode/
+.idea/
+.DS_Store
