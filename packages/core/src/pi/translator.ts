@@ -219,14 +219,45 @@ function num(v: unknown): number {
 }
 
 /** 把工具结果压成纯文本，UI 只显示文本，结构化部分暂不展示 */
+/** 工具输出上限。超过就截断，避免长命令把 DOM 撑爆 */
+const TOOL_OUTPUT_LIMIT = 32_000;
+
+/**
+ * 去掉终端 ANSI 转义序列。
+ *
+ * dogfood 实测：`npx vitest` 的输出带 `\u001b[31m` 之类的颜色码，
+ * 直接显示在界面上是不可见字符，或者变成乱码。
+ *
+ * 覆盖：CSI（颜色、光标）、OSC（超链接、标题）、以及零散的 ESC 序列。
+ */
+export function stripAnsi(input: string): string {
+  // eslint-disable-next-line no-control-regex
+  return input
+    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "")
+    .replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\\\)/g, "")
+    .replace(/\u001b[@-Z\\\\-_]/g, "")
+    .replace(/\r\n/g, "\n");
+}
+
 function extractToolText(result: PiToolResult | undefined): string {
   if (!result) return "";
-  const content = result.content;
-  if (!Array.isArray(content)) return JSON.stringify(result).slice(0, 4000);
-  return content
-    .filter((c) => c.type === "text" && typeof c.text === "string")
-    .map((c) => c.text as string)
-    .join("\n");
+
+  const raw = (() => {
+    const content = result.content;
+    if (!Array.isArray(content)) return JSON.stringify(result);
+    return content
+      .filter((c) => c.type === "text" && typeof c.text === "string")
+      .map((c) => c.text as string)
+      .join("\n");
+  })();
+
+  const clean = stripAnsi(raw);
+
+  if (clean.length <= TOOL_OUTPUT_LIMIT) return clean;
+  // 保留开头与结尾：头通常是上下文，尾通常是结论/报错
+  const head = clean.slice(0, TOOL_OUTPUT_LIMIT - 5000);
+  const tail = clean.slice(-4500);
+  return `${head}\n\n…（中间省略 ${clean.length - TOOL_OUTPUT_LIMIT} 字符）…\n\n${tail}`;
 }
 
 /**
