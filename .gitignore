@@ -18,3 +18,7 @@ coverage/
 .vscode/
 .idea/
 .DS_Store
+
+# pi 运行时：开发期用系统已装的（方案 C），不把 134MB 拷进仓库
+resources/pi-full/
+resources/pi/
