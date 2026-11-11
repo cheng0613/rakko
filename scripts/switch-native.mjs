@@ -32,7 +32,7 @@ const ACTIVE = path.join(RELEASE_DIR, "better_sqlite3.node");
 const NODE_BACKUP = path.join(RELEASE_DIR, "better_sqlite3.node.nodeabi");
 const ELECTRON_BACKUP = path.join(RELEASE_DIR, "better_sqlite3.node.electronabi");
 
-const ELECTRON_VERSION = "33.4.11";
+const ELECTRON_VERSION = "35.7.5";
 
 function exists(p) {
   return fs.existsSync(p);

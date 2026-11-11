@@ -214,6 +214,7 @@ export async function startSession(options: StartSessionOptions): Promise<Sessio
   // ── 3. pi 入口与 node 二进制 ──
   let piEntry: string;
   let nodePath: string;
+  let nodeExtraEnv: Record<string, string> | undefined;
   try {
     const resolved = await resolvePiEntry();
     piEntry = resolved.entry;
@@ -221,7 +222,13 @@ export async function startSession(options: StartSessionOptions): Promise<Sessio
 
     const node = await resolveNodeBinary();
     nodePath = node.path;
-    log("info", "node 二进制", { path: nodePath, version: node.version, source: node.source });
+    nodeExtraEnv = node.extraEnv;
+    log("info", "node 二进制", {
+      path: nodePath,
+      version: node.version,
+      source: node.source,
+      ...(node.extraEnv ? { extraEnv: Object.keys(node.extraEnv) } : {}),
+    });
   } catch (e) {
     throw new SessionStartError(`找不到 pi 或 node：${(e as Error).message}`, "resolve-pi", e);
   }
@@ -280,6 +287,7 @@ export async function startSession(options: StartSessionOptions): Promise<Sessio
   // ── 6. spawn ──
   const host = new PiHost({
     nodePath,
+    ...(nodeExtraEnv ? { nodeExtraEnv } : {}),
     piEntry,
     sessionId,
     agentHome,

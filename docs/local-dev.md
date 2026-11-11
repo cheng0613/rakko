@@ -61,3 +61,68 @@ proxy 没起来或端口被占。检查 `[proxy] 已启动` 日志。
 
 **模型返回空正文但 usage 有值**
 全花在 `reasoning_tokens` 上了。加大 `RAKKO_MAX_OUTPUT`。
+
+## 内置 pi 运行时
+
+应用内置一份裁剪过的 pi（约 94MB），不依赖用户机器上装没装 pi。
+
+```bash
+pnpm pi:prepare    # 从系统 pi 裁剪出 resources/pi（138MB → 94MB）
+pnpm pi:verify     # 验证产物能跑完整闭环
+```
+
+`pi:prepare` 会去这几个地方找系统 pi：环境变量 `RAKKO_PI_ENTRY` →
+volta → npm 全局。找不到就报错，需要先 `npm i -g @mariozechner/pi`。
+
+裁剪掉了这些用不到的 provider SDK（共 44MB）：
+`@anthropic-ai`、`@google`、`@aws-sdk`、`@smithy`。
+保留了 `openai`（25MB）——`openai-completions` 协议的核心，不敢裁。
+
+### 出安装包
+
+```bash
+cd apps/desktop
+pnpm dist:full
+```
+
+产物在 `release/win-unpacked/`，约 304MB（含 94MB 运行时）。
+
+`dist:full` 做四件事：裁剪运行时 → electron-vite 构建 → electron-builder 打包 →
+**补拷贝 node_modules**。
+
+最后一步不能省：electron-builder 对 `extraResources` / `extraFiles` 的
+`from` 目录会**自动排除 `node_modules`**（它假设那是应用自己的依赖）。
+而 pi 加载 `.ts` 扩展需要 `jiti`，缺了就直接起不来，
+报 `Failed to load extension: Cannot find module 'jiti'`。
+
+### 为什么必须是 Electron 35+
+
+pi 1.4.0 用了 Node 22 才有的 API：`module.enableCompileCache()` 和 `fs.globSync()`。
+Electron 33 内置 Node 20.18，两个都没有，pi 会直接 SyntaxError 退出。
+
+试过两个绕法都不行：`ELECTRON_RUN_AS_NODE` 仍然缺 API；写 shim 跳过
+`enableCompileCache` 之后又撞上 `fs.globSync`。
+
+所以锁 Electron 35+（Node 22.16）。升级时记得重编原生模块，
+ABI 会变（Electron 33 = 130，35 = 133）：
+
+```bash
+npx @electron/rebuild -f -w better-sqlite3 -v 35.7.5 --arch x64
+```
+
+### 排查
+
+打包版起不来时，先确认这几件事：
+
+```bash
+cd release/win-unpacked
+ELECTRON_RUN_AS_NODE=1 ./Rakko.exe resources/pi/bundle/cli.js --version
+# 期望输出 1.4.0
+```
+
+再检查应用日志里的三行：
+- `pi 入口 { entry, version, source: 'bundled' }` —— entry 必须指向
+  `resources/pi/bundle/cli.js`，不是系统路径
+- `node 二进制 { path, version, source }` —— 打包版应该落到
+  `electron-run-as-node` 或系统 node
+- `pi stderr` —— 有报错就看这里，别只看「进程已退出 code=1」

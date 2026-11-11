@@ -9,7 +9,9 @@
     "build": "electron-vite build",
     "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
     "test": "vitest run --passWithNoTests",
-    "start": "electron-vite preview"
+    "start": "electron-vite preview",
+    "dist": "electron-vite build && electron-builder --config electron-builder.config.cjs --dir && node ../../scripts/copy-pi-runtime.mjs",
+    "dist:full": "node ../../scripts/prepare-pi-runtime.mjs && electron-vite build && electron-builder --config electron-builder.config.cjs --dir && node ../../scripts/copy-pi-runtime.mjs"
   },
   "dependencies": {
     "@rakko/core": "workspace:*",
@@ -22,7 +24,8 @@
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.4",
-    "electron": "^33.2.1",
+    "electron": "^35.7.5",
+    "electron-builder": "^26.18.0",
     "electron-vite": "^2.3.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",

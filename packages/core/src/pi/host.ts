@@ -23,6 +23,13 @@ export interface PiHostOptions {
    * 在 Electron 里它是 electron.exe，跑 js 会直接失败。
    */
   nodePath: string;
+  /**
+   * spawn node 时附加的环境变量。
+   *
+   * 打包版用 Electron 自带 Node 时需要 `ELECTRON_RUN_AS_NODE=1`。
+   * 由 resolveNodeBinary 的 extraEnv 传入。
+   */
+  nodeExtraEnv?: Record<string, string>;
   /** pi 的 cli.js 绝对路径 */
   piEntry: string;
   /** 会话 id */
@@ -107,7 +114,7 @@ export class PiHost {
 
     const proc = spawn(this.options.nodePath, args, {
       cwd: this.options.cwd,
-      env: this.options.env,
+      env: { ...this.options.env, ...this.options.nodeExtraEnv },
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });

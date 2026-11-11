@@ -22,3 +22,6 @@ coverage/
 # pi 运行时：开发期用系统已装的（方案 C），不把 134MB 拷进仓库
 resources/pi-full/
 resources/pi/
+
+# 打包产物：不进仓库
+release/

@@ -17,7 +17,10 @@
     "e2e:provider": "tsx scripts/e2e-provider.ts",
     "native:status": "node scripts/switch-native.mjs status",
     "native:node": "node scripts/switch-native.mjs node",
-    "native:electron": "node scripts/switch-native.mjs electron"
+    "native:electron": "node scripts/switch-native.mjs electron",
+    "pi:prepare": "node scripts/prepare-pi-runtime.mjs",
+    "pi:verify": "node scripts/verify-pi-runtime.mjs",
+    "pi:copy": "node scripts/copy-pi-runtime.mjs"
   },
   "devDependencies": {
     "@electron/rebuild": "^4.2.1",

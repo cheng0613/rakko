@@ -93,7 +93,21 @@ Full Access 档不拦（那档用户已明确接受）。
 
 ## 4. 分发（pi 从哪来）
 
-**状态**：待办 —— P1 出 beta 包前必须定
+**状态**：✅ 首期已完成（内置裁剪版，94MB）
+
+已实现内置运行时：
+- `pnpm pi:prepare` 从系统 pi 裁剪出 `resources/pi/`（138MB → 94MB）
+- `pnpm pi:verify` 验证产物能跑完整闭环（10 项断言）
+- `pnpm --filter @rakko/desktop dist:full` 一键出安装包
+- 主进程优先用内置运行时，回落到系统 pi
+
+**为什么不上 CDN**：现在只有一个平台、pi 版本锁死 1.4.0，不需要热更新。
+Cindy 的 CDN 方案（manifest + 六平台 + 版本仲裁 + 灰度通道）要 7 人日 + 发布流水线。
+
+**升级 Electron 到 35**：内置 pi 需要 Node 22（pi 1.4.0 用了 `enableCompileCache`
+与 `fs.globSync`），Electron 33 是 Node 20 跑不了。Electron 35 内置 Node 22.16。
+
+**未来的热更新**：可两者并存（内置保底 + CDN 覆盖），Cindy 架构支持。
 
 **为什么待办**：现在开发期用系统已装的 pi（方案 C）。发布时必须选：
 - A：随包内置裁剪版（+90MB，离线可用）
