@@ -31,9 +31,18 @@ const SESSION_ID = "local-1";
 export function ChatPage({
   appInfo,
   initialMode = "ask",
+  onModeChange,
+  initialPrompt,
+  onConsumeInitialPrompt,
 }: {
   appInfo: { name: string; version: string } | null;
   initialMode?: PermissionMode;
+  /** 档位变化时通知外层（首页 pill 要同步） */
+  onModeChange?: (mode: PermissionMode) => void;
+  /** 从首页带进来的第一句话，自动发出 */
+  initialPrompt?: string | null;
+  /** 消费掉 initialPrompt，避免重复发送 */
+  onConsumeInitialPrompt?: () => void;
 }) {
   const [chat, setChat] = useState<ChatState>(initialChatState);
   const [input, setInput] = useState("");
@@ -95,6 +104,26 @@ export function ChatPage({
       setError(e instanceof Error ? e.message : String(e));
     }
   }, []);
+
+  /**
+   * 从首页带进来的第一句话：自动发出。
+   * 只发一次 —— 发完立刻通知外层消费掉，避免切页回来重复发。
+   */
+  useEffect(() => {
+    if (!initialPrompt || !initialPrompt.trim()) return;
+    const text = initialPrompt.trim();
+    onConsumeInitialPrompt?.();
+    setChat((prev) => appendUserMessage(prev, text));
+    void (async () => {
+      try {
+        await ensureSession();
+        await window.rakko.sendMessage({ sessionId: SESSION_ID, text });
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialPrompt]);
 
   const handleSend = useCallback(async (): Promise<void> => {
     const text = input.trim();
@@ -208,6 +237,7 @@ export function ChatPage({
               const idx = PERMISSION_MODES.indexOf(effectiveMode);
               const next = PERMISSION_MODES[(idx + 1) % PERMISSION_MODES.length]!;
               setMode(next);
+              onModeChange?.(next);
               // 热切换：写文件即可，bridge 每次 tool_call 重读
               void window.rakko
                 .setPermissionMode({ sessionId: SESSION_ID, mode: next })

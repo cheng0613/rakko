@@ -6,7 +6,7 @@ import { readFileSync } from "node:fs";
 const TYPES = ["feat", "fix", "refactor", "chore", "docs", "test"];
 
 const FEATURE_SCOPES = [
-  "chat", "session", "project", "permission", "model", "proxy",
+  "chat", "home", "session", "project", "permission", "model", "proxy",
   "layout", "tool", "usage", "teammate", "plugin",
 ];
 const LAYER_SCOPES = ["core", "shared", "desktop", "renderer", "ipc"];

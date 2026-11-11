@@ -69,3 +69,52 @@ button {
 .mono {
   font-family: ui-monospace, "Cascadia Code", Consolas, Menlo, monospace;
 }
+
+/* ── 顶部页签（P0 只有首页与对话） ── */
+.app-tabs {
+  display: flex;
+  gap: 2px;
+  padding: 6px 12px 0;
+  background: var(--card);
+  border-bottom: 1px solid var(--line);
+  flex: none;
+}
+
+.app-tab {
+  font-size: 12.5px;
+  padding: 6px 14px;
+  border-radius: 8px 8px 0 0;
+  color: var(--ink3);
+  border: 1px solid transparent;
+  border-bottom: 0;
+  position: relative;
+  top: 1px;
+}
+
+.app-tab:hover {
+  color: var(--ink2);
+  background: var(--card2);
+}
+
+.app-tab.on {
+  color: var(--ink);
+  background: var(--canvas);
+  border-color: var(--line);
+  font-weight: 600;
+}
+
+/* ── 应用主布局：左侧 dock + 右侧主区 ── */
+.app-deck {
+  display: grid;
+  grid-template-columns: 64px minmax(0, 1fr);
+  height: 100%;
+  background: var(--canvas);
+}
+
+.app-main {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}

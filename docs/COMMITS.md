@@ -56,6 +56,7 @@ Assisted-by: Cindy (https://cindy.app)
 
 ```
 chat        对话、消息流、composer
+home        首页启动台、dock 导航
 session     会话生命周期、恢复、中止
 project     项目、工作目录、AGENTS.md 装配
 permission  权限档、审批卡、自动审核
