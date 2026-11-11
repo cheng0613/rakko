@@ -18,6 +18,7 @@ import {
   type ChatState,
 } from "./state.js";
 import { PermissionCard } from "./PermissionCard.js";
+import { Markdown } from "./Markdown.js";
 import "./chat.css";
 
 declare global {
@@ -352,7 +353,12 @@ function MessageRow({
       </span>
       <div className="mbody">
         {blocks.map((b, i) => {
-          if (b.kind === "text") return <div key={i} className="bubble">{b.text}</div>;
+          if (b.kind === "text")
+            return (
+              <div key={i} className="bubble md">
+                <Markdown text={b.text} />
+              </div>
+            );
           if (b.kind === "thinking") return <div key={i} className="thinking">{b.text}</div>;
           return <ToolCard key={b.callId} block={b} />;
         })}

@@ -230,11 +230,34 @@ export function clearPendingPermission(state: ChatState, callId: string): ChatSt
 /** 工具输入压成一行摘要 */
 export function summarizeToolInput(input: unknown): string {
   if (input === null || input === undefined) return "";
-  if (typeof input === "string") return input.slice(0, 200);
+  if (typeof input === "string") return clip(input);
+
+  if (typeof input === "object") {
+    const obj = input as Record<string, unknown>;
+
+    // 已知字段直接取值，不显示 JSON 花括号与引号
+    // 顺序有意义：command 最常见，path 次之
+    for (const key of ["command", "path", "file_path", "pattern", "url", "query"]) {
+      const v = obj[key];
+      if (typeof v === "string" && v.length > 0) {
+        // bash 多行命令压成一行预览
+        return clip(v.replace(/\s*\n\s*/g, " ⏎ "));
+      }
+    }
+
+    // 兜底：取第一个字符串值
+    for (const v of Object.values(obj)) {
+      if (typeof v === "string" && v.length > 0) return clip(v);
+    }
+  }
+
   try {
-    const s = JSON.stringify(input);
-    return s.length > 200 ? `${s.slice(0, 200)}…` : s;
+    return clip(JSON.stringify(input));
   } catch {
     return "";
   }
+}
+
+function clip(s: string, max = 200): string {
+  return s.length > max ? `${s.slice(0, max)}…` : s;
 }

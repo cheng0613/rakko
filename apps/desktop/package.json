@@ -14,7 +14,8 @@
   "dependencies": {
     "@rakko/core": "workspace:*",
     "@rakko/proxy": "workspace:*",
-    "@rakko/shared": "workspace:*"
+    "@rakko/shared": "workspace:*",
+    "marked": "^18.2.0"
   },
   "devDependencies": {
     "@types/node": "^22.15.3",
