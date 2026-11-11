@@ -34,7 +34,7 @@ RAKKO_BASE_URL=... RAKKO_MODEL=... RAKKO_API_KEY=... pnpm dev
 
 ## 2. auto 档的真实分类器
 
-**状态**：待办 —— P1
+**状态**：部分完成 —— 已改名标注「待实现」（`9d2a299`），真分类器仍待办（P1）
 
 **为什么待办**：现在 `auto` 档与 `ask` 行为完全相同（都问）。UI 上虽然叫「自动审批」，实际没生效。
 
@@ -58,6 +58,16 @@ RAKKO_BASE_URL=... RAKKO_MODEL=... RAKKO_API_KEY=... pnpm dev
 **需要**：SQLite + 迁移 + IPC。
 
 **预估**：4–5 人日
+
+---
+
+## 3b. 空闲回收
+
+**状态**：✅ 已完成（本提交）
+
+30min TTL / 5min 扫描，照 Cindy 的参数。释放前复查是否真空闲
+（运行中、有待审批都不回收）。回收不影响数据，下次发消息按
+session_file 续接上下文。
 
 ---
 

@@ -8,7 +8,12 @@ import { app } from "electron";
 import path from "node:path";
 import { IPC } from "@rakko/shared";
 import type { AgentEvent, ProviderConfig, TokenUsage } from "@rakko/shared";
-import { SessionStartError, startSession, type SessionRuntime } from "@rakko/core";
+import {
+  IdleReaper,
+  SessionStartError,
+  startSession,
+  type SessionRuntime,
+} from "@rakko/core";
 import { createCompatProxy, type ProxyHandle } from "@rakko/proxy";
 
 export interface SessionManagerOptions {
@@ -31,6 +36,12 @@ export interface SessionManagerOptions {
 interface ManagedSession {
   runtime: SessionRuntime;
   dataDir: string;
+  /** 最后一次活动时间（发消息、收事件都算） */
+  lastActiveAt: number;
+  /** 是否有回合在跑（运行中不能回收） */
+  busy: boolean;
+  /** 是否有待审批（等用户决定时不能回收） */
+  pendingPermissions: number;
 }
 
 export class SessionManager {
@@ -38,6 +49,7 @@ export class SessionManager {
   private proxy: ProxyHandle | null = null;
   private proxyStarting: Promise<ProxyHandle> | null = null;
   private readonly usage = new Map<string, TokenUsage>();
+  private reaper: IdleReaper | null = null;
 
   constructor(private readonly options: SessionManagerOptions) {}
 
@@ -144,7 +156,13 @@ export class SessionManager {
       },
     });
 
-    this.sessions.set(input.sessionId, { runtime, dataDir });
+    this.sessions.set(input.sessionId, {
+      runtime,
+      dataDir,
+      lastActiveAt: Date.now(),
+      busy: false,
+      pendingPermissions: 0,
+    });
     return { sessionId: input.sessionId, proxyUrl: proxy.url };
   }
 
@@ -160,7 +178,13 @@ export class SessionManager {
       console.error("[db] 存用户消息失败", e);
     }
 
-    await s.runtime.send(text);
+    s.lastActiveAt = Date.now();
+    s.busy = true;
+    try {
+      await s.runtime.send(text);
+    } finally {
+      // busy 在收到 turn_end 时才清；这里不重置
+    }
   }
 
   async respondPermission(
@@ -170,6 +194,8 @@ export class SessionManager {
   ): Promise<void> {
     const s = this.sessions.get(sessionId);
     if (!s) throw new Error(`会话不存在：${sessionId}`);
+    s.lastActiveAt = Date.now();
+    s.pendingPermissions = Math.max(0, s.pendingPermissions - 1);
     await s.runtime.respondPermission(callId, decision);
   }
 
@@ -188,6 +214,44 @@ export class SessionManager {
     await s.runtime.abort();
   }
 
+  /**
+   * 启动空闲回收。
+   *
+   * 30 分钟没活动就关掉 pi 进程，数据留着；
+   * 下次发消息时按 session_file 续接上下文。
+   */
+  startIdleReaper(options: { ttlMs?: number; scanIntervalMs?: number } = {}): void {
+    if (this.reaper) return;
+    this.reaper = new IdleReaper({
+      ...(options.ttlMs !== undefined ? { ttlMs: options.ttlMs } : {}),
+      ...(options.scanIntervalMs !== undefined ? { scanIntervalMs: options.scanIntervalMs } : {}),
+      listSessions: () =>
+        [...this.sessions.entries()].map(([sessionId, m]) => ({
+          sessionId,
+          lastActiveAt: m.lastActiveAt,
+          // 运行中或有待审批都不能回收
+          busy: m.busy || m.pendingPermissions > 0,
+        })),
+      closeSession: async (sessionId) => {
+        // 用 stop 而不是直接关 runtime：stop 会同时注销 proxy 并清管理器记录
+        await this.stop(sessionId);
+      },
+      log: (level, msg, meta) => {
+        if (level === "warn") console.warn(`[reaper] ${msg}`, meta ?? "");
+        else console.log(`[reaper] ${msg}`, meta ?? "");
+      },
+    });
+    this.reaper.start();
+    console.log(
+      `[reaper] 空闲回收已启动（${Math.round(this.reaper.ttlMsForLog / 1000)}s TTL / ${Math.round(this.reaper.scanIntervalMsForLog / 1000)}s 扫描）`,
+    );
+  }
+
+  stopIdleReaper(): void {
+    this.reaper?.stop();
+    this.reaper = null;
+  }
+
   async stop(sessionId: string): Promise<void> {
     const s = this.sessions.get(sessionId);
     if (!s) return;
@@ -199,6 +263,7 @@ export class SessionManager {
   }
 
   async stopAll(): Promise<void> {
+    this.stopIdleReaper();
     const ids = [...this.sessions.keys()];
     await Promise.all(ids.map((id) => this.stop(id)));
     if (this.proxy) {
@@ -243,6 +308,18 @@ export class SessionManager {
   private broadcast(sessionId: string, event: AgentEvent): void {
     // 先落库跟踪，再转发 —— 即使推送失败，数据也在
     this.trackAssistantText(sessionId, event);
+
+    // 维护活动时间与忙闲状态（空闲回收靠这两个）
+    const managed = this.sessions.get(sessionId);
+    if (managed) {
+      managed.lastActiveAt = Date.now();
+      if (event.type === "turn_start") managed.busy = true;
+      if (event.type === "turn_end" || event.type === "error") managed.busy = false;
+      if (event.type === "permission_request") managed.pendingPermissions += 1;
+      if (event.type === "permission_resolved") {
+        managed.pendingPermissions = Math.max(0, managed.pendingPermissions - 1);
+      }
+    }
     const win = this.options.getWindow();
     if (!win || win.isDestroyed()) return;
     try {

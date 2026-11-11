@@ -69,6 +69,14 @@ void app.whenReady().then(async () => {
     getWindow: () => mainWindow,
     ...(persistence ? { persistence } : {}),
   });
+  // 30 分钟没活动的会话自动回收（数据留着，下次发消息续接上下文）。
+  // 环境变量可覆盖，主要用于测试。
+  const idleTtl = Number(process.env["RAKKO_IDLE_TTL_MS"]);
+  const idleScan = Number(process.env["RAKKO_IDLE_SCAN_MS"]);
+  sessions.startIdleReaper({
+    ...(Number.isFinite(idleTtl) && idleTtl > 0 ? { ttlMs: idleTtl } : {}),
+    ...(Number.isFinite(idleScan) && idleScan > 0 ? { scanIntervalMs: idleScan } : {}),
+  });
   providerService = new ProviderService();
   registerIpc(ipcMain, sessions, providerService, persistence);
 
