@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import { PRODUCT_NAME } from "@rakko/shared";
+import type { HomeSession } from "./use-home-data.js";
 import "./home.css";
 
 export interface HomeTask {
@@ -7,21 +8,22 @@ export interface HomeTask {
   title: string;
   status: "urgent" | "doing" | "todo";
   due?: string;
-  /** 已完成的不显示在列表里 */
   done?: boolean;
 }
 
 export interface HomeProps {
   appInfo: { name: string; version: string } | null;
   userName?: string;
-  tasks?: HomeTask[];
-  /** 最近打开的文件（P0 先用项目里的真实入口） */
-  recentFiles?: Array<{ name: string; kind: "m" | "f" | "p" }>;
-  /** 点击建议任务或任务行，带着文本进对话 */
+  /** 真实会话（来自数据库） */
+  sessions?: HomeSession[];
+  lastSession?: HomeSession | null;
+  loading?: boolean;
+  error?: string | null;
+  /** 点建议任务或输入框 → 新开一个会话并带上这句话 */
   onStartTask?: (prompt: string) => void;
-  /** 直接输入后发送 */
   onSubmit?: (text: string) => void;
-  /** 权限档 pill 点一下循环切换 */
+  /** 点历史会话 → 打开它 */
+  onOpenSession?: (sessionId: string) => void;
   permissionLabel?: string;
   onCyclePermission?: () => void;
 }
@@ -41,30 +43,32 @@ const DOT_COLOR: Record<HomeTask["status"], string> = {
 /**
  * 首页 · 启动台。
  *
- * 规格来自 OpenDesign 稿件：问候 + 最近文件 + 上次会话 + 建议任务 + 任务列表 + composer。
- *
- * P0 阶段的数据都还是空的（没有项目持久化、没有任务表），
- * 所以每个区块都要有诚实的空状态，不能塞假数据。
+ * 规格来自 OpenDesign 稿件。数据来自本地数据库：
+ *   - 「我的任务」= 最近会话列表（每个会话就是一个任务）
+ *   - 「上次会话」= 最近一条会话
+ *   - 「最近打开的文件」= **还没有数据源**，保持空状态，不伪造
  */
 export function HomePage({
   appInfo,
   userName,
-  tasks = [],
-  recentFiles = [],
+  sessions = [],
+  lastSession = null,
+  loading = false,
+  error = null,
   onStartTask,
   onSubmit,
+  onOpenSession,
   permissionLabel,
   onCyclePermission,
 }: HomeProps) {
   const [input, setInput] = useState("");
   const [query, setQuery] = useState("");
 
-  const visibleTasks = useMemo(() => {
-    const list = tasks.filter((t) => !t.done);
-    if (!query.trim()) return list;
+  const visibleSessions = useMemo(() => {
+    if (!query.trim()) return sessions;
     const q = query.trim().toLowerCase();
-    return list.filter((t) => t.title.toLowerCase().includes(q));
-  }, [tasks, query]);
+    return sessions.filter((s) => s.title.toLowerCase().includes(q));
+  }, [sessions, query]);
 
   const submit = (): void => {
     const text = input.trim();
@@ -82,43 +86,52 @@ export function HomePage({
         <span className="tname">{appInfo?.name ?? PRODUCT_NAME}</span>
         <span className="meta">{appInfo ? `v${appInfo.version}` : ""}</span>
         <span className="spacer" />
+        {loading && <span className="meta">加载中…</span>}
       </header>
 
       <div className="home-scroll">
         <div className="hm-hello">
-          {userName ? (
-            <>
-              <span className="mark">欢迎回来，{userName}</span>
-              <span className="sub">今天想让 Agent 做点什么？</span>
-            </>
-          ) : (
-            <>
-              <span className="mark">你好</span>
-              <span className="sub">今天想让 Agent 做点什么？</span>
-            </>
-          )}
+          <span className="mark">{userName ? `欢迎回来，${userName}` : "你好"}</span>
+          <span className="sub">今天想让 Agent 做点什么？</span>
         </div>
+
+        {error && (
+          <div className="hm-error">
+            读取历史失败：{error}
+          </div>
+        )}
 
         <div className="hm-row">
           <div className="hm-card tint">
             <h6>最近打开的文件</h6>
-            {recentFiles.length === 0 ? (
-              <div className="home-empty">还没有打开过文件。在对话里让它读某个文件后，这里会列出来。</div>
-            ) : (
-              recentFiles.map((f) => (
-                <div className="filerow" key={f.name}>
-                  <span className={`fico ${f.kind}`}>{f.kind === "p" ? "PDF" : f.kind.toUpperCase()}</span>
-                  <span>{f.name}</span>
-                </div>
-              ))
-            )}
+            <div className="home-empty">
+              还没有追踪文件访问。这一块需要记录 Agent 读过哪些文件，属于后续功能。
+            </div>
           </div>
 
           <div className="hm-card">
             <h6>上次会话</h6>
-            <div className="home-empty">
-              还没有历史会话。开始第一次对话后，这里会显示上次聊到哪。
-            </div>
+            {lastSession ? (
+              <div
+                className="meet clickable"
+                onClick={() => onOpenSession?.(lastSession.id)}
+                role="button"
+                tabIndex={0}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") onOpenSession?.(lastSession.id);
+                }}
+              >
+                <span className="ava" />
+                <span>
+                  <b>{lastSession.title}</b>
+                  <small>{lastSession.relativeTime}</small>
+                </span>
+              </div>
+            ) : (
+              <div className="home-empty">
+                还没有历史会话。开始第一次对话后，这里会显示上次聊到哪。
+              </div>
+            )}
           </div>
         </div>
 
@@ -144,7 +157,7 @@ export function HomePage({
         <div className="hm-tasks">
           <div className="hm-th">
             <b>我的任务</b>
-            <span className="cnt">{visibleTasks.length}</span>
+            <span className="cnt">{visibleSessions.length}</span>
             <span className="hm-search">
               <span aria-hidden>⌕</span>
               <input
@@ -153,31 +166,25 @@ export function HomePage({
                 onChange={(e) => setQuery(e.target.value)}
               />
             </span>
-            {visibleTasks.length > 1 && (
-              <button className="prio" title="P0 暂未实现排序">✦ 按优先级排序</button>
-            )}
           </div>
 
-          {visibleTasks.length === 0 ? (
+          {visibleSessions.length === 0 ? (
             <div className="home-empty">
               {query
                 ? "没有匹配的任务。"
                 : "还没有任务。每个会话就是一个任务，开始对话后会出现在这里。"}
             </div>
           ) : (
-            visibleTasks.map((t) => {
-              const pill = STATUS_PILL[t.status];
-              return (
-                <div className="trow" key={t.id}>
-                  <span className="tdot" style={{ background: DOT_COLOR[t.status] }} />
-                  <span className="tname" onClick={() => onStartTask?.(t.title)}>
-                    {t.title}
-                  </span>
-                  <span className={`pill ${pill.cls}`}>{pill.text}</span>
-                  {t.due && <span className="pill yel">{t.due}</span>}
-                </div>
-              );
-            })
+            visibleSessions.map((s) => (
+              <div className="trow" key={s.id}>
+                <span className="tdot" style={{ background: DOT_COLOR.todo }} />
+                <span className="tname" onClick={() => onOpenSession?.(s.id)}>
+                  {s.title}
+                </span>
+                <span className="sp" />
+                <span className="pill gray">{s.relativeTime}</span>
+              </div>
+            ))
           )}
         </div>
       </div>

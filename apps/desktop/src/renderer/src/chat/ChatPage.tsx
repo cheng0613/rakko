@@ -64,7 +64,44 @@ export function ChatPage({
       setChat((prev) => reduceEvent(prev, event));
     });
     return unsubscribe;
-  }, []);
+  }, [sessionId]);
+
+  /**
+   * 加载历史消息。
+   *
+   * 打开一条旧会话时，数据库里已经有消息，要先读出来铺到界面上。
+   * 之后的新消息靠事件流追加。
+   */
+  useEffect(() => {
+    if (!sessionId) return;
+    let cancelled = false;
+
+    void (async () => {
+      try {
+        const rows = await window.rakko.listMessages(sessionId, { limit: 100 });
+        if (cancelled || rows.length === 0) return;
+
+        setChat((prev) => {
+          // 已经通过当前轮次产生过消息时不覆盖（避免竞态）
+          if (prev.messages.length > 0) return prev;
+          return {
+            ...prev,
+            messages: rows.map((m) => ({
+              id: `h-${m.id}`,
+              role: m.role,
+              blocks: [{ kind: "text" as const, text: m.content }],
+            })),
+          };
+        });
+      } catch (e) {
+        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId]);
 
   // 自动滚到底部
   useEffect(() => {

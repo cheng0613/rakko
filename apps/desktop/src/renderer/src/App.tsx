@@ -3,6 +3,7 @@ import type { PermissionMode, RakkoApi } from "@rakko/shared";
 import { PERMISSION_MODES, PERMISSION_MODE_LABEL } from "@rakko/shared";
 import { ChatPage } from "./chat/ChatPage.js";
 import { HomePage } from "./home/HomePage.js";
+import { useHomeData } from "./home/use-home-data.js";
 import { Dock, type DockRoute } from "./layout/Dock.js";
 
 declare global {
@@ -28,6 +29,9 @@ export default function App() {
   const [pendingPrompt, setPendingPrompt] = useState<string | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [sessionError, setSessionError] = useState<string | null>(null);
+  // 每次切到首页都重新读一次 —— 否则新建的会话不会出现
+  const [homeRefreshKey, setHomeRefreshKey] = useState(0);
+  const home = useHomeData(homeRefreshKey);
 
   useEffect(() => {
     if (!window.rakko) {
@@ -62,7 +66,6 @@ export default function App() {
    * P0 阶段固定用当前工作目录作为项目。
    */
   const ensureSession = useCallback(async (): Promise<string | null> => {
-    if (sessionId) return sessionId;
     try {
       const project = await window.rakko.openProject(".");
       const session = await window.rakko.createSession(project.id);
@@ -73,16 +76,31 @@ export default function App() {
       setSessionError(e instanceof Error ? e.message : String(e));
       return null;
     }
-  }, [sessionId]);
+  }, []);
 
   const startFromHome = useCallback(
     (prompt: string) => {
+      // 新任务：清掉旧会话 id，让 ensureSession 建一个新的
+      setSessionId(null);
       setPendingPrompt(prompt);
       setRoute("chat");
-      void ensureSession();
     },
-    [ensureSession],
+    [],
   );
+
+  /** 打开一条历史会话 */
+  const openSession = useCallback((id: string) => {
+    setSessionId(id);
+    setPendingPrompt(null);
+    setRoute("chat");
+  }, []);
+
+  // 进对话页但没有会话时自动创建（覆盖 dock 切换、直接跳转等所有入口）
+  useEffect(() => {
+    if (route === "chat" && !sessionId && !sessionError) {
+      void ensureSession();
+    }
+  }, [route, sessionId, sessionError, ensureSession]);
 
   if (error) {
     return (
@@ -97,19 +115,33 @@ export default function App() {
 
   return (
     <div className="app-deck">
-      <Dock route={route} onNavigate={setRoute} />
+      <Dock
+        route={route}
+        onNavigate={(next) => {
+          setRoute(next);
+          if (next === "home") setHomeRefreshKey((k) => k + 1);
+          // 进对话页时没会话就建一个，否则会卡在「正在创建会话」
+          if (next === "chat" && !sessionId && !sessionError) void ensureSession();
+        }}
+      />
 
       <div className="app-main">
         {route === "home" ? (
           <HomePage
             appInfo={appInfo}
+            sessions={home.sessions}
+            lastSession={home.lastSession}
+            loading={home.loading}
+            error={home.error}
             onStartTask={startFromHome}
             onSubmit={startFromHome}
+            onOpenSession={openSession}
             permissionLabel={PERMISSION_MODE_LABEL[mode]}
             onCyclePermission={cycleMode}
           />
         ) : sessionId ? (
           <ChatPage
+            key={sessionId}
             sessionId={sessionId}
             appInfo={appInfo}
             initialMode={mode}
