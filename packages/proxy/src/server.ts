@@ -302,22 +302,45 @@ export async function createCompatProxy(options: CreateProxyOptions): Promise<Pr
 }
 
 /**
- * 把上游 baseUrl 与请求路径拼起来。
+ * 把上游 baseUrl 与请求路径拼起来，**去掉重复的路径段**。
  *
- * pi 请求形如 /v1/chat/completions；上游 baseUrl 形如 https://api.openai.com/v1。
- * 两者都有 /v1 时要避免拼成 /v1/v1/chat/completions。
+ * pi 总发 `/v1/chat/completions`，但用户的上游可能是：
+ *   https://api.openai.com/v1        → /v1/chat/completions          （已含 /v1，不能重复）
+ *   https://host/llm/v1              → /llm/v1/chat/completions     （base 更深）
+ *   https://host                     → /v1/chat/completions
+ *
+ * 不能简单判断「reqPath 是否以 basePath 开头」：
+ * basePath=/llm/v1、reqPath=/v1/chat/completions 时它不成立，
+ * 但直接拼会变成 /llm/v1/v1/chat/completions。
+ *
+ * 正确做法：找出 base 末尾与 req 开头**最长的重叠段**，去掉重叠再拼。
  */
 export function buildUpstreamUrl(baseUrl: string, requestPath: string): string {
   const base = baseUrl.endsWith("/") ? baseUrl.slice(0, -1) : baseUrl;
   const reqPath = requestPath.startsWith("/") ? requestPath : `/${requestPath}`;
 
   const baseUrlObj = new URL(base);
-  const basePath = baseUrlObj.pathname.replace(/\/+$/, "");
+  const baseSegments = baseUrlObj.pathname.split("/").filter((s) => s.length > 0);
 
-  // 如果请求路径已经以 base 的路径开头，就直接拼
-  if (basePath && (reqPath === basePath || reqPath.startsWith(`${basePath}/`))) {
-    return `${baseUrlObj.origin}${reqPath}`;
+  // 把 reqPath 拆成 pathname + query
+  const qIdx = reqPath.indexOf("?");
+  const reqPathname = qIdx >= 0 ? reqPath.slice(0, qIdx) : reqPath;
+  const reqQuery = qIdx >= 0 ? reqPath.slice(qIdx) : "";
+  const reqSegments = reqPathname.split("/").filter((s) => s.length > 0);
+
+  // 找最长重叠：base 的尾部 == req 的头部
+  let overlap = 0;
+  const maxCheck = Math.min(baseSegments.length, reqSegments.length);
+  for (let len = maxCheck; len > 0; len--) {
+    const baseTail = baseSegments.slice(-len).join("/");
+    const reqHead = reqSegments.slice(0, len).join("/");
+    if (baseTail === reqHead) {
+      overlap = len;
+      break;
+    }
   }
 
-  return `${base}${reqPath}`;
+  const rest = reqSegments.slice(overlap);
+  const fullPath = "/" + [...baseSegments, ...rest].join("/");
+  return `${baseUrlObj.origin}${fullPath}${reqQuery}`;
 }

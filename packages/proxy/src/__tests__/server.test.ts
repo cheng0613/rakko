@@ -329,6 +329,25 @@ describe("工具函数", () => {
     );
   });
 
+  it("base 更深时也只保留一层 v1（真实上游踩到的）", () => {
+    // 实测上游：https://d-openai.juneyaoair.com/llm/v1
+    // pi 发：/v1/chat/completions
+    // 早期实现拼成 /llm/v1/v1/chat/completions，上游 404
+    expect(
+      buildUpstreamUrl("https://d-openai.juneyaoair.com/llm/v1", "/v1/chat/completions"),
+    ).toBe("https://d-openai.juneyaoair.com/llm/v1/chat/completions");
+  });
+
+  it("base 与请求路径完全重叠时不多拼", () => {
+    expect(buildUpstreamUrl("https://host/v1/chat", "/v1/chat")).toBe("https://host/v1/chat");
+  });
+
+  it("多段重叠只去一次", () => {
+    expect(buildUpstreamUrl("https://host/a/b/v1", "/v1/chat/completions")).toBe(
+      "https://host/a/b/v1/chat/completions",
+    );
+  });
+
   it("buildUpstreamUrl 保留查询参数", () => {
     expect(buildUpstreamUrl("http://h/v1", "/v1/chat/completions?a=1")).toBe(
       "http://h/v1/chat/completions?a=1",
