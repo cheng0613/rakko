@@ -66,6 +66,15 @@ export interface ProviderView {
   updatedAt: number;
 }
 
+/** 一条已落库的消息 */
+export interface MessageInfo {
+  id: number;
+  sessionId: string;
+  role: "user" | "assistant";
+  content: string;
+  createdAt: number;
+}
+
 /** 新建或更新 provider 的输入 */
 export interface UpsertProviderInput {
   id: string;
@@ -136,6 +145,21 @@ export interface RakkoApi {
   /** 列出某个项目的会话 */
   listSessions(projectId: string): Promise<SessionInfo[]>;
 
+  /** 最近会话（跨项目，首页用） */
+  listRecentSessions(limit?: number): Promise<SessionInfo[]>;
+
+  /** 会话的消息，分页。beforeId 用于往上翻 */
+  listMessages(
+    sessionId: string,
+    options?: { limit?: number; beforeId?: number },
+  ): Promise<MessageInfo[]>;
+
+  /** 重命名会话 */
+  renameSession(sessionId: string, title: string): Promise<void>;
+
+  /** 删除会话 */
+  deleteSession(sessionId: string): Promise<void>;
+
   /** 在一个项目里新建会话 */
   createSession(projectId: string): Promise<SessionInfo>;
 
@@ -189,6 +213,10 @@ export const IPC = {
   listProjects: "rakko:list-projects",
   openProject: "rakko:open-project",
   listSessions: "rakko:list-sessions",
+  listRecentSessions: "rakko:list-recent-sessions",
+  listMessages: "rakko:list-messages",
+  renameSession: "rakko:rename-session",
+  deleteSession: "rakko:delete-session",
   createSession: "rakko:create-session",
   startSession: "rakko:start-session",
   stopSession: "rakko:stop-session",

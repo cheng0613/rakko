@@ -17,10 +17,12 @@ import { PRODUCT_NAME } from "@rakko/shared";
 import { registerIpc } from "./ipc/register.js";
 import { SessionManager } from "./session/manager.js";
 import { ProviderService } from "./provider/service.js";
+import { PersistenceService } from "./persistence/service.js";
 
 let mainWindow: BrowserWindow | null = null;
 let sessions: SessionManager | null = null;
 let providerService: ProviderService | null = null;
+let persistence: PersistenceService | null = null;
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({
@@ -55,10 +57,20 @@ function createWindow(): void {
   }
 }
 
-void app.whenReady().then(() => {
-  sessions = new SessionManager({ getWindow: () => mainWindow });
+void app.whenReady().then(async () => {
+  persistence = new PersistenceService();
+  try {
+    await persistence.open();
+  } catch (e) {
+    console.error("[db] 打开失败，会话将不会持久化：", e);
+  }
+
+  sessions = new SessionManager({
+    getWindow: () => mainWindow,
+    ...(persistence ? { persistence } : {}),
+  });
   providerService = new ProviderService();
-  registerIpc(ipcMain, sessions, providerService);
+  registerIpc(ipcMain, sessions, providerService, persistence);
 
   createWindow();
 
@@ -77,5 +89,8 @@ app.on("before-quit", (event) => {
   event.preventDefault();
   const s = sessions;
   sessions = null;
-  void s.stopAll().finally(() => app.exit(0));
+  void s.stopAll().finally(() => {
+    persistence?.close();
+    app.exit(0);
+  });
 });

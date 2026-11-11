@@ -9,3 +9,4 @@ export * from "./session/runtime.js";
 export * from "./session/permission-store.js";
 export * from "./provider/store.js";
 export * from "./provider/probe.js";
+export * from "./db/database.js";

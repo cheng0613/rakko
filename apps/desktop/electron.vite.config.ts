@@ -4,7 +4,13 @@ import { resolve } from "node:path";
 
 export default defineConfig({
   main: {
-    plugins: [externalizeDepsPlugin({ exclude: ["@rakko/core", "@rakko/shared", "@rakko/proxy"] })],
+    plugins: [
+      externalizeDepsPlugin({
+        exclude: ["@rakko/core", "@rakko/shared", "@rakko/proxy"],
+        // 原生模块必须 externalize：它们靠 require 加载 .node，打包进 ESM 会直接挂
+        include: ["better-sqlite3"],
+      }),
+    ],
     build: {
       rollupOptions: {
         input: { index: resolve(__dirname, "src/main/index.ts") },

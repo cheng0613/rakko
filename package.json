@@ -8,18 +8,25 @@
     "pnpm": ">=12"
   },
   "scripts": {
-    "dev": "pnpm --filter @rakko/desktop dev",
-    "build": "pnpm -r build",
+    "dev": "pnpm native:electron && pnpm --filter @rakko/desktop dev",
+    "build": "pnpm native:electron && pnpm -r build",
     "typecheck": "pnpm -r typecheck",
-    "test": "pnpm -r test",
+    "test": "pnpm native:node && pnpm -r test",
     "verify": "pnpm typecheck && pnpm test && pnpm build",
     "e2e:pi": "tsx scripts/e2e-pi-host.ts",
-    "e2e:provider": "tsx scripts/e2e-provider.ts"
+    "e2e:provider": "tsx scripts/e2e-provider.ts",
+    "native:status": "node scripts/switch-native.mjs status",
+    "native:node": "node scripts/switch-native.mjs node",
+    "native:electron": "node scripts/switch-native.mjs electron"
   },
   "devDependencies": {
+    "@electron/rebuild": "^4.2.1",
     "@types/node": "^22.15.3",
     "tsx": "^4.23.15",
     "typescript": "^5.9.3",
     "vitest": "^3.2.4"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.2.0"
   }
 }

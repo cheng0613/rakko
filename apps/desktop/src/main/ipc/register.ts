@@ -17,12 +17,14 @@ import type {
 } from "@rakko/shared";
 import type { SessionManager } from "../session/manager.js";
 import type { ProviderService } from "../provider/service.js";
+import type { PersistenceService } from "../persistence/service.js";
 import { readBootstrapProviders, toModelSummaries } from "../bootstrap-config.js";
 
 export function registerIpc(
   ipcMain: IpcMain,
   sessions: SessionManager,
   providers: ProviderService,
+  persistence: PersistenceService,
 ): void {
   ipcMain.handle(IPC.getAppInfo, () => ({
     name: PRODUCT_NAME,
@@ -72,24 +74,55 @@ export function registerIpc(
     return providers.test(input as Parameters<ProviderService["test"]>[0]);
   });
 
-  // ── 项目与会话（P0 先返回空，持久化在后续步骤）──
-  ipcMain.handle(IPC.listProjects, async (): Promise<ProjectInfo[]> => []);
+  // ── 项目与会话（持久化）──
+  ipcMain.handle(IPC.listProjects, async (): Promise<ProjectInfo[]> => persistence.listProjects());
 
   ipcMain.handle(IPC.openProject, async (_e, cwd: unknown): Promise<ProjectInfo> => {
     if (typeof cwd !== "string" || cwd.length === 0) {
       throw new Error("openProject: cwd 必须是非空字符串");
     }
-    throw new Error("openProject 尚未实现（P0 步骤 10）");
+    return persistence.openProject(cwd);
   });
 
   ipcMain.handle(IPC.listSessions, async (_e, projectId: unknown): Promise<SessionInfo[]> => {
     if (typeof projectId !== "string") throw new Error("listSessions: projectId 必须是字符串");
-    return [];
+    return persistence.listSessions(projectId);
+  });
+
+  ipcMain.handle(IPC.listRecentSessions, async (_e, limit: unknown) => {
+    const n = typeof limit === "number" && Number.isFinite(limit) ? limit : 20;
+    return persistence.listRecentSessions(n);
+  });
+
+  ipcMain.handle(IPC.listMessages, async (_e, payload: unknown) => {
+    assertShape(payload, ["sessionId"], "listMessages");
+    const { sessionId, options } = payload as {
+      sessionId: string;
+      options?: { limit?: number; beforeId?: number };
+    };
+    if (typeof sessionId !== "string") throw new Error("listMessages: sessionId 必须是字符串");
+    return persistence.listMessages(sessionId, options ?? {});
+  });
+
+  ipcMain.handle(IPC.renameSession, async (_e, payload: unknown) => {
+    assertShape(payload, ["sessionId", "title"], "renameSession");
+    const { sessionId, title } = payload as { sessionId: string; title: string };
+    if (typeof sessionId !== "string" || typeof title !== "string") {
+      throw new Error("renameSession: sessionId 与 title 必须是字符串");
+    }
+    if (title.trim().length === 0) throw new Error("renameSession: 标题不能为空");
+    persistence.renameSession(sessionId, title.trim());
+  });
+
+  ipcMain.handle(IPC.deleteSession, async (_e, sessionId: unknown) => {
+    if (typeof sessionId !== "string") throw new Error("deleteSession: sessionId 必须是字符串");
+    await sessions.stop(sessionId);
+    persistence.deleteSession(sessionId);
   });
 
   ipcMain.handle(IPC.createSession, async (_e, projectId: unknown): Promise<SessionInfo> => {
     if (typeof projectId !== "string") throw new Error("createSession: projectId 必须是字符串");
-    throw new Error("createSession 尚未实现（P0 步骤 10）");
+    return persistence.createSession(projectId);
   });
 
   // ── 会话运行时 ──

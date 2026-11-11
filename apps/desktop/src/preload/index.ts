@@ -11,6 +11,12 @@ const api: RakkoApi = {
   listProjects: () => ipcRenderer.invoke(IPC.listProjects),
   openProject: (cwd) => ipcRenderer.invoke(IPC.openProject, cwd),
   listSessions: (projectId) => ipcRenderer.invoke(IPC.listSessions, projectId),
+  listRecentSessions: (limit) => ipcRenderer.invoke(IPC.listRecentSessions, limit),
+  listMessages: (sessionId, options) =>
+    ipcRenderer.invoke(IPC.listMessages, { sessionId, options }),
+  renameSession: (sessionId, title) =>
+    ipcRenderer.invoke(IPC.renameSession, { sessionId, title }),
+  deleteSession: (sessionId) => ipcRenderer.invoke(IPC.deleteSession, sessionId),
   createSession: (projectId) => ipcRenderer.invoke(IPC.createSession, projectId),
   startSession: (input) => ipcRenderer.invoke(IPC.startSession, input),
   stopSession: (sessionId) => ipcRenderer.invoke(IPC.stopSession, sessionId),

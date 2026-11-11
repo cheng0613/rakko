@@ -26,15 +26,17 @@ declare global {
   }
 }
 
-const SESSION_ID = "local-1";
 
 export function ChatPage({
+  sessionId,
   appInfo,
   initialMode = "ask",
   onModeChange,
   initialPrompt,
   onConsumeInitialPrompt,
 }: {
+  /** 真实会话 id（数据库里存在的） */
+  sessionId: string;
   appInfo: { name: string; version: string } | null;
   initialMode?: PermissionMode;
   /** 档位变化时通知外层（首页 pill 要同步） */
@@ -58,7 +60,7 @@ export function ChatPage({
 
   // 订阅事件
   useEffect(() => {
-    const unsubscribe = window.rakko.onAgentEvent(SESSION_ID, (event: AgentEvent) => {
+    const unsubscribe = window.rakko.onAgentEvent(sessionId, (event: AgentEvent) => {
       setChat((prev) => reduceEvent(prev, event));
     });
     return unsubscribe;
@@ -89,13 +91,13 @@ export function ChatPage({
       }
 
       await window.rakko.startSession({
-        sessionId: SESSION_ID,
+        sessionId: sessionId,
         cwd: ".",
         promptSections: ["你是 Rakko，一个桌面助手。回答简洁、准确。"],
         tools: "all",
       });
       // 会话起来后同步一次当前档位
-      await window.rakko.setPermissionMode({ sessionId: SESSION_ID, mode: effectiveMode });
+      await window.rakko.setPermissionMode({ sessionId: sessionId, mode: effectiveMode });
       startedRef.current = true;
       setStatus("就绪");
       setError(null);
@@ -117,7 +119,7 @@ export function ChatPage({
     void (async () => {
       try {
         await ensureSession();
-        await window.rakko.sendMessage({ sessionId: SESSION_ID, text });
+        await window.rakko.sendMessage({ sessionId: sessionId, text });
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
       }
@@ -135,7 +137,7 @@ export function ChatPage({
     try {
       await ensureSession();
       if (!startedRef.current) return;
-      await window.rakko.sendMessage({ sessionId: SESSION_ID, text });
+      await window.rakko.sendMessage({ sessionId: sessionId, text });
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -145,7 +147,7 @@ export function ChatPage({
     async (callId: string, decision: "allow-once" | "allow-type" | "deny"): Promise<void> => {
       setDeciding(callId);
       try {
-        await window.rakko.resolvePermission({ sessionId: SESSION_ID, callId, decision });
+        await window.rakko.resolvePermission({ sessionId: sessionId, callId, decision });
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
       } finally {
@@ -158,7 +160,7 @@ export function ChatPage({
 
   const handleStop = useCallback(async (): Promise<void> => {
     try {
-      await window.rakko.abort(SESSION_ID);
+      await window.rakko.abort(sessionId);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -240,7 +242,7 @@ export function ChatPage({
               onModeChange?.(next);
               // 热切换：写文件即可，bridge 每次 tool_call 重读
               void window.rakko
-                .setPermissionMode({ sessionId: SESSION_ID, mode: next })
+                .setPermissionMode({ sessionId: sessionId, mode: next })
                 .catch(() => {
                   /* 会话还没启动时切换，等启动时用初始值 */
                 });
@@ -276,7 +278,7 @@ export function ChatPage({
       </div>
 
       <footer className="statusline">
-        <span>session: {SESSION_ID}</span>
+        <span>session: {sessionId}</span>
         <span>models: {models.length}</span>
         {chat.currentTurnId && <span>turn: {chat.currentTurnId}</span>}
         {chat.lastError && <span className="err">错误：{chat.lastError}</span>}

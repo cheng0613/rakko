@@ -26,6 +26,8 @@ export default function App() {
   const [mode, setMode] = useState<PermissionMode>("ask");
   /** 从首页带进对话的初始文本 */
   const [pendingPrompt, setPendingPrompt] = useState<string | null>(null);
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [sessionError, setSessionError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!window.rakko) {
@@ -53,10 +55,34 @@ export default function App() {
     });
   }, []);
 
-  const startFromHome = useCallback((prompt: string) => {
-    setPendingPrompt(prompt);
-    setRoute("chat");
-  }, []);
+  /**
+   * 确保有一个真实会话。
+   *
+   * 流程：打开（或复用）项目 → 建会话 → 拿到 id。
+   * P0 阶段固定用当前工作目录作为项目。
+   */
+  const ensureSession = useCallback(async (): Promise<string | null> => {
+    if (sessionId) return sessionId;
+    try {
+      const project = await window.rakko.openProject(".");
+      const session = await window.rakko.createSession(project.id);
+      setSessionId(session.id);
+      setSessionError(null);
+      return session.id;
+    } catch (e) {
+      setSessionError(e instanceof Error ? e.message : String(e));
+      return null;
+    }
+  }, [sessionId]);
+
+  const startFromHome = useCallback(
+    (prompt: string) => {
+      setPendingPrompt(prompt);
+      setRoute("chat");
+      void ensureSession();
+    },
+    [ensureSession],
+  );
 
   if (error) {
     return (
@@ -82,14 +108,23 @@ export default function App() {
             permissionLabel={PERMISSION_MODE_LABEL[mode]}
             onCyclePermission={cycleMode}
           />
-        ) : (
+        ) : sessionId ? (
           <ChatPage
+            sessionId={sessionId}
             appInfo={appInfo}
             initialMode={mode}
             onModeChange={setMode}
             initialPrompt={pendingPrompt}
             onConsumeInitialPrompt={() => setPendingPrompt(null)}
           />
+        ) : (
+          <div style={{ padding: 32, color: "var(--ink3)" }}>
+            {sessionError ? (
+              <span style={{ color: "var(--warn)" }}>创建会话失败：{sessionError}</span>
+            ) : (
+              "正在创建会话…"
+            )}
+          </div>
         )}
       </div>
     </div>

@@ -13,6 +13,15 @@ import { createCompatProxy, type ProxyHandle } from "@rakko/proxy";
 
 export interface SessionManagerOptions {
   getWindow: () => BrowserWindow | null;
+  /** 持久化服务。没有时不落库（开发/测试） */
+  persistence?: {
+    appendMessage(input: {
+      sessionId: string;
+      role: "user" | "assistant";
+      content: string;
+    }): unknown;
+    maybeAutoTitle(sessionId: string, firstUserMessage: string): void;
+  };
 }
 
 interface ManagedSession {
@@ -129,6 +138,15 @@ export class SessionManager {
   async send(sessionId: string, text: string): Promise<void> {
     const s = this.sessions.get(sessionId);
     if (!s) throw new Error(`会话不存在：${sessionId}`);
+
+    // 先落库再发：即使发送失败，用户输入也不该丢
+    try {
+      this.options.persistence?.appendMessage({ sessionId, role: "user", content: text });
+      this.options.persistence?.maybeAutoTitle(sessionId, text);
+    } catch (e) {
+      console.error("[db] 存用户消息失败", e);
+    }
+
     await s.runtime.send(text);
   }
 
@@ -180,7 +198,38 @@ export class SessionManager {
     return this.usage.get(sessionId) ?? null;
   }
 
+  /** 按会话累积当前轮的助手正文，用于在收口时落库 */
+  private readonly assistantBuffers = new Map<string, string>();
+
+  private trackAssistantText(sessionId: string, event: AgentEvent): void {
+    if (event.type === "turn_start") {
+      this.assistantBuffers.set(sessionId, "");
+      return;
+    }
+    if (event.type === "text_delta") {
+      const cur = this.assistantBuffers.get(sessionId) ?? "";
+      this.assistantBuffers.set(sessionId, cur + event.text);
+      return;
+    }
+    if (event.type === "turn_end") {
+      const text = (this.assistantBuffers.get(sessionId) ?? "").trim();
+      this.assistantBuffers.delete(sessionId);
+      if (!text) return;
+      try {
+        this.options.persistence?.appendMessage({
+          sessionId,
+          role: "assistant",
+          content: text,
+        });
+      } catch (e) {
+        console.error("[db] 存助手回复失败", e);
+      }
+    }
+  }
+
   private broadcast(sessionId: string, event: AgentEvent): void {
+    // 先落库跟踪，再转发 —— 即使推送失败，数据也在
+    this.trackAssistantText(sessionId, event);
     const win = this.options.getWindow();
     if (!win || win.isDestroyed()) return;
     try {
