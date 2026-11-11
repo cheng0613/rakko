@@ -20,6 +20,12 @@
 import http from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
+import {
+  LearningStore,
+  decideHeal,
+  routeIdentity,
+  stripCacheFields,
+} from "./cache-heal.js";
 
 /** 上游目标。由调用方注册，代理只负责转发。 */
 export interface UpstreamTarget {
@@ -34,6 +40,12 @@ export interface TokenUsageDelta {
   outputTokens: number;
   cacheReadTokens: number;
   cacheWriteTokens: number;
+}
+
+export interface CacheHealOptions {
+  /** 学习文件路径。不给则不启用自愈 */
+  storePath?: string;
+  log?: (level: "info" | "warn" | "error", msg: string, meta?: unknown) => void;
 }
 
 export interface ProxyObservers {
@@ -64,6 +76,8 @@ export interface CreateProxyOptions {
   /** 监听端口，0 表示随机 */
   port?: number;
   observers?: ProxyObservers;
+  /** 缓存字段自愈。不给则关闭（行为与之前一致） */
+  cacheHeal?: CacheHealOptions;
 }
 
 /** 占位 key 前缀，与 env.ts 保持一致 */
@@ -124,9 +138,24 @@ function observeUsage(
   }
 }
 
+/** 收集上游响应头，去掉 hop-by-hop */
+function collectHeaders(h: http.IncomingHttpHeaders): Record<string, string | string[]> {
+  const out: Record<string, string | string[]> = {};
+  for (const [k, v] of Object.entries(h)) {
+    if (v === undefined) continue;
+    const lk = k.toLowerCase();
+    if (lk === "content-length" || lk === "transfer-encoding" || lk === "connection") continue;
+    out[k] = v;
+  }
+  return out;
+}
+
 export async function createCompatProxy(options: CreateProxyOptions): Promise<ProxyHandle> {
   const registry = new Map<string, UpstreamTarget>();
   const log = options.observers?.log ?? (() => {});
+  const learning = options.cacheHeal?.storePath
+    ? new LearningStore(options.cacheHeal.storePath)
+    : null;
   const onUsage = options.observers?.onUsage;
   const onUpstreamError = options.observers?.onUpstreamError;
 
@@ -141,6 +170,18 @@ export async function createCompatProxy(options: CreateProxyOptions): Promise<Pr
       }
     });
   });
+
+  /** 把上游错误原样回给客户端 */
+  function respondError(target: ServerResponse, status: number, detail: string): void {
+    if (target.headersSent) {
+      target.end();
+      return;
+    }
+    target.writeHead(status, { "content-type": "application/json" });
+    target.end(
+      detail || JSON.stringify({ error: { type: "upstream_error", message: "上游返回错误" } }),
+    );
+  }
 
   async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const sessionId = options.resolveSession(req);
@@ -194,82 +235,168 @@ export async function createCompatProxy(options: CreateProxyOptions): Promise<Pr
     const isHttps = upstreamUrl.protocol === "https:";
     const transport = isHttps ? await import("node:https") : await import("node:http");
 
-    await new Promise<void>((resolve, reject) => {
-      const upstreamReq = transport.request(
-        {
-          protocol: upstreamUrl.protocol,
-          hostname: upstreamUrl.hostname,
-          port: upstreamUrl.port || (isHttps ? 443 : 80),
-          path: `${upstreamUrl.pathname}${upstreamUrl.search}`,
-          method: req.method,
-          headers,
-        },
-        (upstreamRes) => {
-          // 原样回传状态与头
-          const resHeaders: Record<string, string | string[]> = {};
-          for (const [k, v] of Object.entries(upstreamRes.headers)) {
-            if (v === undefined) continue;
-            // 去掉 hop-by-hop，避免客户端解压/分块错乱
-            const lk = k.toLowerCase();
-            if (lk === "content-length" || lk === "transfer-encoding" || lk === "connection") continue;
-            resHeaders[k] = v;
-          }
-          res.writeHead(upstreamRes.statusCode ?? 502, resHeaders);
+    /**
+     * 发一次上游请求的三种结果：
+     *   { kind: "success" }        —— 成功流式转发，已写回客户端
+     *   { kind: "error", ... }     —— 错误已回给客户端（不允许自愈时）
+     *   { kind: "healable", ... }  —— 错误但没回传，调用方可尝试自愈
+     */
+    type UpstreamResult =
+      | { kind: "success" }
+      | { kind: "error" }
+      | { kind: "healable"; status: number; detail: string };
 
-          const usageSeen = { done: false };
+    const sendUpstream = (payload: Buffer, reqHeaders: Record<string, string>, allowHeal: boolean) =>
+      new Promise<UpstreamResult>((resolve, reject) => {
+        const upstreamReq = transport.request(
+          {
+            protocol: upstreamUrl.protocol,
+            hostname: upstreamUrl.hostname,
+            port: upstreamUrl.port || (isHttps ? 443 : 80),
+            path: `${upstreamUrl.pathname}${upstreamUrl.search}`,
+            method: req.method,
+            headers: reqHeaders,
+          },
+          (upstreamRes) => {
+            const status = upstreamRes.statusCode ?? 502;
 
-          if (upstreamRes.statusCode && upstreamRes.statusCode >= 400) {
-            const errChunks: Buffer[] = [];
-            upstreamRes.on("data", (c: Buffer) => errChunks.push(c));
-            upstreamRes.on("end", () => {
-              const detail = Buffer.concat(errChunks).toString("utf8").slice(0, 1000);
-              onUpstreamError?.(sessionId, upstreamRes.statusCode ?? 0, detail);
-              res.end(Buffer.concat(errChunks));
-              resolve();
+            // 错误响应：先缓冲看能不能自愈
+            if (status >= 400) {
+              const errChunks: Buffer[] = [];
+              upstreamRes.on("data", (c: Buffer) => errChunks.push(c));
+              upstreamRes.on("end", () => {
+                const buf = Buffer.concat(errChunks);
+                const detail = buf.toString("utf8").slice(0, 1000);
+                if (allowHeal) {
+                  resolve({ kind: "healable", status, detail });
+                } else {
+                  onUpstreamError?.(sessionId, status, detail);
+                  const resHeaders = collectHeaders(upstreamRes.headers);
+                  res.writeHead(status, resHeaders);
+                  res.end(buf);
+                  resolve({ kind: "error" });
+                }
+              });
+              return;
+            }
+
+            // 成功：原样回传头 + 字节级 pipe
+            res.writeHead(status, collectHeaders(upstreamRes.headers));
+            const usageSeen = { done: false };
+
+            // ⚠️ 字节级 pipe：不缓冲、不聚合、不等待结束
+            upstreamRes.on("data", (chunk: Buffer) => {
+              if (onUsage) observeUsage(chunk, sessionId, onUsage, usageSeen);
+              res.write(chunk);
             });
+            upstreamRes.on("end", () => {
+              res.end();
+              resolve({ kind: "success" });
+            });
+            upstreamRes.on("error", (e) => {
+              log("error", "上游响应流出错", { sessionId, message: e.message });
+              res.end();
+              resolve({ kind: "error" });
+            });
+          }
+        );
+
+        upstreamReq.on("error", (e) => {
+          log("error", "连接上游失败", { sessionId, message: e.message });
+          onUpstreamError?.(sessionId, 0, e.message);
+          if (!res.headersSent) {
+            res.writeHead(502, { "content-type": "application/json" });
+            res.end(
+              JSON.stringify({
+                error: { type: "upstream_unreachable", message: `连不上上游：${e.message}` },
+              }),
+            );
+          } else {
+            res.end();
+          }
+          resolve({ kind: "error" });
+        });
+
+        // 客户端提前断开时，也要把上游请求取消
+        res.on("close", () => {
+          if (!upstreamReq.destroyed) upstreamReq.destroy();
+        });
+
+        upstreamReq.end(payload);
+      });
+
+    // ── 首次请求前：先看这条线路有没有学到的规则 ──
+    // 学到了就直接不带缓存字段，不用等它报错。
+    const protocolGuess0 = targetUrl.indexOf("/messages") !== -1 ? "anthropic-messages" : "openai";
+    const routeId = routeIdentity(protocolGuess0, targetUrl);
+    let outBody = body;
+    let outHeaders = headers;
+
+    if (learning) {
+      const known = await learning.lookup(routeId).catch(() => null);
+      if (known) {
+        try {
+          const src = JSON.parse(body.toString("utf8")) as Record<string, unknown>;
+          const stripped = stripCacheFields(src);
+          outBody = Buffer.from(JSON.stringify(stripped), "utf8");
+          outHeaders = { ...headers, "content-length": String(outBody.length) };
+          log("info", "按已学规则移除缓存字段", { route: routeId, strip: known.strip });
+        } catch {
+          // 请求体不是 JSON：原样发
+        }
+      }
+    }
+
+    const first = await sendUpstream(outBody, outHeaders, true);
+
+    if (first.kind !== "healable") return; // 成功，或错误已回传
+
+    // ── 命中错误：看能不能自愈 ──
+    const route = routeId;
+    let payload = outBody;
+    let healed = false;
+    if (learning && payload.length > 0) {
+      let parsed: Record<string, unknown> | null = null;
+      try {
+        parsed = JSON.parse(payload.toString("utf8")) as Record<string, unknown>;
+      } catch {
+        parsed = null;
+      }
+
+      if (parsed) {
+        const decision = decideHeal(parsed, first.status, first.detail);
+        if (decision.retry) {
+          const stripped = stripCacheFields(parsed);
+          const nextBody = Buffer.from(JSON.stringify(stripped), "utf8");
+          log("info", "尝试缓存字段自愈", {
+            route,
+            strip: decision.strip,
+            reason: decision.reason,
+            kind: decision.kind,
+          });
+
+          const r = await sendUpstream(
+            nextBody,
+            { ...headers, "content-length": String(nextBody.length) },
+            false,
+          );
+
+          if (r.kind === "success") {
+            healed = true;
+            try {
+              await learning.learn({ route, strip: decision.strip, kind: decision.kind });
+            } catch (e) {
+            }
             return;
           }
-
-          // ⚠️ 字节级 pipe：不缓冲、不聚合、不等待结束
-          upstreamRes.on("data", (chunk: Buffer) => {
-            if (onUsage) observeUsage(chunk, sessionId, onUsage, usageSeen);
-            res.write(chunk);
-          });
-          upstreamRes.on("end", () => {
-            res.end();
-            resolve();
-          });
-          upstreamRes.on("error", (e) => {
-            log("error", "上游响应流出错", { sessionId, message: e.message });
-            res.end();
-            resolve();
-          });
-        },
-      );
-
-      upstreamReq.on("error", (e) => {
-        log("error", "连接上游失败", { sessionId, message: e.message });
-        onUpstreamError?.(sessionId, 0, e.message);
-        if (!res.headersSent) {
-          res.writeHead(502, { "content-type": "application/json" });
-          res.end(
-            JSON.stringify({
-              error: { type: "upstream_unreachable", message: `连不上上游：${e.message}` },
-            }),
-          );
-        } else {
-          res.end();
         }
-        resolve();
-      });
+      }
+    }
 
-      // 客户端提前断开时，也要把上游请求取消
-      res.on("close", () => {
-        if (!upstreamReq.destroyed) upstreamReq.destroy();
-      });
-
-      upstreamReq.end(body);
-    });
+    if (!healed) {
+      onUpstreamError?.(sessionId, first.status, first.detail);
+      return respondError(res, first.status, first.detail);
+    }
   }
 
   const port = await new Promise<number>((resolve, reject) => {
@@ -291,6 +418,8 @@ export async function createCompatProxy(options: CreateProxyOptions): Promise<Pr
       registry.delete(sessionId);
     },
     async dispose() {
+      // 把学习记录落盘（运行期只在内存里）
+      if (learning) await learning.flush();
       registry.clear();
       await new Promise<void>((resolve) => {
         server.close(() => resolve());

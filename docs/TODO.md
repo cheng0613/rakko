@@ -81,6 +81,16 @@ Full Access 档不拦（那档用户已明确接受）。
 
 ---
 
+## 3d. 缓存字段自愈（compat）
+
+**状态**：✅ 已完成
+
+上游拒收 `prompt_cache_key` / `prompt_cache_retention` 时自动移除重试一次，
+成功后记进本地学习文件（explicit 7 天 / opaque 24 小时），
+下次同线路直接不带这两个字段。
+
+---
+
 ## 4. 分发（pi 从哪来）
 
 **状态**：待办 —— P1 出 beta 包前必须定

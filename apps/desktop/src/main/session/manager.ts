@@ -62,6 +62,11 @@ export class SessionManager {
 
     this.proxyStarting = (async () => {
       const handle = await createCompatProxy({
+        // 缓存字段自愈：上游拒收 prompt_cache_key 时自动移除重试。
+        // 学习文件放 userData 下，跨启动保留。
+        cacheHeal: {
+          storePath: path.join(app.getPath("userData"), "config", "cache-heal.json"),
+        },
         // 会话标识走自定义头，由 pi 的 provider 配置注入。
         // 没有时回落到单会话模式（P0 只有一个会话）。
         resolveSession: (req) => {
