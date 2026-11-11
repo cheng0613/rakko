@@ -96,6 +96,16 @@ export class PersistenceService {
     return this.getDb().countMessages(sessionId);
   }
 
+  /** 取上次记录的 pi 会话文件路径，用于续接上下文 */
+  getSessionFile(sessionId: string): string | null {
+    return this.getDb().getSession(sessionId)?.sessionFile ?? null;
+  }
+
+  /** 记录 pi 会话文件路径 */
+  setSessionFile(sessionId: string, file: string): void {
+    this.getDb().setSessionFile(sessionId, file);
+  }
+
   /**
    * 用首条用户消息生成会话标题。
    *

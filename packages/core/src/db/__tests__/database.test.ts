@@ -5,39 +5,60 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DbError, RakkoDb } from "../database.js";
 
 let db: RakkoDb;
+/** 当前测试用的临时目录（会被 tmpDir 覆盖） */
 let dir: string;
+/** 本测试创建的所有临时目录，统一在 afterEach 清理 */
+let tempDirs: string[] = [];
 
 beforeEach(() => {
   db = RakkoDb.openInMemory();
+  tempDirs = [];
 });
 
 afterEach(async () => {
-  db.close();
-  if (dir) await fs.rm(dir, { recursive: true, force: true });
+  // 内存库必须关，否则 Windows 上会锁住临时目录
+  try {
+    db.close();
+  } catch {
+    /* 已经关过 */
+  }
+  for (const d of tempDirs) {
+    await fs.rm(d, { recursive: true, force: true }).catch(() => {});
+  }
+  tempDirs = [];
 });
 
+/** 建一个受管理的临时目录 */
+async function tmpDir(): Promise<string> {
+  const d = await fs.mkdtemp(path.join(os.tmpdir(), "rakko-db-"));
+  tempDirs.push(d);
+  return d;
+}
+
 describe("迁移", () => {
-  it("打开后 schema 版本是 1", () => {
-    expect(db.schemaVersion).toBe(1);
+  it("打开后 schema 版本是最新的", () => {
+    // v1 建表，v2 加 session_file 列
+    expect(db.schemaVersion).toBeGreaterThanOrEqual(2);
   });
 
   it("重复打开不报错（幂等）", async () => {
-    dir = await fs.mkdtemp(path.join(os.tmpdir(), "rakko-db-"));
+    dir = await tmpDir();
     const file = path.join(dir, "rakko.db");
 
     const a = await RakkoDb.open(file);
+    const ver = a.schemaVersion;
     a.upsertProject({ id: "p1", name: "项目", cwd: "/tmp/x" });
     a.close();
 
     // 再开一次：迁移会重跑，但不能报错，数据要还在
     const b = await RakkoDb.open(file);
-    expect(b.schemaVersion).toBe(1);
+    expect(b.schemaVersion).toBe(ver);
     expect(b.listProjects()).toHaveLength(1);
     b.close();
   });
 
   it("升级不丢数据（模拟再开一次）", async () => {
-    dir = await fs.mkdtemp(path.join(os.tmpdir(), "rakko-db-"));
+    dir = await tmpDir();
     const file = path.join(dir, "rakko.db");
 
     const a = await RakkoDb.open(file);
@@ -54,10 +75,10 @@ describe("迁移", () => {
   });
 
   it("打开不存在的目录会创建", async () => {
-    dir = await fs.mkdtemp(path.join(os.tmpdir(), "rakko-db-"));
+    dir = await tmpDir();
     const file = path.join(dir, "a", "b", "rakko.db");
     const d = await RakkoDb.open(file);
-    expect(d.schemaVersion).toBe(1);
+    expect(d.schemaVersion).toBeGreaterThanOrEqual(2);
     d.close();
   });
 });
@@ -212,6 +233,62 @@ describe("消息", () => {
 
     expect(db.listMessages("s1").map((m) => m.content)).toEqual(["给 s1"]);
     expect(db.listMessages("s2").map((m) => m.content)).toEqual(["给 s2"]);
+  });
+});
+
+describe("会话文件路径（上下文续接）", () => {
+  it("新会话的 sessionFile 是 null", () => {
+    db.upsertProject({ id: "p1", name: "P", cwd: "/tmp/a" });
+    const s = db.createSession({ id: "s1", projectId: "p1", title: "T" });
+    expect(s.sessionFile).toBeNull();
+    expect(db.getSession("s1")?.sessionFile).toBeNull();
+  });
+
+  it("记录后能读回来", () => {
+    db.upsertProject({ id: "p1", name: "P", cwd: "/tmp/a" });
+    db.createSession({ id: "s1", projectId: "p1", title: "T" });
+    db.setSessionFile("s1", "/tmp/sessions/abc.jsonl");
+    expect(db.getSession("s1")?.sessionFile).toBe("/tmp/sessions/abc.jsonl");
+  });
+
+  it("记录会推进 updatedAt", async () => {
+    db.upsertProject({ id: "p1", name: "P", cwd: "/tmp/a" });
+    const s = db.createSession({ id: "s1", projectId: "p1", title: "T" });
+    await new Promise((r) => setTimeout(r, 5));
+    db.setSessionFile("s1", "/tmp/x.jsonl");
+    expect(db.getSession("s1")!.updatedAt).toBeGreaterThan(s.updatedAt);
+  });
+
+  it("老库升级后也能用（v1 → v2 加列）", async () => {
+    dir = await tmpDir();
+    const file = path.join(dir, "rakko.db");
+
+    // 先用 v1 建库（模拟旧版本用户）
+    const { default: Database } = await import("better-sqlite3");
+    const raw = new Database(file);
+    raw.exec(`
+      CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, cwd TEXT NOT NULL UNIQUE,
+        created_at INTEGER NOT NULL, last_opened_at INTEGER NOT NULL);
+      CREATE TABLE sessions (id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        title TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+        sdk_session_id TEXT);
+      PRAGMA user_version = 1;
+    `);
+    raw.prepare("INSERT INTO projects VALUES ('p1','旧项目','/tmp/old',1,1)").run();
+    raw.prepare("INSERT INTO sessions VALUES ('s1','p1','旧会话',1,1,NULL)").run();
+    raw.close();
+
+    // 用新版本打开：应该自动加列，数据不丢
+    const upgraded = await RakkoDb.open(file);
+    expect(upgraded.schemaVersion).toBeGreaterThanOrEqual(2);
+    expect(upgraded.getSession("s1")?.title).toBe("旧会话");
+    expect(upgraded.getSession("s1")?.sessionFile).toBeNull();
+
+    // 加列后可写
+    upgraded.setSessionFile("s1", "/tmp/new.jsonl");
+    expect(upgraded.getSession("s1")?.sessionFile).toBe("/tmp/new.jsonl");
+    upgraded.close();
   });
 });
 

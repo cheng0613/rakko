@@ -53,6 +53,21 @@ export interface StartSessionOptions {
   onEvent: (event: AgentEvent) => void;
   /** 权限请求回调。不提供时一律拒绝（fail-closed） */
   onPermissionRequest?: (request: import("@rakko/shared").PermissionRequest) => void;
+  /**
+   * 要续接的 pi 会话文件绝对路径。
+   *
+   * 给了它 pi 就会加载之前的上下文（`--session <file>`）；
+   * 不给则是一个全新会话。
+   *
+   * 这个路径由上一次运行结束时通过 onSessionFile 回传，存在数据库里。
+   */
+  resumeSessionFile?: string | null;
+  /**
+   * pi 报告的会话文件路径。启动后立刻回调一次，之后每次 send 前也会检查。
+   *
+   * 调用方应该把它存起来（数据库），下次启动时作为 resumeSessionFile 传回来。
+   */
+  onSessionFile?: (path: string) => void;
   /** 初始权限档，默认 ask */
   initialPermissionMode?: import("@rakko/shared").PermissionMode;
   log?: (level: "info" | "warn" | "error", msg: string, meta?: unknown) => void;
@@ -248,6 +263,12 @@ export async function startSession(options: StartSessionOptions): Promise<Sessio
     extraArgs.push("--append-system-prompt", promptPath);
   }
 
+  // 续接上下文：给了会话文件就让 pi 加载它
+  if (options.resumeSessionFile) {
+    extraArgs.push("--session", options.resumeSessionFile);
+    log("info", "续接会话上下文", { sessionFile: options.resumeSessionFile });
+  }
+
   // 模型：用第一个 provider 的第一个模型
   const firstProvider = providers[0];
   const firstModel = firstProvider?.models[0];
@@ -271,9 +292,28 @@ export async function startSession(options: StartSessionOptions): Promise<Sessio
     log,
   });
 
+  let sessionFile: string | null = null;
+
+  /** 从 pi 的 getState 里取会话文件路径，变化时回调出去 */
+  const captureSessionFile = async (): Promise<void> => {
+    try {
+      const state = (await host.getState()) as { sessionFile?: unknown } | null;
+      const file = typeof state?.sessionFile === "string" ? state.sessionFile : null;
+      if (file && file !== sessionFile) {
+        sessionFile = file;
+        log("info", "pi 会话文件", { sessionFile: file });
+        options.onSessionFile?.(file);
+      }
+    } catch (e) {
+      // 取不到不影响对话，只是下次不能续接
+      log("warn", "取会话文件失败", { message: (e as Error).message });
+    }
+  };
+
   try {
     host.start();
     await host.getState();
+    await captureSessionFile();
   } catch (e) {
     await host.dispose().catch(() => {});
     throw new SessionStartError(`启动 pi 失败：${(e as Error).message}`, "spawn", e);
@@ -286,6 +326,8 @@ export async function startSession(options: StartSessionOptions): Promise<Sessio
     },
     async send(text: string) {
       await host.prompt(text);
+      // 首轮之后 pi 才写会话文件；这里补一次，确保下次能续接
+      if (!sessionFile) void captureSessionFile();
     },
     async abort() {
       await host.abort();

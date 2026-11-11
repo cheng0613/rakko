@@ -21,6 +21,10 @@ export interface SessionManagerOptions {
       content: string;
     }): unknown;
     maybeAutoTitle(sessionId: string, firstUserMessage: string): void;
+    /** 取上次记录的 pi 会话文件路径，用于续接上下文 */
+    getSessionFile(sessionId: string): string | null;
+    /** 记录 pi 会话文件路径 */
+    setSessionFile(sessionId: string, path: string): void;
   };
 }
 
@@ -116,6 +120,15 @@ export class SessionManager {
       promptSections: input.promptSections,
       tools: input.tools,
       initialPermissionMode: input.initialPermissionMode,
+      // 续接上次的上下文（有的话）
+      resumeSessionFile: this.options.persistence?.getSessionFile(input.sessionId) ?? null,
+      onSessionFile: (file) => {
+        try {
+          this.options.persistence?.setSessionFile(input.sessionId, file);
+        } catch (e) {
+          console.error("[db] 记录会话文件失败", e);
+        }
+      },
       // 权限请求转成事件推给渲染层
       onPermissionRequest: (request) => {
         this.broadcast(input.sessionId, {

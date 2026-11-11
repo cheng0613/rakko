@@ -35,6 +35,11 @@ export interface SessionRow {
   updatedAt: number;
   /** 该会话的 pi 会话文件 id（用于 resume），还没跑过时为空 */
   sdkSessionId: string | null;
+  /**
+   * pi 的会话文件绝对路径。用于 --session 续接上下文。
+   * 第一次跑完之后由会话运行时写回。
+   */
+  sessionFile: string | null;
 }
 
 export interface MessageRow {
@@ -78,6 +83,11 @@ const MIGRATIONS: ReadonlyArray<string> = [
   );
   CREATE INDEX IF NOT EXISTS idx_messages_session
     ON messages(session_id, id);
+  `,
+  // v2：记录 pi 会话文件路径，用于上下文续接。
+  // 已存在的库用 ALTER 补列（CREATE TABLE IF NOT EXISTS 不会改已有表）。
+  `
+  ALTER TABLE sessions ADD COLUMN session_file TEXT;
   `,
 ];
 
@@ -207,6 +217,7 @@ export class RakkoDb {
       createdAt: now,
       updatedAt: now,
       sdkSessionId: null,
+      sessionFile: null,
     };
   }
 
@@ -242,6 +253,13 @@ export class RakkoDb {
     this.db
       .prepare("UPDATE sessions SET sdk_session_id = ?, updated_at = ? WHERE id = ?")
       .run(sdkSessionId, Date.now(), id);
+  }
+
+  /** 记录 pi 会话文件路径，下次启动时用它续接上下文 */
+  setSessionFile(id: string, sessionFile: string): void {
+    this.db
+      .prepare("UPDATE sessions SET session_file = ?, updated_at = ? WHERE id = ?")
+      .run(sessionFile, Date.now(), id);
   }
 
   deleteSession(id: string): void {
@@ -323,6 +341,7 @@ interface RawSession {
   created_at: number;
   updated_at: number;
   sdk_session_id: string | null;
+  session_file: string | null;
 }
 
 interface RawMessage {
@@ -351,6 +370,7 @@ function toSession(r: RawSession): SessionRow {
     createdAt: r.created_at,
     updatedAt: r.updated_at,
     sdkSessionId: r.sdk_session_id,
+    sessionFile: r.session_file ?? null,
   };
 }
 
