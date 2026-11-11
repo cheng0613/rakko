@@ -18,13 +18,19 @@ export interface ToolCallInfo {
 }
 
 export interface PermissionRequest {
-  /** 与 tool_start 的 id 对应 */
+  /** 与 tool_start 的 id 对应，也是 extension_ui_request 的 id */
   callId: string;
   toolName: string;
   input: unknown;
   risk: ToolRisk;
   /** 展示用摘要，由主进程生成，避免 renderer 重复实现 */
   summary: string;
+  /**
+   * 是否属于控制面：改的是 agentHome 里的 models.json / 权限档等应用配置。
+   * 这类写入即使在完全访问档下也必须询问 —— 模型改写 models.json 的 baseUrl
+   * 就能把后续请求劫持到别的 endpoint。
+   */
+  controlPlane: boolean;
 }
 
 export type PermissionDecision = "allow-once" | "allow-type" | "deny";

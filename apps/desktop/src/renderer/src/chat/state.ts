@@ -39,6 +39,16 @@ export interface ChatMessage {
   errorText?: string;
 }
 
+/** 一条待处理的审批 */
+export interface PendingPermission {
+  callId: string;
+  toolName: string;
+  input: unknown;
+  risk: "low" | "medium" | "high";
+  summary: string;
+  controlPlane: boolean;
+}
+
 export interface ChatState {
   messages: ChatMessage[];
   /** 是否有一轮在跑 */
@@ -49,6 +59,8 @@ export interface ChatState {
   totalUsage: TokenUsage;
   /** 最近一次错误 */
   lastError: string | null;
+  /** 待处理的审批（按到达顺序） */
+  pendingPermissions: PendingPermission[];
 }
 
 export const initialChatState: ChatState = {
@@ -57,6 +69,7 @@ export const initialChatState: ChatState = {
   currentTurnId: null,
   totalUsage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
   lastError: null,
+  pendingPermissions: [],
 };
 
 /** 用户发消息时立刻本地插入（不等 pi 回显） */
@@ -167,9 +180,25 @@ export function reduceEvent(state: ChatState, event: AgentEvent): ChatState {
     case "error":
       return { ...state, lastError: event.message, busy: false, currentTurnId: null };
 
-    case "permission_request":
-      // P0 步骤 11 才接审批，这里先记一笔
-      return { ...state, lastError: "收到权限请求，但审批界面还没实现" };
+    case "permission_request": {
+      const r = event.request;
+      // 同 callId 不重复入队（pi 重连或重放时可能出现）
+      if (state.pendingPermissions.some((p) => p.callId === r.callId)) return state;
+      return {
+        ...state,
+        pendingPermissions: [
+          ...state.pendingPermissions,
+          {
+            callId: r.callId,
+            toolName: r.toolName,
+            input: r.input,
+            risk: r.risk,
+            summary: r.summary,
+            controlPlane: r.controlPlane,
+          },
+        ],
+      };
+    }
 
     case "permission_resolved":
     case "tool_update":
@@ -187,6 +216,14 @@ function updateCurrent(state: ChatState, fn: (blocks: Block[]) => Block[]): Chat
   return {
     ...state,
     messages: state.messages.map((m) => (m.id === id ? { ...m, blocks: fn(m.blocks) } : m)),
+  };
+}
+
+/** 移出一条待审批。用户点了按钮后调用 */
+export function clearPendingPermission(state: ChatState, callId: string): ChatState {
+  return {
+    ...state,
+    pendingPermissions: state.pendingPermissions.filter((p) => p.callId !== callId),
   };
 }
 

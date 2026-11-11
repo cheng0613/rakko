@@ -6,6 +6,13 @@
  */
 import { app, BrowserWindow, ipcMain, nativeTheme } from "electron";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+/**
+ * ESM 里没有 __dirname。
+ * 主进程产物是 ESM（package.json type: module），必须自己算。
+ */
+const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 import { PRODUCT_NAME } from "@rakko/shared";
 import { registerIpc } from "./ipc/register.js";
 import { SessionManager } from "./session/manager.js";
@@ -24,7 +31,7 @@ function createWindow(): void {
     backgroundColor: nativeTheme.shouldUseDarkColors ? "#141413" : "#e9e9e6",
     titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "default",
     webPreferences: {
-      preload: path.join(__dirname, "../preload/index.mjs"),
+      preload: path.join(moduleDir, "../preload/index.mjs"),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
@@ -42,7 +49,7 @@ function createWindow(): void {
   if (process.env["ELECTRON_RENDERER_URL"]) {
     void mainWindow.loadURL(process.env["ELECTRON_RENDERER_URL"]);
   } else {
-    void mainWindow.loadFile(path.join(__dirname, "../renderer/index.html"));
+    void mainWindow.loadFile(path.join(moduleDir, "../renderer/index.html"));
   }
 }
 

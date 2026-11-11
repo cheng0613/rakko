@@ -89,6 +89,7 @@ export class SessionManager {
     apiKey: string;
     promptSections: string[];
     tools: string[] | "all";
+    initialPermissionMode?: import("@rakko/shared").PermissionMode;
   }): Promise<{ sessionId: string; proxyUrl: string }> {
     await this.stop(input.sessionId);
 
@@ -105,6 +106,15 @@ export class SessionManager {
       apiKey: input.apiKey,
       promptSections: input.promptSections,
       tools: input.tools,
+      initialPermissionMode: input.initialPermissionMode,
+      // 权限请求转成事件推给渲染层
+      onPermissionRequest: (request) => {
+        this.broadcast(input.sessionId, {
+          type: "permission_request",
+          turnId: "-",
+          request,
+        });
+      },
       onEvent: (event) => this.broadcast(input.sessionId, event),
       log: (level, msg, meta) => {
         if (level === "error") console.error(`[session ${input.sessionId}] ${msg}`, meta ?? "");
@@ -120,6 +130,25 @@ export class SessionManager {
     const s = this.sessions.get(sessionId);
     if (!s) throw new Error(`会话不存在：${sessionId}`);
     await s.runtime.send(text);
+  }
+
+  async respondPermission(
+    sessionId: string,
+    callId: string,
+    decision: import("@rakko/shared").PermissionDecision,
+  ): Promise<void> {
+    const s = this.sessions.get(sessionId);
+    if (!s) throw new Error(`会话不存在：${sessionId}`);
+    await s.runtime.respondPermission(callId, decision);
+  }
+
+  async setPermissionMode(
+    sessionId: string,
+    mode: import("@rakko/shared").PermissionMode,
+  ): Promise<void> {
+    const s = this.sessions.get(sessionId);
+    if (!s) throw new Error(`会话不存在：${sessionId}`);
+    await s.runtime.setPermissionMode(mode);
   }
 
   async abort(sessionId: string): Promise<void> {

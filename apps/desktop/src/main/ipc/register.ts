@@ -99,13 +99,22 @@ export function registerIpc(ipcMain: IpcMain, sessions: SessionManager): void {
   ipcMain.handle(IPC.resolvePermission, async (_e, input: unknown): Promise<void> => {
     const parsed = input as PermissionResolveInput;
     assertShape(parsed, ["sessionId", "callId", "decision"], "resolvePermission");
-    throw new Error("resolvePermission 尚未实现（P0 步骤 11）");
+    if (typeof parsed.sessionId !== "string" || typeof parsed.callId !== "string") {
+      throw new Error("resolvePermission: sessionId 与 callId 必须是字符串");
+    }
+    if (!["allow-once", "allow-type", "deny"].includes(parsed.decision)) {
+      throw new Error(`resolvePermission: 非法的 decision ${String(parsed.decision)}`);
+    }
+    await sessions.respondPermission(parsed.sessionId, parsed.callId, parsed.decision);
   });
 
   ipcMain.handle(IPC.setPermissionMode, async (_e, input: unknown): Promise<void> => {
     const parsed = input as SetPermissionModeInput;
     assertShape(parsed, ["sessionId", "mode"], "setPermissionMode");
-    throw new Error("setPermissionMode 尚未实现（P0 步骤 11）");
+    if (typeof parsed.sessionId !== "string") {
+      throw new Error("setPermissionMode: sessionId 必须是字符串");
+    }
+    await sessions.setPermissionMode(parsed.sessionId, parsed.mode);
   });
 }
 

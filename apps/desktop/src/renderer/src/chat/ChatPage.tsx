@@ -10,12 +10,14 @@ import type { AgentEvent, ModelSummary, PermissionMode } from "@rakko/shared";
 import type { RakkoApi } from "@rakko/shared";
 import {
   appendUserMessage,
+  clearPendingPermission,
   initialChatState,
   reduceEvent,
   summarizeToolInput,
   type Block,
   type ChatState,
 } from "./state.js";
+import { PermissionCard } from "./PermissionCard.js";
 import "./chat.css";
 
 declare global {
@@ -26,10 +28,17 @@ declare global {
 
 const SESSION_ID = "local-1";
 
-export function ChatPage({ appInfo }: { appInfo: { name: string; version: string } | null }) {
+export function ChatPage({
+  appInfo,
+  initialMode = "ask",
+}: {
+  appInfo: { name: string; version: string } | null;
+  initialMode?: PermissionMode;
+}) {
   const [chat, setChat] = useState<ChatState>(initialChatState);
   const [input, setInput] = useState("");
-  const [mode, setMode] = useState<PermissionMode>("ask");
+  const [mode, setMode] = useState<PermissionMode>(initialMode);
+  const [deciding, setDeciding] = useState<string | null>(null);
   const [status, setStatus] = useState<string>("未连接");
   const [error, setError] = useState<string | null>(null);
   const [models, setModels] = useState<ModelSummary[]>([]);
@@ -76,6 +85,8 @@ export function ChatPage({ appInfo }: { appInfo: { name: string; version: string
         promptSections: ["你是 Rakko，一个桌面助手。回答简洁、准确。"],
         tools: "all",
       });
+      // 会话起来后同步一次当前档位
+      await window.rakko.setPermissionMode({ sessionId: SESSION_ID, mode: effectiveMode });
       startedRef.current = true;
       setStatus("就绪");
       setError(null);
@@ -100,6 +111,21 @@ export function ChatPage({ appInfo }: { appInfo: { name: string; version: string
       setError(e instanceof Error ? e.message : String(e));
     }
   }, [input, ensureSession]);
+
+  const handleDecide = useCallback(
+    async (callId: string, decision: "allow-once" | "allow-type" | "deny"): Promise<void> => {
+      setDeciding(callId);
+      try {
+        await window.rakko.resolvePermission({ sessionId: SESSION_ID, callId, decision });
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        setChat((prev) => clearPendingPermission(prev, callId));
+        setDeciding(null);
+      }
+    },
+    [],
+  );
 
   const handleStop = useCallback(async (): Promise<void> => {
     try {
@@ -162,6 +188,15 @@ export function ChatPage({ appInfo }: { appInfo: { name: string; version: string
         {chat.messages.map((m) => (
           <MessageRow key={m.id} role={m.role} blocks={m.blocks} endReason={m.endReason} />
         ))}
+
+        {chat.pendingPermissions.map((p) => (
+          <PermissionCard
+            key={p.callId}
+            request={p}
+            pending={deciding === p.callId}
+            onDecide={(d) => void handleDecide(p.callId, d)}
+          />
+        ))}
       </div>
 
       <div className="composer">
@@ -171,7 +206,14 @@ export function ChatPage({ appInfo }: { appInfo: { name: string; version: string
             title={effectiveMode === "bypassPermissions" ? BYPASS_WARNING : PERMISSION_MODE_LABEL[effectiveMode]}
             onClick={() => {
               const idx = PERMISSION_MODES.indexOf(effectiveMode);
-              setMode(PERMISSION_MODES[(idx + 1) % PERMISSION_MODES.length]!);
+              const next = PERMISSION_MODES[(idx + 1) % PERMISSION_MODES.length]!;
+              setMode(next);
+              // 热切换：写文件即可，bridge 每次 tool_call 重读
+              void window.rakko
+                .setPermissionMode({ sessionId: SESSION_ID, mode: next })
+                .catch(() => {
+                  /* 会话还没启动时切换，等启动时用初始值 */
+                });
             }}
           >
             {PERMISSION_MODE_LABEL[effectiveMode]}

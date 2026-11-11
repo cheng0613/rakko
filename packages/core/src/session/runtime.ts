@@ -11,6 +11,14 @@ import { assertAppendPromptUsable, writeAppendPrompt } from "../pi/append-prompt
 import { buildPiEnv } from "../pi/env.js";
 import { PiHost } from "../pi/host.js";
 import { resolveNodeBinary, resolvePiEntry } from "../pi/resolve-pi.js";
+import {
+  RAKKO_ALLOW_ONCE,
+  RAKKO_ALLOW_TYPE,
+  RAKKO_BRIDGE_FILENAME,
+  RAKKO_DENY,
+  buildBridgeSource,
+} from "../pi/bridge-source.js";
+import { PERMISSION_FILENAME, writePermissionMode } from "./permission-store.js";
 
 export interface StartSessionOptions {
   sessionId: string;
@@ -43,6 +51,10 @@ export interface StartSessionOptions {
   tools?: string[] | "all";
   /** 事件回调 */
   onEvent: (event: AgentEvent) => void;
+  /** 权限请求回调。不提供时一律拒绝（fail-closed） */
+  onPermissionRequest?: (request: import("@rakko/shared").PermissionRequest) => void;
+  /** 初始权限档，默认 ask */
+  initialPermissionMode?: import("@rakko/shared").PermissionMode;
   log?: (level: "info" | "warn" | "error", msg: string, meta?: unknown) => void;
 }
 
@@ -52,6 +64,10 @@ export interface SessionRuntime {
   send(text: string): Promise<void>;
   /** 中止当前轮 */
   abort(): Promise<void>;
+  /** 切换权限档（热切换，不用重启 pi） */
+  setPermissionMode(mode: import("@rakko/shared").PermissionMode): Promise<void>;
+  /** 回答一个权限请求 */
+  respondPermission(callId: string, decision: import("@rakko/shared").PermissionDecision): Promise<void>;
   /** 关闭 */
   dispose(): Promise<void>;
   /** 是否在运行 */
@@ -154,6 +170,32 @@ export async function startSession(options: StartSessionOptions): Promise<Sessio
     log("info", "真 key 已交给 proxy", { sessionId, upstream: primary.baseUrl });
   }
 
+  // ── 2.6 写权限门扩展与权限档 ──
+  const runtimeDir = path.join(agentHome, "runtime");
+  const extensionsDir = path.join(agentHome, "extensions");
+  const permissionFile = path.join(runtimeDir, PERMISSION_FILENAME);
+  try {
+    await fs.mkdir(extensionsDir, { recursive: true });
+    const source = buildBridgeSource({ permissionFile, agentHome });
+    const bridgePath = path.join(extensionsDir, RAKKO_BRIDGE_FILENAME);
+    await fs.writeFile(bridgePath, source, "utf8");
+
+    // 回读校验：扩展文件写坏了，pi 会启动失败且报错不直观
+    const readBack = await fs.readFile(bridgePath, "utf8");
+    if (readBack !== source) {
+      throw new Error("权限门扩展写入后回读不一致");
+    }
+
+    await writePermissionMode(runtimeDir, options.initialPermissionMode ?? "ask");
+    log("info", "权限门就绪", {
+      bridge: bridgePath,
+      permissionFile,
+      mode: options.initialPermissionMode ?? "ask",
+    });
+  } catch (e) {
+    throw new SessionStartError(`写入权限门失败：${(e as Error).message}`, "permission-bridge", e);
+  }
+
   // ── 3. pi 入口与 node 二进制 ──
   let piEntry: string;
   let nodePath: string;
@@ -174,18 +216,24 @@ export async function startSession(options: StartSessionOptions): Promise<Sessio
     sessionId,
     agentHome,
     proxyPort: useProxy ? options.proxy!.port : 0,
-    // 无 proxy 时，pi 需要真 key 才能直连上游
-    ...(useProxy ? {} : { extra: { RAKKO_PI_API_KEY: options.apiKey! } }),
+    // 权限档文件路径：bridge 靠它热切换
+    extra: {
+      RAKKO_PI_PERMISSION_FILE: permissionFile,
+      ...(useProxy ? {} : { RAKKO_PI_API_KEY: options.apiKey! }),
+    },
   });
 
   // ── 5. 参数 ──
   const extraArgs: string[] = [
-    "--no-extensions",
+    // 不传 --no-extensions：要让刚写的权限门扩展加载
     "--no-skills",
     "--no-prompt-templates",
     "--no-themes",
     "--no-mcp",
     "--no-context-files",
+    // 显式加载我们的扩展，不依赖目录扫描
+    "--extension",
+    path.join(extensionsDir, RAKKO_BRIDGE_FILENAME),
   ];
 
   if (options.tools === "all") {
@@ -219,6 +267,7 @@ export async function startSession(options: StartSessionOptions): Promise<Sessio
     extraArgs,
     onEvent: options.onEvent,
     onExit: (code: number | null, signal: string | null) => log("info", "pi 退出", { code, signal }),
+    onPermissionRequest: options.onPermissionRequest,
     log,
   });
 
@@ -240,6 +289,20 @@ export async function startSession(options: StartSessionOptions): Promise<Sessio
     },
     async abort() {
       await host.abort();
+    },
+    async setPermissionMode(mode) {
+      // 写文件即热切换：bridge 每次 tool_call 都会重读
+      await writePermissionMode(runtimeDir, mode);
+      log("info", "权限档已切换", { mode });
+    },
+    async respondPermission(callId, decision) {
+      const value =
+        decision === "allow-once"
+          ? RAKKO_ALLOW_ONCE
+          : decision === "allow-type"
+            ? RAKKO_ALLOW_TYPE
+            : RAKKO_DENY;
+      host.respondUi(callId, value);
     },
     async dispose() {
       await host.dispose();

@@ -314,3 +314,118 @@
 .mono {
   font-family: ui-monospace, "Cascadia Code", Consolas, Menlo, monospace;
 }
+
+/* ── 审批卡 ── */
+.perm-card {
+  border: 1px solid var(--warn);
+  border-radius: 10px;
+  background: var(--card);
+  padding: 12px 14px;
+  max-width: 720px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.perm-card.control-plane {
+  border-width: 2px;
+}
+
+.perm-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.perm-title {
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.perm-risk {
+  font-size: 10.5px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--line2);
+  color: var(--ink2);
+}
+
+.perm-risk.high {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+.perm-cp {
+  font-size: 10.5px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--warn);
+  color: var(--card);
+}
+
+.perm-tool {
+  font-size: 12px;
+  color: var(--ink2);
+}
+
+.perm-body {
+  margin: 0;
+  padding: 10px 12px;
+  background: var(--card2);
+  border-radius: 8px;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--ink);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 200px;
+  overflow: auto;
+}
+
+.perm-note {
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--ink2);
+}
+
+.perm-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.pbtn {
+  font-size: 12.5px;
+  padding: 5px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--line2);
+  background: var(--card);
+  color: var(--ink);
+}
+
+.pbtn:hover:not(:disabled) {
+  background: var(--card2);
+}
+
+.pbtn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.pbtn.primary {
+  background: var(--acid);
+  border-color: var(--acid-line);
+  font-weight: 600;
+}
+
+.pbtn.danger {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+.perm-done {
+  font-size: 11.5px;
+  color: var(--ink3);
+  margin-left: 4px;
+}
