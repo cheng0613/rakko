@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@rakko/core": "workspace:*",
+    "@rakko/proxy": "workspace:*",
     "@rakko/shared": "workspace:*"
   },
   "devDependencies": {

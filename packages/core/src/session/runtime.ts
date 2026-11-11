@@ -18,8 +18,18 @@ export interface StartSessionOptions {
   dataDir: string;
   /** 工作目录 */
   cwd: string;
-  /** proxy 端口（models.json 与 env 都指向它）。P0 无 proxy 时为 0 */
-  proxyPort: number;
+  /**
+   * CompatProxy。有它时：models.json 指向 loopback，key 交给 proxy，
+   * pi 的 spawn env 里只有占位值。
+   * 没它时（P0 早期形态）：直连上游，key 进 env。
+   *
+   * **生产路径必须传它** —— 不传就意味着 key 进了子进程 env，
+   * 违背 AGENTS.md 不变量 13。
+   */
+  proxy?: {
+    port: number;
+    register: (sessionId: string, target: { baseUrl: string; apiKey: string }) => void;
+  };
   providers: ProviderConfig[];
   /**
    * 真实上游 key。
@@ -71,16 +81,13 @@ export class SessionStartError extends Error {
  * 任一步失败都抛错，不生成半可用的会话。
  */
 export async function startSession(options: StartSessionOptions): Promise<SessionRuntime> {
-  const { sessionId, dataDir, cwd, proxyPort, providers, promptSections } = options;
+  const { sessionId, dataDir, cwd, providers, promptSections } = options;
   const log = options.log ?? (() => {});
 
-  // P0 阶段没有 CompatProxy：models.json 直接写真实上游，
-  // key 通过 env 交给 pi。接入 proxy 后，baseUrl 改成 loopback，
-  // 这里改为把 apiKey 交给 proxy，models.json 里只留占位。
-  const useProxy = proxyPort > 0;
+  const useProxy = options.proxy !== undefined;
   if (!useProxy && !options.apiKey) {
     throw new SessionStartError(
-      "未提供 apiKey。P0 阶段（无 proxy）需要把 key 通过 env 交给 pi。",
+      "未提供 apiKey。无 proxy 时需要把 key 通过 env 交给 pi。",
       "no-api-key",
     );
   }
@@ -112,12 +119,14 @@ export async function startSession(options: StartSessionOptions): Promise<Sessio
   try {
     // 有 proxy：baseUrl 指向 loopback，key 写占位（真 key 在 proxy 内存）。
     // 无 proxy（P0）：baseUrl 直接写 provider 自己的上游，key 走 env。
-    const proxyBase = useProxy
-      ? `http://127.0.0.1:${proxyPort}/v1`
-      : null;
+    const proxyBase = useProxy ? `http://127.0.0.1:${options.proxy!.port}/v1` : null;
 
     if (proxyBase) {
-      await writeModelsJson(agentHome, { proxyBaseUrl: proxyBase, providers });
+      await writeModelsJson(agentHome, {
+        proxyBaseUrl: proxyBase,
+        providers,
+        sessionId,
+      });
     } else {
       await writeModelsJsonDirect(agentHome, providers);
     }
@@ -127,6 +136,22 @@ export async function startSession(options: StartSessionOptions): Promise<Sessio
     });
   } catch (e) {
     throw new SessionStartError(`写入 models.json 失败：${(e as Error).message}`, "models-json", e);
+  }
+
+  // ── 2.5 把真 key 交给 proxy（不写进 models.json，不进 env）──
+  if (useProxy) {
+    const primary = providers[0];
+    if (!primary) {
+      throw new SessionStartError("没有可用的 provider", "no-provider");
+    }
+    if (!options.apiKey) {
+      throw new SessionStartError("proxy 模式必须提供 apiKey", "no-api-key");
+    }
+    options.proxy!.register(sessionId, {
+      baseUrl: primary.baseUrl,
+      apiKey: options.apiKey,
+    });
+    log("info", "真 key 已交给 proxy", { sessionId, upstream: primary.baseUrl });
   }
 
   // ── 3. pi 入口与 node 二进制 ──
@@ -148,7 +173,7 @@ export async function startSession(options: StartSessionOptions): Promise<Sessio
   const env = buildPiEnv({
     sessionId,
     agentHome,
-    proxyPort,
+    proxyPort: useProxy ? options.proxy!.port : 0,
     // 无 proxy 时，pi 需要真 key 才能直连上游
     ...(useProxy ? {} : { extra: { RAKKO_PI_API_KEY: options.apiKey! } }),
   });

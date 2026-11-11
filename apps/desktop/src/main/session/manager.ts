@@ -1,57 +1,106 @@
 /**
- * 会话管理器：在主进程里持有会话运行时，转发事件到渲染进程。
+ * 会话管理器：持有会话运行时 + CompatProxy，转发事件到渲染进程。
  *
- * 事件流走 pub/sub（不变量：translator 不直接 webContents.send）。
- * 渲染进程按 sessionId 订阅，将来加手机推送 / IM 转发时不用改翻译层。
+ * proxy 是进程级的（一个实例服务所有会话），按 sessionId 区分上游与 key。
  */
 import type { BrowserWindow } from "electron";
 import { app } from "electron";
 import path from "node:path";
 import { IPC } from "@rakko/shared";
-import type { AgentEvent, ProviderConfig } from "@rakko/shared";
+import type { AgentEvent, ProviderConfig, TokenUsage } from "@rakko/shared";
 import { SessionStartError, startSession, type SessionRuntime } from "@rakko/core";
+import { createCompatProxy, type ProxyHandle } from "@rakko/proxy";
 
 export interface SessionManagerOptions {
-  /** 取当前主窗口，用于推送事件 */
   getWindow: () => BrowserWindow | null;
 }
 
 interface ManagedSession {
   runtime: SessionRuntime;
   dataDir: string;
-  subscribers: Set<string>;
 }
 
 export class SessionManager {
   private readonly sessions = new Map<string, ManagedSession>();
+  private proxy: ProxyHandle | null = null;
+  private proxyStarting: Promise<ProxyHandle> | null = null;
+  private readonly usage = new Map<string, TokenUsage>();
 
   constructor(private readonly options: SessionManagerOptions) {}
 
   /**
-   * 启动会话。同一 id 重复调用会先关掉旧的。
+   * 懒启动 proxy。全进程共用一个。
    */
+  private async ensureProxy(): Promise<ProxyHandle> {
+    if (this.proxy) return this.proxy;
+    if (this.proxyStarting) return this.proxyStarting;
+
+    this.proxyStarting = (async () => {
+      const handle = await createCompatProxy({
+        // 会话标识走自定义头，由 pi 的 provider 配置注入。
+        // 没有时回落到单会话模式（P0 只有一个会话）。
+        resolveSession: (req) => {
+          const raw = req.headers["x-rakko-session-id"];
+          if (typeof raw === "string" && raw.length > 0) return raw;
+          // 回落：当前唯一活跃会话
+          const ids = [...this.sessions.keys()];
+          return ids.length === 1 ? ids[0]! : null;
+        },
+        observers: {
+          onUsage: (sessionId, delta) => {
+            const prev = this.usage.get(sessionId) ?? {
+              inputTokens: 0,
+              outputTokens: 0,
+              cacheReadTokens: 0,
+              cacheWriteTokens: 0,
+            };
+            this.usage.set(sessionId, {
+              inputTokens: prev.inputTokens + delta.inputTokens,
+              outputTokens: prev.outputTokens + delta.outputTokens,
+              cacheReadTokens: prev.cacheReadTokens + delta.cacheReadTokens,
+              cacheWriteTokens: prev.cacheWriteTokens + delta.cacheWriteTokens,
+            });
+          },
+          onUpstreamError: (sessionId, status, detail) => {
+            console.error(`[proxy ${sessionId}] 上游错误 ${status}: ${detail.slice(0, 300)}`);
+          },
+          log: (level, msg, meta) => {
+            if (level === "error") console.error(`[proxy] ${msg}`, meta ?? "");
+            else console.log(`[proxy] ${msg}`, meta ?? "");
+          },
+        },
+      });
+      this.proxy = handle;
+      console.log(`[proxy] 已启动 ${handle.url}`);
+      return handle;
+    })();
+
+    try {
+      return await this.proxyStarting;
+    } finally {
+      this.proxyStarting = null;
+    }
+  }
+
   async start(input: {
     sessionId: string;
     cwd: string;
     providers: ProviderConfig[];
-    /** 真实上游 key。只在主进程使用，不下发。 */
     apiKey: string;
     promptSections: string[];
     tools: string[] | "all";
-  }): Promise<{ sessionId: string }> {
+  }): Promise<{ sessionId: string; proxyUrl: string }> {
     await this.stop(input.sessionId);
 
+    const proxy = await this.ensureProxy();
     const dataDir = path.join(app.getPath("userData"), "sessions", input.sessionId);
-
-    // P0 阶段 proxy 还没接。models.json 的 baseUrl 会指向一个未启动的端口，
-    // 这是预期内的 —— 真接模型要等 CompatProxy（P0 剩余步骤）。
-    const proxyPort = 0;
 
     const runtime = await startSession({
       sessionId: input.sessionId,
       dataDir,
       cwd: input.cwd,
-      proxyPort,
+      // 传 proxy：key 留在 proxy 内存，pi 的 env 里只有占位值
+      proxy: { port: proxy.port, register: (id, target) => proxy.register(id, target) },
       providers: input.providers,
       apiKey: input.apiKey,
       promptSections: input.promptSections,
@@ -63,13 +112,8 @@ export class SessionManager {
       },
     });
 
-    this.sessions.set(input.sessionId, {
-      runtime,
-      dataDir,
-      subscribers: new Set(),
-    });
-
-    return { sessionId: input.sessionId };
+    this.sessions.set(input.sessionId, { runtime, dataDir });
+    return { sessionId: input.sessionId, proxyUrl: proxy.url };
   }
 
   async send(sessionId: string, text: string): Promise<void> {
@@ -88,6 +132,7 @@ export class SessionManager {
     const s = this.sessions.get(sessionId);
     if (!s) return;
     this.sessions.delete(sessionId);
+    this.proxy?.unregister(sessionId);
     await s.runtime.dispose().catch((e: unknown) => {
       console.error(`[session ${sessionId}] dispose 失败`, e);
     });
@@ -96,18 +141,16 @@ export class SessionManager {
   async stopAll(): Promise<void> {
     const ids = [...this.sessions.keys()];
     await Promise.all(ids.map((id) => this.stop(id)));
+    if (this.proxy) {
+      await this.proxy.dispose().catch(() => {});
+      this.proxy = null;
+    }
   }
 
-  /** 某个会话是否在运行 */
-  isRunning(sessionId: string): boolean {
-    return this.sessions.get(sessionId)?.runtime.running ?? false;
+  getUsage(sessionId: string): TokenUsage | null {
+    return this.usage.get(sessionId) ?? null;
   }
 
-  /**
-   * 广播事件给渲染进程。
-   *
-   * 形状固定为 { sessionId, event }，渲染端按 sessionId 过滤。
-   */
   private broadcast(sessionId: string, event: AgentEvent): void {
     const win = this.options.getWindow();
     if (!win || win.isDestroyed()) return;

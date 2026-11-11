@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 
 export default defineConfig({
   main: {
-    plugins: [externalizeDepsPlugin({ exclude: ["@rakko/core", "@rakko/shared"] })],
+    plugins: [externalizeDepsPlugin({ exclude: ["@rakko/core", "@rakko/shared", "@rakko/proxy"] })],
     build: {
       rollupOptions: {
         input: { index: resolve(__dirname, "src/main/index.ts") },
@@ -14,6 +14,7 @@ export default defineConfig({
       alias: {
         "@rakko/shared": resolve(__dirname, "../../packages/shared/src/index.ts"),
         "@rakko/core": resolve(__dirname, "../../packages/core/src/index.ts"),
+        "@rakko/proxy": resolve(__dirname, "../../packages/proxy/src/index.ts"),
       },
     },
   },

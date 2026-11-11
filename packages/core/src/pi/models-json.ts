@@ -38,6 +38,8 @@ interface PiProviderEntry {
   api: string;
   baseUrl: string;
   apiKey: string;
+  /** 自定义请求头。proxy 模式用它传会话标识 */
+  headers?: Record<string, string>;
   models: PiModelEntry[];
 }
 
@@ -50,6 +52,11 @@ export interface BuildModelsJsonOptions {
   proxyBaseUrl: string;
   /** 插值用的环境变量名，默认 RAKKO_PI_API_KEY */
   apiKeyEnvVar?: string;
+  /**
+   * 会话标识。proxy 模式必须给 —— proxy 靠它认出这条请求属哪个会话、
+   * 该用哪把真 key。
+   */
+  sessionId?: string;
   providers: ProviderConfig[];
 }
 
@@ -167,6 +174,8 @@ export function buildModelsJson(options: BuildModelsJsonOptions): PiModelsJson {
       // 一律指向 proxy：真上游地址由 proxy 自己记着，不写进 pi 读得到的文件
       baseUrl: proxyBaseUrl,
       apiKey: `$${apiKeyEnvVar}`,
+      // 会话标识：proxy 按它反查真 key
+      ...(options.sessionId ? { headers: { "x-rakko-session-id": options.sessionId } } : {}),
       models: provider.models.map((model) => ({
         id: model.id,
         name: model.name,
