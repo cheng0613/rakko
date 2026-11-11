@@ -65,3 +65,17 @@ describe("完全访问档的文案", () => {
     expect(BYPASS_WARNING).not.toMatch(/安全[^。]*。$/);
   });
 });
+
+describe("auto 档的诚实标注", () => {
+  it("标签必须标明「待实现」——不能让用户以为选了就少被打扰", async () => {
+    const { PERMISSION_MODE_LABEL } = await import("../permission.js");
+    expect(PERMISSION_MODE_LABEL.auto).toContain("待实现");
+    // 不允许出现裸的「自动审批」而不加说明
+    expect(PERMISSION_MODE_LABEL.auto).not.toBe("自动审批");
+  });
+
+  it("描述要说明当前行为与 ask 相同", async () => {
+    const { PERMISSION_MODE_DESCRIPTION } = await import("../permission.js");
+    expect(PERMISSION_MODE_DESCRIPTION.auto).toContain("每次询问");
+  });
+});

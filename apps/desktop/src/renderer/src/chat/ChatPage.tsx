@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   BYPASS_WARNING,
   PERMISSION_MODES,
+  PERMISSION_MODE_DESCRIPTION,
   PERMISSION_MODE_LABEL,
   PRODUCT_NAME,
   coercePermissionMode,
@@ -271,8 +272,14 @@ export function ChatPage({
       <div className="composer">
         <div className="cbar">
           <button
-            className={`ppill ${effectiveMode === "bypassPermissions" ? "warn" : ""}`}
-            title={effectiveMode === "bypassPermissions" ? BYPASS_WARNING : PERMISSION_MODE_LABEL[effectiveMode]}
+            className={`ppill ${effectiveMode === "bypassPermissions" ? "warn" : ""} ${
+              effectiveMode === "auto" ? "pending" : ""
+            }`}
+            title={
+              effectiveMode === "bypassPermissions"
+                ? BYPASS_WARNING
+                : PERMISSION_MODE_DESCRIPTION[effectiveMode]
+            }
             onClick={() => {
               const idx = PERMISSION_MODES.indexOf(effectiveMode);
               const next = PERMISSION_MODES[(idx + 1) % PERMISSION_MODES.length]!;

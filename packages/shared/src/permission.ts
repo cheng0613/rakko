@@ -17,13 +17,16 @@ export const STRICTEST_PERMISSION_MODE: PermissionMode = PERMISSION_MODES[0];
 
 export const PERMISSION_MODE_LABEL: Record<PermissionMode, string> = {
   ask: "每次询问",
-  auto: "自动审批",
+  // 诚实标注：真正的自动审核分类器还没做，这一档目前与 ask 相同。
+  // 不写「自动审批」是因为那会让用户以为选了就少被打扰。
+  auto: "自动审批（待实现）",
   bypassPermissions: "完全访问",
 };
 
 export const PERMISSION_MODE_DESCRIPTION: Record<PermissionMode, string> = {
   ask: "每个会改动系统的工具调用都先问你。只读操作直接执行。",
-  auto: "低风险操作自动放行，高风险（写、删、执行命令）仍会问你。",
+  auto:
+    "本应低风险自动放行、高风险才问你。但自动分类器尚未实现，当前行为与「每次询问」相同。",
   bypassPermissions: "不再询问。Agent 可以执行任何命令、读写任何文件。",
 };
 

@@ -552,3 +552,9 @@
   font-size: 0.92em;
   color: var(--ink3);
 }
+
+/* auto 档：功能还没实现，视觉上要能看出来 */
+.ppill.pending {
+  border-style: dashed;
+  color: var(--ink3);
+}
