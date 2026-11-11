@@ -26,6 +26,28 @@ export interface SendMessageInput {
   text: string;
 }
 
+/** 启动一个会话 */
+export interface StartSessionInput {
+  sessionId: string;
+  cwd: string;
+  /** 系统提示追加段落 */
+  promptSections: string[];
+  /** 工具：具体名单，或 "all" 开启默认集 */
+  tools: string[] | "all";
+}
+
+/**
+ * 渲染进程可见的模型信息。
+ * 不包含 key、不包含真实 baseUrl —— 那些只在主进程里。
+ */
+export interface ModelSummary {
+  providerId: string;
+  providerName: string;
+  modelId: string;
+  modelName: string;
+  contextWindow: number;
+}
+
 export interface PermissionResolveInput {
   sessionId: string;
   callId: string;
@@ -57,6 +79,12 @@ export interface RakkoApi {
   /** 在一个项目里新建会话 */
   createSession(projectId: string): Promise<SessionInfo>;
 
+  /** 启动/重启一个会话运行时 */
+  startSession(input: StartSessionInput): Promise<{ sessionId: string }>;
+
+  /** 停止会话 */
+  stopSession(sessionId: string): Promise<void>;
+
   /** 发消息 */
   sendMessage(input: SendMessageInput): Promise<void>;
 
@@ -72,6 +100,12 @@ export interface RakkoApi {
   /** 订阅某个会话的 Agent 事件 */
   onAgentEvent(sessionId: string, handler: (event: AgentEvent) => void): Unsubscribe;
 
+  /**
+   * 列出可用模型（只含展示信息）。
+   * 真正的 key 与上游地址只在主进程，不下发。
+   */
+  listModels(): Promise<ModelSummary[]>;
+
   /** 应用配置（目前只有产品名与版本，给窗口标题用） */
   getAppInfo(): Promise<{ name: string; version: string }>;
 }
@@ -82,10 +116,13 @@ export const IPC = {
   openProject: "rakko:open-project",
   listSessions: "rakko:list-sessions",
   createSession: "rakko:create-session",
+  startSession: "rakko:start-session",
+  stopSession: "rakko:stop-session",
   sendMessage: "rakko:send-message",
   abort: "rakko:abort",
   resolvePermission: "rakko:resolve-permission",
   setPermissionMode: "rakko:set-permission-mode",
   agentEvent: "rakko:agent-event",
   getAppInfo: "rakko:get-app-info",
+  listModels: "rakko:list-models",
 } as const;

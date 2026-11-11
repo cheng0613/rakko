@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import type { RakkoApi } from "@rakko/shared";
-import { LayoutHost } from "./layout/LayoutHost.js";
+import { ChatPage } from "./chat/ChatPage.js";
 
 declare global {
   interface Window {
@@ -11,10 +11,7 @@ declare global {
 /**
  * 应用外壳。
  *
- * P0 阶段只验证三件事：
- * 1. preload 桥通了（能拿到 appInfo）
- * 2. 布局树能渲染
- * 3. 重启后布局能恢复（下一步接持久化）
+ * P0 阶段只有对话页。首页/设置页等设计稿落地后在这里做路由。
  */
 export default function App() {
   const [appInfo, setAppInfo] = useState<{ name: string; version: string } | null>(null);
@@ -22,6 +19,10 @@ export default function App() {
 
   useEffect(() => {
     let cancelled = false;
+    if (!window.rakko) {
+      setError("preload 桥没接通：window.rakko 不存在");
+      return;
+    }
     window.rakko
       .getAppInfo()
       .then((info) => {
@@ -42,12 +43,9 @@ export default function App() {
         <p className="mono" style={{ marginTop: 8, color: "var(--ink2)" }}>
           {error}
         </p>
-        <p style={{ marginTop: 16, color: "var(--ink3)", fontSize: 13 }}>
-          preload 桥没接通，检查 contextIsolation 与 preload 路径。
-        </p>
       </div>
     );
   }
 
-  return <LayoutHost appInfo={appInfo} />;
+  return <ChatPage appInfo={appInfo} />;
 }

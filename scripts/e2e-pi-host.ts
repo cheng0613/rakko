@@ -94,6 +94,7 @@ async function main(): Promise<void> {
   // 5. 启动 PiHost
   const events: AgentEvent[] = [];
   const host = new PiHost({
+    nodePath: process.execPath,
     piEntry: pi.entry,
     sessionId: "e2e-session-001",
     agentHome,

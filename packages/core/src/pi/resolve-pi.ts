@@ -30,6 +30,24 @@ export interface ResolvedPiEntry {
   source: "env" | "volta" | "node-modules" | "direct";
 }
 
+/**
+ * 能跑 pi 的 node 可执行文件。
+ *
+ * ⚠️ 不能在 Electron 里用 process.execPath —— 那里它是 electron.exe，
+ * 直接跑 js 会报「App threw an error during load」。
+ * ELECTRON_RUN_AS_NODE=1 也不可靠：Electron 33 的 Node 版本较旧，
+ * 跑 pi 1.4.0 会在 enableCompileCache 上 SyntaxError。
+ *
+ * 必须解析出真正的 node 二进制（不是 shim）。
+ */
+export interface ResolvedNodeBinary {
+  path: string;
+  version: string;
+  source: "env" | "system";
+}
+
+const MIN_NODE_MAJOR = 22;
+
 export class PiNotFoundError extends Error {
   constructor(message: string, readonly tried: string[]) {
     super(message);
@@ -190,4 +208,76 @@ export async function resolvePiEntry(options: { forceRefresh?: boolean } = {}): 
 /** 测试用：清掉缓存 */
 export function resetPiEntryCache(): void {
   cached = null;
+  cachedNode = null;
+}
+
+/**
+ * 解析一个可用的 node 二进制。
+ *
+ * 优先级：
+ *   1. RAKKO_NODE_BINARY
+ *   2. PATH 上的 node（跳过 shim，要求能跑 --version 且主版本 >= 22）
+ *
+ * 在 Electron 里调用时，PATH 上的 node 会指向真的 node 而不是 electron。
+ */
+async function probeNodeBinary(candidate: string): Promise<ResolvedNodeBinary | null> {
+  try {
+    const { stdout } = await execFileAsync(candidate, ["--version"], {
+      timeout: 8000,
+      windowsHide: true,
+    });
+    const raw = stdout.trim().replace(/^v/, "");
+    const major = Number.parseInt(raw.split(".")[0] ?? "0", 10);
+    if (!Number.isFinite(major) || major < MIN_NODE_MAJOR) return null;
+    return { path: candidate, version: raw, source: "system" };
+  } catch {
+    return null;
+  }
+}
+
+let cachedNode: ResolvedNodeBinary | null = null;
+
+export async function resolveNodeBinary(options: { forceRefresh?: boolean } = {}): Promise<ResolvedNodeBinary> {
+  if (cachedNode && !options.forceRefresh) return cachedNode;
+
+  const tried: string[] = [];
+
+  const fromEnv = process.env["RAKKO_NODE_BINARY"];
+  if (fromEnv) {
+    tried.push(`env RAKKO_NODE_BINARY=${fromEnv}`);
+    const hit = await probeNodeBinary(fromEnv);
+    if (hit) {
+      cachedNode = { ...hit, source: "env" };
+      return cachedNode;
+    }
+  }
+
+  // 注意：在 Electron 主进程里，process.execPath 是 electron.exe，不能用。
+  // 这里显式排除，避免悄悄拿错。
+  const execPath = process.execPath;
+  const looksLikeElectron = /electron/i.test(execPath) && !/node\.exe$/i.test(execPath);
+
+  const candidates: string[] = [];
+  if (!looksLikeElectron) candidates.push(execPath);
+  if (process.platform === "win32") {
+    candidates.push("node.exe", "node");
+  } else {
+    candidates.push("node");
+  }
+
+  for (const c of candidates) {
+    tried.push(c);
+    const hit = await probeNodeBinary(c);
+    if (hit) {
+      cachedNode = hit;
+      return cachedNode;
+    }
+  }
+
+  throw new PiNotFoundError(
+    `找不到可用的 node（需要 >= ${MIN_NODE_MAJOR}）。` +
+      `在 Electron 里不能用 process.execPath（它是 electron.exe），` +
+      `请安装 node 或设置 RAKKO_NODE_BINARY。`,
+    tried,
+  );
 }

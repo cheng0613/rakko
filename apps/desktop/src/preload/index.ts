@@ -12,11 +12,14 @@ const api: RakkoApi = {
   openProject: (cwd) => ipcRenderer.invoke(IPC.openProject, cwd),
   listSessions: (projectId) => ipcRenderer.invoke(IPC.listSessions, projectId),
   createSession: (projectId) => ipcRenderer.invoke(IPC.createSession, projectId),
+  startSession: (input) => ipcRenderer.invoke(IPC.startSession, input),
+  stopSession: (sessionId) => ipcRenderer.invoke(IPC.stopSession, sessionId),
   sendMessage: (input) => ipcRenderer.invoke(IPC.sendMessage, input),
   abort: (sessionId) => ipcRenderer.invoke(IPC.abort, sessionId),
   resolvePermission: (input) => ipcRenderer.invoke(IPC.resolvePermission, input),
   setPermissionMode: (input) => ipcRenderer.invoke(IPC.setPermissionMode, input),
   getAppInfo: () => ipcRenderer.invoke(IPC.getAppInfo),
+  listModels: () => ipcRenderer.invoke(IPC.listModels),
 
   onAgentEvent: (sessionId: string, handler: (event: AgentEvent) => void): Unsubscribe => {
     const listener = (_e: unknown, payload: { sessionId: string; event: AgentEvent }) => {

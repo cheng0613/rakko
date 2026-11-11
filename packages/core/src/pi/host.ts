@@ -17,8 +17,11 @@ import type { AgentEvent } from "@rakko/shared";
 import { PiTranslator, type PiRawEvent } from "./translator.js";
 
 export interface PiHostOptions {
-  /** node 可执行路径，默认 process.execPath */
-  nodePath?: string;
+  /**
+   * node 可执行文件路径。**必填**，不要用 process.execPath：
+   * 在 Electron 里它是 electron.exe，跑 js 会直接失败。
+   */
+  nodePath: string;
   /** pi 的 cli.js 绝对路径 */
   piEntry: string;
   /** 会话 id */
@@ -96,7 +99,7 @@ export class PiHost {
       args,
     });
 
-    const proc = spawn(this.options.nodePath ?? process.execPath, args, {
+    const proc = spawn(this.options.nodePath, args, {
       cwd: this.options.cwd,
       env: this.options.env,
       stdio: ["pipe", "pipe", "pipe"],

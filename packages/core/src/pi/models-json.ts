@@ -192,6 +192,76 @@ export function buildModelsJson(options: BuildModelsJsonOptions): PiModelsJson {
 }
 
 /**
+ * 直连模式（P0 无 proxy）：baseUrl 写 provider 自己的上游，
+ * apiKey 仍写 `$RAKKO_PI_API_KEY`，真 key 由 spawn env 提供。
+ *
+ * 注意：这与 proxy 模式的差别只在 baseUrl，四字段校验等完全一致。
+ */
+export async function writeModelsJsonDirect(
+  agentHome: string,
+  providers: ProviderConfig[],
+  apiKeyEnvVar = "RAKKO_PI_API_KEY",
+): Promise<string> {
+  const problems: string[] = [];
+  if (providers.length === 0) problems.push("providers: 至少配置一个供应商");
+
+  for (const p of providers) {
+    if (!p.baseUrl) problems.push(`providers.${p.id}.baseUrl: 直连模式下不能为空`);
+    if (p.models.length === 0) problems.push(`providers.${p.id}.models: 至少要有一个模型`);
+    for (const m of p.models) {
+      validateCost(p.id, m, problems);
+      if (!(m.contextWindow > 0)) problems.push(`providers.${p.id}.models.${m.id}.contextWindow 必须大于 0`);
+      if (!(m.maxOutput > 0)) problems.push(`providers.${p.id}.models.${m.id}.maxOutput 必须大于 0`);
+    }
+  }
+
+  if (problems.length > 0) {
+    throw new ModelsJsonError(
+      `models.json 校验未通过（${problems.length} 处问题）`,
+      problems,
+    );
+  }
+
+  const result: PiModelsJson = { providers: {} };
+  for (const p of providers) {
+    result.providers[p.id] = {
+      api: p.api,
+      baseUrl: p.baseUrl,
+      apiKey: `$${apiKeyEnvVar}`,
+      models: p.models.map((m) => ({
+        id: m.id,
+        name: m.name,
+        contextWindow: m.contextWindow,
+        maxOutput: m.maxOutput,
+        supportsTools: m.capabilities.supportsTools,
+        supportsImage: m.capabilities.supportsImage,
+        supportsThinking: m.capabilities.supportsThinking,
+        ...(m.capabilities.thinkingLevels ? { thinkingLevels: m.capabilities.thinkingLevels } : {}),
+        cost: {
+          input: m.cost.input,
+          output: m.cost.output,
+          cacheRead: m.cost.cacheRead,
+          cacheWrite: m.cost.cacheWrite,
+        },
+      })),
+    };
+  }
+
+  const target = path.join(agentHome, "models.json");
+  const tmp = `${target}.${process.pid}.tmp`;
+  await fs.mkdir(agentHome, { recursive: true });
+  const text = `${JSON.stringify(result, null, 2)}\n`;
+  await fs.writeFile(tmp, text, "utf8");
+  const readBack = await fs.readFile(tmp, "utf8");
+  if (readBack !== text) {
+    await fs.rm(tmp, { force: true });
+    throw new ModelsJsonError("models.json 写入后回读不一致", []);
+  }
+  await fs.rename(tmp, target);
+  return target;
+}
+
+/**
  * 原子写入 models.json。
  *
  * 先写临时文件再 rename —— pi 可能同时在读这个文件，

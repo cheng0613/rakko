@@ -1,15 +1,17 @@
 /**
  * Electron 主进程入口。
  *
- * 只做装配：窗口、IPC 路由、宿主能力注入。
+ * 只做装配：窗口、IPC 路由、会话管理器、宿主能力注入。
  * 业务逻辑不写在这里 —— 见 packages/core。
  */
 import { app, BrowserWindow, ipcMain, nativeTheme } from "electron";
 import path from "node:path";
 import { PRODUCT_NAME } from "@rakko/shared";
 import { registerIpc } from "./ipc/register.js";
+import { SessionManager } from "./session/manager.js";
 
 let mainWindow: BrowserWindow | null = null;
+let sessions: SessionManager | null = null;
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({
@@ -23,14 +25,12 @@ function createWindow(): void {
     titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "default",
     webPreferences: {
       preload: path.join(__dirname, "../preload/index.mjs"),
-      // 安全默认值：渲染进程不能直接碰 Node 或 electron
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
     },
   });
 
-  // 首帧画完再显示，避免白屏闪烁
   mainWindow.once("ready-to-show", () => {
     mainWindow?.show();
   });
@@ -47,7 +47,8 @@ function createWindow(): void {
 }
 
 void app.whenReady().then(() => {
-  registerIpc(ipcMain);
+  sessions = new SessionManager({ getWindow: () => mainWindow });
+  registerIpc(ipcMain, sessions);
 
   createWindow();
 
@@ -58,4 +59,13 @@ void app.whenReady().then(() => {
 
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
+});
+
+// 退出前把子进程收干净，避免孤儿 pi 进程
+app.on("before-quit", (event) => {
+  if (!sessions) return;
+  event.preventDefault();
+  const s = sessions;
+  sessions = null;
+  void s.stopAll().finally(() => app.exit(0));
 });

@@ -2,35 +2,41 @@
  * IPC 路由。
  *
  * 每个 handler 都做参数校验 —— 渲染进程传来的东西一律不可信。
- * 这一层只做转发与校验，真正的业务在 packages/core。
+ * 这一层只做转发与校验，业务在 packages/core。
  */
 import type { IpcMain } from "electron";
 import { app } from "electron";
 import { IPC, PRODUCT_NAME } from "@rakko/shared";
 import type {
+  PermissionResolveInput,
   ProjectInfo,
   SendMessageInput,
   SessionInfo,
   SetPermissionModeInput,
-  PermissionResolveInput,
+  StartSessionInput,
 } from "@rakko/shared";
+import type { SessionManager } from "../session/manager.js";
+import { readBootstrapProviders, toModelSummaries } from "../bootstrap-config.js";
 
-export function registerIpc(ipcMain: IpcMain): void {
+export function registerIpc(ipcMain: IpcMain, sessions: SessionManager): void {
   ipcMain.handle(IPC.getAppInfo, () => ({
     name: PRODUCT_NAME,
     version: app.getVersion(),
   }));
 
-  ipcMain.handle(IPC.listProjects, async (): Promise<ProjectInfo[]> => {
-    // P0 阶段：还没有项目持久化。先返回空列表，让 UI 能跑起来。
-    return [];
+  // 只返回展示信息，key 与 baseUrl 不出主进程
+  ipcMain.handle(IPC.listModels, () => {
+    const { providers } = readBootstrapProviders();
+    return toModelSummaries(providers);
   });
+
+  // ── 项目与会话（P0 先返回空，持久化在后续步骤）──
+  ipcMain.handle(IPC.listProjects, async (): Promise<ProjectInfo[]> => []);
 
   ipcMain.handle(IPC.openProject, async (_e, cwd: unknown): Promise<ProjectInfo> => {
     if (typeof cwd !== "string" || cwd.length === 0) {
       throw new Error("openProject: cwd 必须是非空字符串");
     }
-    // 未实现：见 PLAN P0 后续步骤
     throw new Error("openProject 尚未实现（P0 步骤 10）");
   });
 
@@ -41,35 +47,70 @@ export function registerIpc(ipcMain: IpcMain): void {
 
   ipcMain.handle(IPC.createSession, async (_e, projectId: unknown): Promise<SessionInfo> => {
     if (typeof projectId !== "string") throw new Error("createSession: projectId 必须是字符串");
-    throw new Error("createSession 尚未实现（P0 步骤 6）");
+    throw new Error("createSession 尚未实现（P0 步骤 10）");
+  });
+
+  // ── 会话运行时 ──
+  ipcMain.handle(IPC.startSession, async (_e, input: unknown) => {
+    const parsed = input as StartSessionInput;
+    assertShape(parsed, ["sessionId", "cwd", "promptSections", "tools"], "startSession");
+    if (typeof parsed.sessionId !== "string" || parsed.sessionId.length === 0) {
+      throw new Error("startSession: sessionId 必须是非空字符串");
+    }
+    if (typeof parsed.cwd !== "string" || parsed.cwd.length === 0) {
+      throw new Error("startSession: cwd 必须是非空字符串");
+    }
+
+    // provider 与 key 由主进程从环境变量读，不信任渲染进程传入
+    const boot = readBootstrapProviders();
+    if (boot.providers.length === 0) {
+      throw new Error(`缺少模型配置：${boot.missing.join(" / ")} 未设置`);
+    }
+
+    return sessions.start({
+      sessionId: parsed.sessionId,
+      cwd: parsed.cwd,
+      providers: boot.providers,
+      apiKey: boot.apiKey,
+      promptSections: Array.isArray(parsed.promptSections) ? parsed.promptSections : [],
+      tools: parsed.tools ?? "all",
+    });
+  });
+
+  ipcMain.handle(IPC.stopSession, async (_e, sessionId: unknown): Promise<void> => {
+    if (typeof sessionId !== "string") throw new Error("stopSession: sessionId 必须是字符串");
+    await sessions.stop(sessionId);
   });
 
   ipcMain.handle(IPC.sendMessage, async (_e, input: unknown): Promise<void> => {
-    assertShape(input, ["sessionId", "text"], "sendMessage");
-    throw new Error("sendMessage 尚未实现（P0 步骤 6）");
+    const parsed = input as SendMessageInput;
+    assertShape(parsed, ["sessionId", "text"], "sendMessage");
+    if (typeof parsed.sessionId !== "string" || typeof parsed.text !== "string") {
+      throw new Error("sendMessage: sessionId 与 text 必须是字符串");
+    }
+    await sessions.send(parsed.sessionId, parsed.text);
   });
 
   ipcMain.handle(IPC.abort, async (_e, sessionId: unknown): Promise<void> => {
     if (typeof sessionId !== "string") throw new Error("abort: sessionId 必须是字符串");
-    throw new Error("abort 尚未实现（P0 步骤 6）");
+    await sessions.abort(sessionId);
   });
 
   ipcMain.handle(IPC.resolvePermission, async (_e, input: unknown): Promise<void> => {
-    assertShape(input, ["sessionId", "callId", "decision"], "resolvePermission");
+    const parsed = input as PermissionResolveInput;
+    assertShape(parsed, ["sessionId", "callId", "decision"], "resolvePermission");
     throw new Error("resolvePermission 尚未实现（P0 步骤 11）");
   });
 
   ipcMain.handle(IPC.setPermissionMode, async (_e, input: unknown): Promise<void> => {
-    assertShape(input, ["sessionId", "mode"], "setPermissionMode");
+    const parsed = input as SetPermissionModeInput;
+    assertShape(parsed, ["sessionId", "mode"], "setPermissionMode");
     throw new Error("setPermissionMode 尚未实现（P0 步骤 11）");
   });
 }
 
 /**
- * 最小形状校验。
- *
- * 不是完整的 schema 校验 —— P0 先拦住「字段缺失 / 类型完全错」这类明显问题。
- * 等接入 zod 再统一。
+ * 最小形状校验。拦住「字段缺失 / 类型完全错」这类明显问题。
  */
 function assertShape(input: unknown, required: string[], where: string): void {
   if (typeof input !== "object" || input === null) {
@@ -81,10 +122,3 @@ function assertShape(input: unknown, required: string[], where: string): void {
     }
   }
 }
-
-// 保留类型引用，避免 TS 报未使用
-export type _IpcTypes = [
-  SendMessageInput,
-  SetPermissionModeInput,
-  PermissionResolveInput,
-];
