@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useState } from "react";
 import type { PermissionMode, RakkoApi } from "@rakko/shared";
 import { PERMISSION_MODES, PERMISSION_MODE_LABEL } from "@rakko/shared";
-import { ChatPage } from "./chat/ChatPage.js";
 import { HomePage } from "./home/HomePage.js";
 import { useHomeData } from "./home/use-home-data.js";
 import { Dock, type DockRoute } from "./layout/Dock.js";
+import { LayoutHost } from "./layout/LayoutHost.js";
+import { panelRuntime, registerBuiltinPanels } from "./layout/builtin-panels.js";
 
 declare global {
   interface Window {
@@ -12,26 +13,39 @@ declare global {
   }
 }
 
-type Route = DockRoute;
+// 模块加载时注册一次，之后 render 只更新 panelRuntime
+registerBuiltinPanels();
 
 /**
- * 应用外壳 + 极简路由。
+ * 应用外壳。
  *
- * P0 只有两个页面：首页与对话。dock 上其它入口（自动化/搜索/子代理/插件）
- * 还没有对应的设计稿与实现，这里不放假按钮 —— 等做了再加。
+ * 两套承载方式：
+ *   - 首页：普通路由切换（它不需要分割/多面板）
+ *   - 对话：走布局树（支持将来的分割、多面板、持久化）
+ *
+ * 布局树是用户级全局的，所以它只承载「工作区」这一侧。
  */
 export default function App() {
   const [appInfo, setAppInfo] = useState<{ name: string; version: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [route, setRoute] = useState<Route>("home");
+  const [route, setRoute] = useState<DockRoute>("home");
   const [mode, setMode] = useState<PermissionMode>("ask");
-  /** 从首页带进对话的初始文本 */
-  const [pendingPrompt, setPendingPrompt] = useState<string | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [sessionError, setSessionError] = useState<string | null>(null);
-  // 每次切到首页都重新读一次 —— 否则新建的会话不会出现
+  const [pendingPrompt, setPendingPrompt] = useState<string | null>(null);
+
   const [homeRefreshKey, setHomeRefreshKey] = useState(0);
   const home = useHomeData(homeRefreshKey);
+
+  // 把最新参数交给面板注册表 —— 注册只做一次，render 读这里
+  panelRuntime.current = {
+    sessionId,
+    appInfo,
+    mode,
+    onModeChange: setMode,
+    initialPrompt: pendingPrompt,
+    onConsumeInitialPrompt: () => setPendingPrompt(null),
+  };
 
   useEffect(() => {
     if (!window.rakko) {
@@ -59,12 +73,6 @@ export default function App() {
     });
   }, []);
 
-  /**
-   * 确保有一个真实会话。
-   *
-   * 流程：打开（或复用）项目 → 建会话 → 拿到 id。
-   * P0 阶段固定用当前工作目录作为项目。
-   */
   const ensureSession = useCallback(async (): Promise<string | null> => {
     try {
       const project = await window.rakko.openProject(".");
@@ -78,24 +86,19 @@ export default function App() {
     }
   }, []);
 
-  const startFromHome = useCallback(
-    (prompt: string) => {
-      // 新任务：清掉旧会话 id，让 ensureSession 建一个新的
-      setSessionId(null);
-      setPendingPrompt(prompt);
-      setRoute("chat");
-    },
-    [],
-  );
+  const startFromHome = useCallback((prompt: string) => {
+    setSessionId(null);
+    setPendingPrompt(prompt);
+    setRoute("chat");
+  }, []);
 
-  /** 打开一条历史会话 */
   const openSession = useCallback((id: string) => {
     setSessionId(id);
     setPendingPrompt(null);
     setRoute("chat");
   }, []);
 
-  // 进对话页但没有会话时自动创建（覆盖 dock 切换、直接跳转等所有入口）
+  // 进对话页但没有会话时自动创建
   useEffect(() => {
     if (route === "chat" && !sessionId && !sessionError) {
       void ensureSession();
@@ -120,8 +123,6 @@ export default function App() {
         onNavigate={(next) => {
           setRoute(next);
           if (next === "home") setHomeRefreshKey((k) => k + 1);
-          // 进对话页时没会话就建一个，否则会卡在「正在创建会话」
-          if (next === "chat" && !sessionId && !sessionError) void ensureSession();
         }}
       />
 
@@ -139,24 +140,13 @@ export default function App() {
             permissionLabel={PERMISSION_MODE_LABEL[mode]}
             onCyclePermission={cycleMode}
           />
-        ) : sessionId ? (
-          <ChatPage
-            key={sessionId}
-            sessionId={sessionId}
-            appInfo={appInfo}
-            initialMode={mode}
-            onModeChange={setMode}
-            initialPrompt={pendingPrompt}
-            onConsumeInitialPrompt={() => setPendingPrompt(null)}
-          />
-        ) : (
-          <div style={{ padding: 32, color: "var(--ink3)" }}>
-            {sessionError ? (
-              <span style={{ color: "var(--warn)" }}>创建会话失败：{sessionError}</span>
-            ) : (
-              "正在创建会话…"
-            )}
+        ) : sessionError ? (
+          <div style={{ padding: 32, color: "var(--warn)" }}>
+            创建会话失败：{sessionError}
           </div>
+        ) : (
+          /* 对话页走布局树：支持分割与持久化 */
+          <LayoutHost />
         )}
       </div>
     </div>

@@ -1,98 +1,69 @@
-import { useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { LayoutNode } from "./layout-tree.js";
-import { createDefaultLayout, countKind, CHAT_PANE_KIND } from "./layout-tree.js";
+import { CHAT_PANE_KIND, countKind, validateTree } from "./layout-tree.js";
 import { LayoutPane } from "./LayoutPane.js";
-
-interface Props {
-  appInfo: { name: string; version: string } | null;
-}
+import { loadLayout, saveLayout } from "./persistence.js";
+import { getPanel } from "./panel-registry.js";
 
 /**
- * 布局宿主：把布局树渲染成界面。
+ * 布局宿主。
  *
- * 现在是单 pane（只有 chat-main）。P0 后续步骤会：
- * - 接上 split 的递归渲染与拖拽分割
- * - 接上持久化（重启保持）
- * - 接上面板注册表（未注册的 panelKind 保留位置但不渲染）
+ * 职责：
+ *   1. 首帧就渲染保存的布局（不先画默认再跳变）
+ *   2. 布局变化时存盘
+ *   3. 存盘读不出来时回落默认，不阻塞启动
+ *
+ * 现在只有一个 pane（chat-main），但结构已经支持 split：
+ * 加面板只要 insertBeside，不需要改这里。
  */
-export function LayoutHost({ appInfo }: Props) {
-  const [layout] = useState<LayoutNode>(() => createDefaultLayout());
+export function LayoutHost() {
+  // 首帧就用保存的布局 —— 避免先画默认再跳变
+  const [layout, setLayout] = useState<LayoutNode>(() => loadLayout().layout);
+  const [activePaneId, setActivePaneId] = useState<string | null>(null);
+  const [saveWarned, setSaveWarned] = useState(false);
+
+  // 布局**变化**时存盘。
+  // 用 ref 跳过首次挂载 —— 否则每次打开对话页都把刚读出来的布局再写一遍，
+  // 既无意义，也会掩盖「存盘被外部改动」的情况。
+  const mountedRef = useRef(false);
+  useEffect(() => {
+    if (!mountedRef.current) {
+      mountedRef.current = true;
+      return;
+    }
+    const ok = saveLayout(layout);
+    if (!ok && !saveWarned) {
+      setSaveWarned(true);
+      console.warn("[layout] 布局无法保存，本次会话内的调整重启后会丢失");
+    }
+  }, [layout, saveWarned]);
+
+  /** 统一入口：改布局前先校验，非法就拒绝（避免产生坏状态） */
+  const updateLayout = useCallback((next: LayoutNode) => {
+    try {
+      validateTree(next);
+      setLayout(next);
+    } catch (e) {
+      console.error("[layout] 拒绝非法布局变换：", (e as Error).message);
+    }
+  }, []);
 
   const chatCount = countKind(layout, CHAT_PANE_KIND);
 
   return (
-    <div
-      style={{
-        display: "flex",
-        flexDirection: "column",
-        height: "100%",
-        background: "var(--canvas)",
-      }}
-    >
-      {/* 顶部标题栏 */}
-      <header
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 12,
-          padding: "10px 16px",
-          borderBottom: "1px solid var(--line)",
-          background: "var(--card)",
-          flex: "none",
-        }}
-      >
-        <span
-          aria-hidden
-          style={{
-            width: 22,
-            height: 22,
-            borderRadius: 6,
-            background: "var(--acid)",
-            border: "1px solid var(--acid-line)",
-            display: "grid",
-            placeItems: "center",
-            fontSize: 13,
-            fontWeight: 700,
-          }}
-        >
-          π
-        </span>
-        <strong style={{ fontSize: 14 }}>{appInfo?.name ?? "Rakko"}</strong>
-        <span style={{ color: "var(--ink3)", fontSize: 12 }}>
-          {appInfo ? `v${appInfo.version}` : "连接中…"}
-        </span>
-        <span style={{ flex: 1 }} />
-        <span
-          className="mono"
-          style={{ color: "var(--ink3)", fontSize: 11 }}
-          title="布局树状态"
-        >
-          panes: {countKind(layout, CHAT_PANE_KIND)} chat
-        </span>
-      </header>
-
-      {/* 布局区 */}
-      <main style={{ flex: 1, minHeight: 0, display: "flex" }}>
-        <LayoutPane node={layout} />
+    <div className="layout-host">
+      <main className="layout-main">
+        <LayoutPane node={layout} activePaneId={activePaneId} onActivate={setActivePaneId} />
       </main>
-
-      {/* 底部状态栏 */}
-      <footer
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 16,
-          padding: "6px 16px",
-          borderTop: "1px solid var(--line)",
-          background: "var(--card2)",
-          color: "var(--ink3)",
-          fontSize: 11,
-          flex: "none",
-        }}
-      >
-        <span>chat-main: {chatCount === 1 ? "✓ 恰好一个" : `✗ ${chatCount} 个`}</span>
-        <span>P0 骨架 · 布局树已就绪</span>
-      </footer>
     </div>
   );
+}
+
+/** 供调试：把当前布局打印出来 */
+export function describeLayout(node: LayoutNode): string {
+  if (node.type === "pane") {
+    const p = getPanel(node.panelKind);
+    return p ? `${node.panelKind}(${node.id})` : `${node.panelKind}?(${node.id})`;
+  }
+  return `${node.direction}[${describeLayout(node.first)} | ${describeLayout(node.second)}]`;
 }
