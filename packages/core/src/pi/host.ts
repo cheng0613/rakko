@@ -316,7 +316,13 @@ export class PiHost {
 
     // payload 在 placeholder（实测），兼容 body 以防版本差异
     const rawPayload = (msg["placeholder"] ?? msg["body"]) as unknown;
-    let payload: { toolName?: unknown; input?: unknown; risk?: unknown; controlPlane?: unknown } = {};
+    let payload: {
+      toolName?: unknown;
+      input?: unknown;
+      risk?: unknown;
+      controlPlane?: unknown;
+      credential?: unknown;
+    } = {};
     if (typeof rawPayload === "string") {
       try {
         payload = JSON.parse(rawPayload) as typeof payload;
@@ -335,6 +341,7 @@ export class PiHost {
       risk: normalizeRisk(payload.risk ?? classifyToolRisk(toolName)),
       summary: summarizePermission(toolName, payload.input),
       controlPlane: payload.controlPlane === true,
+      credential: payload.credential === true,
     };
 
     if (!this.options.onPermissionRequest) {

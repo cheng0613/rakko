@@ -558,3 +558,12 @@
   border-style: dashed;
   color: var(--ink3);
 }
+
+/* 凭证路径标记 */
+.perm-cred {
+  font-size: 10.5px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: #e03131;
+  color: #fff;
+}

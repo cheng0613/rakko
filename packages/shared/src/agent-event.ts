@@ -31,6 +31,11 @@ export interface PermissionRequest {
    * 就能把后续请求劫持到别的 endpoint。
    */
   controlPlane: boolean;
+  /**
+   * 是否触碰凭证路径（.ssh / .env / .aws 等）。
+   * 只读工具碰到这类路径也会升级为审批 —— 防止 agent 静默读 key。
+   */
+  credential?: boolean;
 }
 
 export type PermissionDecision = "allow-once" | "allow-type" | "deny";

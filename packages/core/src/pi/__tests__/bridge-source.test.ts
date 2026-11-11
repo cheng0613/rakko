@@ -107,3 +107,82 @@ describe("路径转义", () => {
     expect(parsesAsScript(weird)).toBe(true);
   });
 });
+
+describe("凭证路径检测（防止静默读 key）", () => {
+  /**
+   * 直接验证【生成的源码】里的逻辑，不是验证我们自己的实现。
+   *
+   * 这段代码要经过「模板字符串 → 生成源码 → 运行时」三层，
+   * 之前就在这里翻过车：`\b` 被吃成退格符、`\` 变成 `\`。
+   * 所以必须测生成后的产物。
+   */
+  function loadDetector(): (input: unknown) => boolean {
+    const src = buildBridgeSource({ permissionFile: "/tmp/p.json", agentHome: "/tmp/ah" });
+    const start = src.indexOf("const CREDENTIAL_MARKERS");
+    const fnStart = src.indexOf("function touchesCredentialPath", start);
+    let depth = 0;
+    let fnEnd = -1;
+    for (let i = src.indexOf("{", fnStart); i < src.length; i++) {
+      if (src[i] === "{") depth++;
+      else if (src[i] === "}") {
+        depth--;
+        if (depth === 0) {
+          fnEnd = i + 1;
+          break;
+        }
+      }
+    }
+    const code = `${src.slice(start, fnEnd)}\nreturn touchesCredentialPath;`;
+    // eslint-disable-next-line no-new-func
+    return new Function(code)() as (input: unknown) => boolean;
+  }
+
+  const detect = loadDetector();
+
+  it.each([
+    ["/home/u/.ssh/id_rsa", true],
+    ["/home/u/.aws/credentials", true],
+    ["/home/u/.gnupg/private-keys-v1.d/x.key", true],
+    ["/home/u/.kube/config", true],
+    ["/home/u/.docker/config.json", true],
+    ["/home/u/.npmrc", true],
+    ["/home/u/.netrc", true],
+    ["/home/u/.git-credentials", true],
+    ["/home/u/.pi/auth.json", true],
+    ["/app/.env", true],
+    ["/app/.env.local", true],
+    ["/repo/.m2/settings.xml", true],
+    ["/repo/.config/gh/hosts.yml", true],
+    ["/home/u/project/notes.txt", false],
+    ["/home/u/projects/my-ssh-tool/x.ts", false],
+    ["src/index.ts", false],
+  ])("%s → %s", (pathStr, expected) => {
+    expect(detect({ path: pathStr })).toBe(expected);
+  });
+
+  it("bash 的 command 字段也能检测到", () => {
+    expect(detect({ command: "cat ~/.ssh/id_rsa" })).toBe(true);
+    expect(detect({ command: "cat /proc/1234/environ" })).toBe(true);
+    expect(detect({ command: "ls -la" })).toBe(false);
+  });
+
+  it("grep 的 pattern 字段也能检测到", () => {
+    expect(detect({ pattern: "key", path: "/home/u/.ssh" })).toBe(true);
+  });
+
+  it("任意字符串字段都会被扫描（不只 path）", () => {
+    expect(detect({ content: '读取 "/home/u/.env" 里的值' })).toBe(true);
+  });
+
+  it("Windows 反斜杠路径也能命中", () => {
+    expect(detect({ path: "C:\\Users\\u\\.ssh\\id_rsa" })).toBe(true);
+    expect(detect({ path: "C:\\Users\\u\\.env" })).toBe(true);
+  });
+
+  it("null / undefined / 空对象不报错也不命中", () => {
+    expect(detect(null)).toBe(false);
+    expect(detect(undefined)).toBe(false);
+    expect(detect({})).toBe(false);
+    expect(detect("")).toBe(false);
+  });
+});

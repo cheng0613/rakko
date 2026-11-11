@@ -39,6 +39,7 @@ export function PermissionCard({ request, pending, onDecide }: Props) {
         <span className="perm-title">需要你的确认</span>
         <span className={`perm-risk ${request.risk}`}>{RISK_LABEL[request.risk] ?? request.risk}</span>
         {request.controlPlane && <span className="perm-cp">应用配置</span>}
+        {request.credential && <span className="perm-cred">凭证路径</span>}
       </div>
 
       <div className="perm-tool">
@@ -51,6 +52,13 @@ export function PermissionCard({ request, pending, onDecide }: Props) {
         <p className="perm-note">
           这次写入会改到 Rakko 自己的配置目录。模型若能改这里，就能把请求转发到别处，
           所以即使在完全访问档也要确认。
+        </p>
+      )}
+
+      {request.credential && (
+        <p className="perm-note">
+          这次调用碰到了凭证类路径（如 .ssh / .env / .aws）。即使是只读操作也要确认 ——
+          防止 Agent 在你不注意的时候读到 key、私钥或 token。
         </p>
       )}
 

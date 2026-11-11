@@ -77,6 +77,101 @@ const SHELL = new Set(["bash", "shell", "powershell", "exec", "run"]);
 const SILENT = new Set(["ask_user_question"]);
 
 /**
+ * 凭证路径片段。**命中即升级为审批**，即使是只读工具。
+ *
+ * 为什么需要：read/grep 这类只读工具在 ask 档下是无条件放行的。
+ * 没有这道门，agent 可以静默 cat ~/.ssh/id_rsa 或读 .env 里的 key。
+ *
+ * 规则只做「文本出现即命中」的粗判：
+ *   - 不解析 shell 语法，不追求覆盖所有绕过方式
+ *   - 保守方向是「多问一次」，不是「误杀」—— 宁可打扰也不要静默泄漏
+ *
+ * 这不是安全边界（真正的隔离需要 OS 级手段），是「不静默」的护栏。
+ * 与 Full Access 的契约一致：那一档用户已明确接受 Agent 能读凭证。
+ */
+/**
+ * 凭证路径片段（纯字符串包含判断，不用正则）。
+ *
+ * 为什么不用正则：这段代码写在一个模板字符串里，
+ * 反斜杠要经过「模板 → 生成源码 → 运行时字符串 → 正则」四层，
+ * 极容易少写一层，导致本该是词边界符的东西变成其他字符。首次实现就踩了这个坑。
+ *
+ * 纯 includes 判断足够：凭据路径的特征是特定目录名/文件名，
+ * 不需要词边界与量词。代价是可能多报（比如 my-ssh-tool），
+ * 但方向是「多问一次」，可接受。
+ */
+const CREDENTIAL_MARKERS = [
+  "/.ssh/",
+  "/.gnupg/",
+  "/.aws/",
+  "/.kube/",
+  "/.docker/config.json",
+  "/.npmrc",
+  "/.pypirc",
+  "/.netrc",
+  "/.git-credentials",
+  "/.gitconfig",
+  "/.env",
+  "id_rsa",
+  "id_ed25519",
+  "id_ecdsa",
+  "/credentials.json",
+  "/credentials.yml",
+  "/credentials.yaml",
+  "/secrets.json",
+  "/secrets.yml",
+  "/secrets.yaml",
+  "/.pi/auth.json",
+  "/auth.json",
+  "keychain",
+  "/.m2/settings.xml",
+  "/.config/gh/hosts.yml",
+  "/environment",
+];
+
+
+/**
+ * 判断一次工具调用是否触碰凭证路径。
+ *
+ * 扫描 input 里**所有字符串字段**（不只是 path）——
+ * bash 的 command、write 的 content、grep 的 pattern 都可能含路径。
+ */
+function touchesCredentialPath(input) {
+  if (input === null || input === undefined) return false;
+  var text;
+  try {
+    text = typeof input === "string" ? input : JSON.stringify(input);
+  } catch (e) {
+    return false;
+  }
+  if (!text) return false;
+
+  // Windows 反斜杠统一成正斜杠。用 charCode 构造，避免模板字符串的多层转义。
+  var BACKSLASH = String.fromCharCode(92);
+  var normalized = text.split(BACKSLASH).join("/");
+
+  for (var i = 0; i < CREDENTIAL_MARKERS.length; i++) {
+    if (normalized.indexOf(CREDENTIAL_MARKERS[i]) !== -1) return true;
+  }
+
+  // /proc/<pid>/environ 这类：两个片段同时出现才算
+  if (normalized.indexOf("/proc/") !== -1 && normalized.indexOf("/environ") !== -1) return true;
+
+  // 目录本身（如 /home/u/.ssh 末尾没斜杠）也算命中
+  var DIR_MARKERS = ["/.ssh", "/.gnupg", "/.aws", "/.kube", "/.pi"];
+  for (var k = 0; k < DIR_MARKERS.length; k++) {
+    var idx = normalized.indexOf(DIR_MARKERS[k]);
+    if (idx !== -1) {
+      var after = normalized.charAt(idx + DIR_MARKERS[k].length);
+      var code = after === "" ? 0 : after.charCodeAt(0);
+      // 0=结尾 47=斜杠 32=空格 34=双引号 39=单引号
+      if (code === 0 || code === 47 || code === 32 || code === 34 || code === 39) return true;
+    }
+  }
+  return false;
+}
+
+/**
  * 读当前权限档。**每次 tool_call 都重新读** —— 热切换靠这个。
  * 任何异常一律回落 ask，绝不宽松回落。
  */
@@ -113,7 +208,9 @@ function isControlPlaneWrite(toolName, input) {
   }
 }
 
-function riskOf(toolName) {
+function riskOf(toolName, credential) {
+  // 碰凭证一律 high，不管工具本身多"只读"
+  if (credential) return "high";
   if (READONLY.has(toolName)) return "low";
   if (WRITE.has(toolName) || SHELL.has(toolName)) return "high";
   return "high";
@@ -129,12 +226,15 @@ export default function (pi) {
     if (SILENT.has(toolName)) return;
 
     const controlPlane = isControlPlaneWrite(toolName, input);
+    // 碰凭证路径：只读也要问（Full Access 除外 —— 那一档用户已明确接受）
+    const credential = touchesCredentialPath(input);
 
     // 完全访问：控制面以外全部放行
+    // 凭证读不单独拦：该档与原生 pi 对齐，用户已接受「token 可能被读到」
     if (mode === "bypassPermissions" && !controlPlane) return;
 
-    // 只读工具放行（控制面写入不会是只读工具，这里已排除）
-    if (READONLY.has(toolName) && !controlPlane) return;
+    // 只读工具放行 —— 但碰凭证时要升级为审批
+    if (READONLY.has(toolName) && !controlPlane && !credential) return;
 
     // auto 档：P0 与 ask 相同（写与命令都问）。
     // 真正的自动分类需要独立的分类器，属于 P1。
@@ -153,8 +253,9 @@ export default function (pi) {
       decision = await ctx.ui.input(TITLE, JSON.stringify({
         toolName,
         input,
-        risk: riskOf(toolName),
+        risk: riskOf(toolName, credential),
         controlPlane,
+        credential,
         mode,
       }));
     } catch (err) {
