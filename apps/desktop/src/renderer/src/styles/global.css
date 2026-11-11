@@ -1,0 +1,71 @@
+/**
+ * 设计 token。
+ *
+ * 沿用 OpenDesign 稿件里的变量名，等接入对话页设计稿时直接对齐，
+ * 不在组件里写裸十六进制（AGENTS.md 硬约束）。
+ */
+:root {
+  --canvas: #e9e9e6;
+  --card: #fdfdfb;
+  --card2: #f1f1ed;
+  --line: #e2e2dc;
+  --line2: #d2d2ca;
+  --ink: #17181a;
+  --ink2: #5f6165;
+  --ink3: #9a9c9f;
+  --acid: #ecf24d;
+  --acid-line: #cdd43c;
+  --warn: #e8590c;
+  --radius: 10px;
+  --shadow-sm: 0 1px 3px rgba(23, 24, 26, 0.06);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --canvas: #141413;
+    --card: #1d1d1b;
+    --card2: #252523;
+    --line: #2d2d2a;
+    --line2: #3b3b37;
+    --ink: #f0f0ea;
+    --ink2: #a8aaa6;
+    --ink3: #74766f;
+    --acid: #e4ec3f;
+    --acid-line: #b9c030;
+    --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.4);
+  }
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  font-family:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  background: var(--canvas);
+  color: var(--ink);
+  font-size: 14px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+
+.mono {
+  font-family: ui-monospace, "Cascadia Code", Consolas, Menlo, monospace;
+}
