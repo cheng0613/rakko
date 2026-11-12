@@ -5,6 +5,7 @@ import { HomePage } from "./home/HomePage.js";
 import { useHomeData } from "./home/use-home-data.js";
 import { Dock, type DockRoute } from "./layout/Dock.js";
 import { LayoutHost } from "./layout/LayoutHost.js";
+import { SettingsPage } from "./settings/SettingsPage.js";
 import { panelRuntime, registerBuiltinPanels } from "./layout/builtin-panels.js";
 
 declare global {
@@ -127,7 +128,9 @@ export default function App() {
       />
 
       <div className="app-main">
-        {route === "home" ? (
+        {route === "settings" ? (
+          <SettingsPage onBack={() => setRoute("home")} />
+        ) : route === "home" ? (
           <HomePage
             appInfo={appInfo}
             sessions={home.sessions}

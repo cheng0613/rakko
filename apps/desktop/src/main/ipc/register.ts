@@ -31,10 +31,14 @@ export function registerIpc(
     version: app.getVersion(),
   }));
 
-  // 只返回展示信息，key 与 baseUrl 不出主进程
-  ipcMain.handle(IPC.listModels, () => {
-    const { providers } = readBootstrapProviders();
-    return toModelSummaries(providers);
+  // 只返回展示信息，key 与 baseUrl 不出主进程。
+  //
+  // 优先用设置页保存的 provider；一个都没有才回落到环境变量
+  // （保留给 e2e 脚本和无 UI 的冒烟测试用）。
+  ipcMain.handle(IPC.listModels, async () => {
+    const saved = await providers.resolveForSession();
+    if (saved.providers.length > 0) return toModelSummaries(saved.providers);
+    return toModelSummaries(readBootstrapProviders().providers);
   });
 
   // ── 运营商配置 ──
@@ -136,17 +140,33 @@ export function registerIpc(
       throw new Error("startSession: cwd 必须是非空字符串");
     }
 
-    // provider 与 key 由主进程从环境变量读，不信任渲染进程传入
-    const boot = readBootstrapProviders();
-    if (boot.providers.length === 0) {
-      throw new Error(`缺少模型配置：${boot.missing.join(" / ")} 未设置`);
+    // provider 与 key 只从主进程读，不信任渲染进程传入。
+    // 优先用设置页保存的配置，没有再回落环境变量。
+    const saved = await providers.resolveForSession();
+    let runtimeProviders = saved.providers;
+    let runtimeKey = saved.apiKey;
+
+    if (runtimeProviders.length === 0) {
+      const boot = readBootstrapProviders();
+      if (boot.providers.length === 0) {
+        throw new Error(
+          "还没有配置模型供应商。打开左侧「设置 → 模型供应商」添加一个，" +
+            `或者设置环境变量 ${boot.missing.join(" / ")}。`,
+        );
+      }
+      runtimeProviders = boot.providers;
+      runtimeKey = boot.apiKey;
+    }
+
+    if (!runtimeKey) {
+      throw new Error("已配置的供应商都没有 API 密钥，请在设置页补上。");
     }
 
     return sessions.start({
       sessionId: parsed.sessionId,
       cwd: parsed.cwd,
-      providers: boot.providers,
-      apiKey: boot.apiKey,
+      providers: runtimeProviders,
+      apiKey: runtimeKey,
       promptSections: Array.isArray(parsed.promptSections) ? parsed.promptSections : [],
       tools: parsed.tools ?? "all",
     });

@@ -20,6 +20,7 @@ import type {
   TestProviderInput,
   TestProviderResult,
   UpsertProviderInput,
+  ProviderConfig,
 } from "@rakko/shared";
 import { createElectronSecretBox } from "../secret-box.desktop.js";
 
@@ -64,6 +65,31 @@ export class ProviderService {
 
   async remove(id: string): Promise<void> {
     return this.getStore().remove(id);
+  }
+
+  /**
+   * 给引擎用的运行时配置：所有已配置 provider + 一把 key。
+   *
+   * 引擎目前只接受「一个 key 走所有 provider」（见 runtime.ts 的 apiKey 用法），
+   * 所以这里取第一个有 key 的 provider 作为 key 来源。
+   * 没有 key 的 provider 仍然返回 config —— 它们会出现在模型列表里，
+   * 但真正调用时会因为 key 为空而失败，这个由上层提示，不在这里吞掉。
+   */
+  async resolveForSession(): Promise<{
+    providers: ProviderConfig[];
+    apiKey: string;
+  }> {
+    const views = await this.getStore().list();
+    if (views.length === 0) return { providers: [], apiKey: "" };
+
+    const providers: ProviderConfig[] = [];
+    let apiKey = "";
+    for (const v of views) {
+      const resolved = await this.getStore().resolveForRuntime(v.id);
+      providers.push(resolved.config);
+      if (!apiKey && resolved.apiKey) apiKey = resolved.apiKey;
+    }
+    return { providers, apiKey };
   }
 
   /**

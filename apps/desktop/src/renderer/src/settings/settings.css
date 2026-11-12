@@ -1,0 +1,1085 @@
+/**
+ * 设置页 · 模型供应商。
+ *
+ * 三栏：导航 / 供应商列表 / 详情。
+ * 数值取自 OpenDesign 稿件 settings-providers.html，
+ * 变量沿用 global.css 的 token，不写裸十六进制。
+ *
+ * 按设计稿要求，余额、购买套餐、远程调用这几块属于账务体系，
+ * Rakko 是纯本地无账号，所以**整块不渲染** —— 不留死按钮。
+ */
+
+.setpage {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  background: var(--canvas);
+}
+
+.setwrap {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 212px 300px 1fr;
+  min-height: 0;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  margin: 12px;
+  overflow: hidden;
+  box-shadow: var(--shadow-sm);
+}
+
+/* ── 左：导航 ── */
+.navcol {
+  border-right: 1px solid var(--line);
+  background: var(--card2);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.navhead {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 16px 16px 12px;
+}
+
+.navhead .back {
+  width: 28px;
+  height: 28px;
+  border: none;
+  background: transparent;
+  border-radius: 8px;
+  display: grid;
+  place-items: center;
+  color: var(--ink2);
+  cursor: pointer;
+}
+
+.navhead .back:hover {
+  background: var(--card);
+  color: var(--ink);
+}
+
+.navhead b {
+  font-size: 15px;
+  letter-spacing: -0.01em;
+}
+
+.navsearch {
+  margin: 0 12px 12px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 6px 9px;
+}
+
+.navsearch input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--ink);
+  font-size: 12.5px;
+  font-family: inherit;
+}
+
+.navlist {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0 10px 12px;
+}
+
+.navitem {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 8px 10px;
+  border: none;
+  background: transparent;
+  border-radius: 9px;
+  color: var(--ink2);
+  font-size: 13px;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.navitem:hover:not(.disabled) {
+  background: var(--card);
+  color: var(--ink);
+}
+
+.navitem.on {
+  background: var(--card);
+  color: var(--ink);
+  font-weight: 600;
+  box-shadow: inset 0 0 0 1px var(--line);
+}
+
+.navitem.disabled {
+  color: var(--ink3);
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+/* 「即将推出」小标 */
+.navitem .soon {
+  margin-left: auto;
+  font-size: 9.5px;
+  color: var(--ink3);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 1px 6px;
+  font-weight: 400;
+}
+
+.navsep {
+  height: 1px;
+  background: var(--line);
+  margin: 8px 10px;
+}
+
+/* ── 中：供应商列表 ── */
+.provcol {
+  border-right: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.provhead {
+  padding: 16px 16px 10px;
+}
+
+.provhead h2 {
+  font-size: 14.5px;
+  margin-bottom: 4px;
+}
+
+.provhead p {
+  font-size: 11.5px;
+  color: var(--ink2);
+  line-height: 1.55;
+}
+
+.provlist {
+  flex: 1;
+  overflow-y: auto;
+  padding: 6px 10px 10px;
+}
+
+.prov {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 9px 10px;
+  margin-bottom: 4px;
+  border: 1px solid transparent;
+  background: transparent;
+  border-radius: 11px;
+  cursor: pointer;
+  font-family: inherit;
+  text-align: left;
+}
+
+.prov:hover {
+  background: var(--card2);
+}
+
+.prov.on {
+  background: var(--card2);
+  border-color: var(--line2);
+}
+
+.prov .pname {
+  font-size: 12.5px;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.prov .pmeta {
+  font-size: 10.5px;
+  color: var(--ink3);
+  margin-top: 1px;
+}
+
+.plogo {
+  width: 24px;
+  height: 24px;
+  border-radius: 7px;
+  display: grid;
+  place-items: center;
+  flex: none;
+  background: var(--ink);
+  color: var(--card);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.plogo.light {
+  background: var(--card);
+  color: var(--ink);
+  border: 1px solid var(--line);
+}
+
+.pdot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #2f9e44;
+  display: block;
+}
+
+.pdot.off {
+  background: var(--ink3);
+}
+
+.provfoot {
+  display: flex;
+  gap: 7px;
+  padding: 10px;
+  border-top: 1px solid var(--line);
+}
+
+.footbtn {
+  flex: 1;
+  padding: 8px;
+  border: 1px solid var(--line);
+  background: var(--card);
+  border-radius: 9px;
+  color: var(--ink);
+  font-size: 12px;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.footbtn:hover {
+  border-color: var(--line2);
+  background: var(--card2);
+}
+
+.footbtn.primary {
+  background: var(--ink);
+  color: var(--card);
+  border-color: var(--ink);
+  font-weight: 600;
+}
+
+/* ── 右：详情 ── */
+.detailcol {
+  overflow-y: auto;
+  padding: 16px;
+  min-height: 0;
+}
+
+.dhead {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding-bottom: 14px;
+}
+
+.dhead .plogo {
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  font-size: 12px;
+}
+
+.dhead .dt {
+  flex: 1;
+  min-width: 0;
+}
+
+.dhead h3 {
+  font-size: 14px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.dhead .sub {
+  font-size: 11.5px;
+  color: var(--ink2);
+  margin-top: 2px;
+  word-break: break-all;
+}
+
+.connected {
+  font-size: 11px;
+  color: #2f9e44;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.connected::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.connected.warn {
+  color: var(--warn);
+}
+
+/* 模型区标题 */
+.mhead {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 0 8px;
+  border-top: 1px solid var(--line);
+}
+
+.mhead b {
+  font-size: 12.5px;
+}
+
+.mhead .cnt {
+  font-size: 11px;
+  color: var(--ink3);
+}
+
+.mhead .sp {
+  flex: 1;
+}
+
+.iconbtn {
+  border: 1px solid var(--line);
+  background: var(--card);
+  border-radius: 7px;
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  color: var(--ink2);
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.iconbtn:hover {
+  border-color: var(--line2);
+  color: var(--ink);
+}
+
+.filters {
+  display: flex;
+  gap: 6px;
+  padding-bottom: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.fchip {
+  font-size: 11.5px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 4px 11px;
+  color: var(--ink2);
+  background: transparent;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.fchip:hover {
+  border-color: var(--line2);
+  color: var(--ink);
+}
+
+.fchip.on {
+  background: var(--ink);
+  color: var(--card);
+  border-color: var(--ink);
+  font-weight: 600;
+}
+
+.msearch {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 3px 9px;
+  background: var(--card);
+}
+
+.msearch input {
+  width: 110px;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--ink);
+  font-size: 11.5px;
+  font-family: inherit;
+}
+
+/* 厂商分组 */
+.vendor {
+  font-size: 10.5px;
+  color: var(--ink3);
+  padding: 9px 2px 4px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.vcount {
+  color: var(--ink3);
+}
+
+/* 单个模型行 */
+.mrow {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 6px 2px;
+  border-radius: 7px;
+}
+
+.mrow:hover {
+  background: var(--card2);
+}
+
+.mrow.off .nm {
+  color: var(--ink3);
+}
+
+.mico {
+  width: 15px;
+  height: 15px;
+  border-radius: 4px;
+  background: var(--card2);
+  border: 1px solid var(--line);
+  display: grid;
+  place-items: center;
+  font-size: 8.5px;
+  color: var(--ink2);
+  flex: none;
+}
+
+.mname {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  flex: 1;
+}
+
+.mname .nm {
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tier {
+  font-size: 9.5px;
+  color: var(--ink3);
+  letter-spacing: -1px;
+  flex: none;
+}
+
+.mctx {
+  font-size: 10px;
+  color: var(--ink3);
+  flex: none;
+}
+
+.sp {
+  flex: 1;
+}
+
+/* 开关 */
+.toggle {
+  width: 38px;
+  height: 22px;
+  border-radius: 999px;
+  background: var(--line2);
+  border: none;
+  position: relative;
+  cursor: pointer;
+  flex: none;
+  transition: background 0.15s;
+  padding: 0;
+}
+
+.toggle::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--card);
+  transition: transform 0.15s;
+}
+
+.toggle.on {
+  background: #1c7ed6;
+}
+
+.toggle.on::after {
+  transform: translateX(16px);
+}
+
+/* 空状态 */
+.empty {
+  padding: 32px 16px;
+  text-align: center;
+  color: var(--ink3);
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+/* ── 弹窗通用 ── */
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.32);
+  display: grid;
+  place-items: center;
+  z-index: 50;
+}
+
+.dialog {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.25);
+  width: 480px;
+  max-height: 78vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.dialog.wide {
+  width: 560px;
+}
+
+.dlghead {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 14px 16px 8px;
+}
+
+.dlghead h3 {
+  font-size: 14px;
+  flex: 1;
+}
+
+.dlghead .custom {
+  border: none;
+  background: transparent;
+  color: var(--ink2);
+  font-size: 11.5px;
+  font-family: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.dlgsearch {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 16px 10px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 6px 9px;
+}
+
+.dlgsearch input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--ink);
+  font-size: 12.5px;
+  font-family: inherit;
+}
+
+.dlgbody {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0 10px 10px;
+}
+
+.dgroup {
+  font-size: 10.5px;
+  color: var(--ink3);
+  padding: 10px 8px 4px;
+}
+
+.drow {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 8px;
+  border: 1px solid transparent;
+  background: transparent;
+  border-radius: 9px;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  color: var(--ink);
+}
+
+.drow:hover {
+  background: var(--card2);
+}
+
+.drow.sel {
+  border-color: var(--line2);
+  background: var(--card2);
+}
+
+.dico {
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: var(--card);
+  display: grid;
+  place-items: center;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--ink2);
+  flex: none;
+}
+
+.dico.dark {
+  background: var(--ink);
+  color: var(--card);
+  border-color: var(--ink);
+}
+
+.dlabel {
+  font-size: 12.5px;
+}
+
+.dhint {
+  margin-left: auto;
+  font-size: 10.5px;
+  color: var(--ink3);
+  text-align: right;
+  max-width: 55%;
+}
+
+.dlgfoot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 7px;
+  padding: 10px 16px;
+  border-top: 1px solid var(--line);
+}
+
+/* ── 表单 ── */
+.d2body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 16px 12px;
+}
+
+.field {
+  margin-bottom: 11px;
+}
+
+.field label {
+  display: block;
+  font-size: 11.5px;
+  color: var(--ink2);
+  margin-bottom: 4px;
+}
+
+.inp {
+  width: 100%;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--card);
+  color: var(--ink);
+  font-size: 12.5px;
+  font-family: inherit;
+  outline: none;
+}
+
+.inp:focus {
+  border-color: var(--line2);
+  box-shadow: 0 0 0 3px rgba(28, 126, 214, 0.1);
+}
+
+.inpwrap {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding-right: 4px;
+}
+
+.inpwrap .inp {
+  border: none;
+  box-shadow: none;
+}
+
+.eye {
+  border: none;
+  background: transparent;
+  color: var(--ink3);
+  cursor: pointer;
+  padding: 4px;
+  display: grid;
+  place-items: center;
+}
+
+.btn2 {
+  padding: 7px 14px;
+  border: 1px solid var(--line);
+  background: var(--card);
+  border-radius: 8px;
+  color: var(--ink);
+  font-size: 12px;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.btn2:hover:not(:disabled) {
+  border-color: var(--line2);
+  background: var(--card2);
+}
+
+.btn2.primary {
+  background: var(--ink);
+  color: var(--card);
+  border-color: var(--ink);
+  font-weight: 600;
+}
+
+.btn2:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.mlistrow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 0;
+  border-top: 1px solid var(--line);
+}
+
+.mlt {
+  font-size: 11.5px;
+  color: var(--ink3);
+  flex: 1;
+}
+
+.fetchbtn {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  background: var(--card);
+  border-radius: 8px;
+  color: var(--ink);
+  font-size: 11.5px;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.fetchbtn:hover:not(:disabled) {
+  border-color: var(--line2);
+}
+
+.fetchbtn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.mchips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  padding-bottom: 9px;
+}
+
+.mchip {
+  font-size: 11px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 3px 9px;
+  color: var(--ink2);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.mchip button {
+  border: none;
+  background: transparent;
+  color: var(--ink3);
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+  padding: 0;
+}
+
+/* 折叠行 */
+.accrow {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  width: 100%;
+  padding: 9px 0;
+  border: none;
+  border-top: 1px solid var(--line);
+  background: transparent;
+  color: var(--ink2);
+  font-size: 12px;
+  font-family: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+
+.accrow:hover {
+  color: var(--ink);
+}
+
+.accrow .chev {
+  transition: transform 0.15s;
+}
+
+.accrow.open .chev {
+  transform: rotate(90deg);
+}
+
+.accbody {
+  padding: 2px 0 10px;
+}
+
+.accbody p,
+.field .hint {
+  font-size: 10.5px;
+  color: var(--ink3);
+  line-height: 1.6;
+  margin-top: 4px;
+}
+
+.mono {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 10.5px;
+  background: var(--card2);
+  padding: 1px 4px;
+  border-radius: 4px;
+}
+
+.testrow {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+
+.testbtn {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 11px;
+  border: 1px solid var(--line);
+  background: var(--card);
+  border-radius: 8px;
+  color: var(--ink);
+  font-size: 11.5px;
+  font-family: inherit;
+  cursor: pointer;
+  flex: none;
+}
+
+.testbtn:hover:not(:disabled) {
+  border-color: var(--line2);
+}
+
+.testbtn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.testhint {
+  font-size: 10.5px;
+  color: var(--ink3);
+  line-height: 1.5;
+}
+
+.testresult {
+  margin-top: 8px;
+  font-size: 11px;
+  padding: 7px 9px;
+  border-radius: 7px;
+  border: 1px solid var(--line);
+  line-height: 1.55;
+  word-break: break-word;
+}
+
+.testresult.ok {
+  border-color: #2f9e44;
+  color: #2f9e44;
+  background: rgba(47, 158, 68, 0.06);
+}
+
+.testresult.err {
+  border-color: var(--warn);
+  color: var(--warn);
+  background: rgba(232, 89, 12, 0.06);
+}
+
+/* ── 选择模型弹窗 ── */
+.d3body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 12px 12px;
+}
+
+.mgroup {
+  font-size: 10.5px;
+  color: var(--ink3);
+  padding: 10px 4px 4px;
+  display: flex;
+  gap: 5px;
+}
+
+.m3row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 7px 6px;
+  border: none;
+  background: transparent;
+  border-radius: 8px;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  color: var(--ink);
+}
+
+.m3row:hover {
+  background: var(--card2);
+}
+
+.cb {
+  width: 15px;
+  height: 15px;
+  border-radius: 4px;
+  border: 1px solid var(--line2);
+  display: grid;
+  place-items: center;
+  flex: none;
+  color: transparent;
+}
+
+.m3row.on .cb {
+  background: var(--ink);
+  border-color: var(--ink);
+  color: var(--card);
+}
+
+.cb svg {
+  width: 10px;
+  height: 10px;
+  stroke-width: 3;
+  display: block;
+}
+
+.m3name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+}
+
+.m3name .nm {
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.m3ctx {
+  font-size: 10px;
+  color: var(--ink3);
+  flex: none;
+}
+
+.d3foot {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 10px 16px;
+  border-top: 1px solid var(--line);
+}
+
+.d3count {
+  font-size: 11.5px;
+  color: var(--ink3);
+  margin-right: auto;
+}
+
+.d3state {
+  text-align: center;
+  padding: 24px 20px;
+  color: var(--ink2);
+}
+
+.d3state b {
+  display: block;
+  font-size: 12.5px;
+  color: var(--ink);
+  margin: 8px 0 4px;
+}
+
+.d3state p {
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--ink3);
+}
+
+.skelrow {
+  height: 30px;
+  border-radius: 8px;
+  background: var(--card2);
+  margin-bottom: 6px;
+  animation: pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 0.5;
+  }
+  50% {
+    opacity: 1;
+  }
+}
