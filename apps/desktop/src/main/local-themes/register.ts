@@ -1,0 +1,68 @@
+import { BrowserWindow, ipcMain } from 'electron';
+
+import type { LocalThemeWriteRequest } from '../../shared/local-themes';
+import {
+  assertTrustedAppRendererEvent,
+  isTrustedCindyRendererWindow,
+} from '../security/trustedAppRenderer.js';
+import { createLogger } from '../logger';
+import { importExternalTheme } from './importer';
+import { loadLocalThemes, loadLocalThemesSync } from './loader';
+import { watchOmarchyTheme } from './omarchy';
+import { openLocalThemesDir, writeLocalTheme } from './writer';
+import { refreshAppearanceTheme } from '../appearance-settings-ipc';
+
+const log = createLogger('local-themes/register');
+
+export async function broadcastLocalThemes(): Promise<void> {
+  try { await refreshAppearanceTheme(); }
+  catch (error) { log.warn('Selected theme appearance could not be restored:', error); }
+  const payload = await loadLocalThemes();
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (!isTrustedCindyRendererWindow(window)) continue;
+    try {
+      window.webContents.send('local-themes:changed', payload);
+    } catch (error) {
+      log.warn(`Failed to push local themes to window ${window.id}:`, error);
+    }
+  }
+}
+
+export function startOmarchyThemeSync(): void {
+  try {
+    const watcher = watchOmarchyTheme(() => {
+      log.info('Omarchy theme switched; pushing themes to windows');
+      void broadcastLocalThemes();
+    });
+    if (!watcher) return;
+    log.info('Watching Omarchy theme switches');
+    watcher.on('error', (error) => log.error('Omarchy theme watcher failed:', error));
+  } catch (error) {
+    log.error('Omarchy theme watcher not started:', error);
+  }
+}
+
+export function registerLocalThemesIpc(): void {
+  startOmarchyThemeSync();
+  ipcMain.on('local-themes:list-sync', (event) => {
+    event.returnValue = loadLocalThemesSync();
+  });
+
+  ipcMain.handle('local-themes:list', async () => {
+    try { await refreshAppearanceTheme(); }
+    catch (error) { log.warn('Selected theme appearance could not be restored:', error); }
+    return loadLocalThemes();
+  });
+  ipcMain.handle('local-themes:write', async (_event, req: LocalThemeWriteRequest) =>
+    writeLocalTheme(req));
+  ipcMain.handle('local-themes:open-dir', async () => openLocalThemesDir());
+  // 导入会弹原生文件对话框并读取用户选中的任意路径,是新增的文件访问能力,
+  // 因此显式过来源闸(只允许 Cindy 自有顶层页面发起);对话框与读文件都在 main
+  // 侧完成,Renderer 拿不到也传不进路径。
+  ipcMain.handle('local-themes:import', async (event) => {
+    assertTrustedAppRendererEvent(event);
+    return importExternalTheme({
+      parentWindow: BrowserWindow.fromWebContents(event.sender),
+    });
+  });
+}

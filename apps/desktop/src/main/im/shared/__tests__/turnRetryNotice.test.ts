@@ -1,0 +1,432 @@
+/**
+ * 渠道侧「正在自动重试 / 重试耗尽」文案映射。
+ *
+ * 断言的是判定边界: 只有过载类非终止 error 才出提示, 其它非终止 error 保持既有
+ * 静默(它们的 message 是内部英文串, 外发等于把裸英文推给渠道用户)。
+ */
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { setMainLocale } from '../../../i18n.desktop';
+
+import {
+  isQuotaExhaustionFailure,
+  overloadFailureNotice,
+  overloadRetryNotice,
+  quotaFailureNoticePrefix,
+  terminalErrorText,
+  turnRetryNotice,
+} from '../turnRetryNotice';
+
+
+// 这些用例断言中文控制文案：显式切到 zh-CN，结束后复位为 en。
+beforeEach(() => setMainLocale('zh-CN'));
+afterEach(() => setMainLocale('en'));
+
+describe('turnRetryNotice', () => {
+  it('终态 429 外层重投 → 渠道侧限流进度', () => {
+    expect(
+      turnRetryNotice({
+        message:
+          'exceeded retry limit, last status: 429 Too Many Requests (rate-limit-retry 1/2)',
+        reason: 'terminal-rate-limit-retry',
+      }),
+    ).toBe('请求受到限流，正在自动重试（1/2）…');
+  });
+
+  it('reason 与 marker 必须同时命中，普通 429 仍保持静默', () => {
+    expect(
+      turnRetryNotice({
+        message: 'provider failed (rate-limit-retry 1/2)',
+        reason: 'other-reason',
+      }),
+    ).toBeNull();
+    expect(
+      turnRetryNotice({
+        message: 'HTTP 429 Too Many Requests',
+        reason: 'terminal-rate-limit-retry',
+      }),
+    ).toBeNull();
+    expect(turnRetryNotice({ message: 'rate limit exceeded', errorStatus: 429 })).toBeNull();
+  });
+
+  it('继续覆盖原有过载进度', () => {
+    expect(
+      turnRetryNotice({
+        message: 'Selected model is at capacity. (auto-retry 2/4)',
+      }),
+    ).toBe('模型服务繁忙，正在自动重试（2/4）…');
+  });
+});
+
+describe('overloadRetryNotice', () => {
+  it('带次数的 Codex 容量重投 → 带进度的中文提示', () => {
+    expect(
+      overloadRetryNotice({
+        message: 'Selected model is at capacity. Please try a different model. (auto-retry 2/4)',
+      }),
+    ).toBe('模型服务繁忙，正在自动重试（2/4）…');
+  });
+
+  it('Claude SDK 的 529 重试同样命中(状态码优先于文本)', () => {
+    expect(
+      overloadRetryNotice({
+        message: 'SDK API request failed: overloaded (HTTP 529) (auto-retry 3/10)',
+        errorStatus: 529,
+      }),
+    ).toBe('模型服务繁忙，正在自动重试（3/10）…');
+  });
+
+  it('拿不到次数时不编造分母', () => {
+    expect(overloadRetryNotice({ message: 'model is at capacity' })).toBe(
+      '模型服务繁忙，正在自动重试…',
+    );
+  });
+
+  it('非过载的非终止 error 保持静默', () => {
+    // #790 的 Codex 网络重连提示走同一条非终止 error 通道, 但渠道侧没有对应文案。
+    expect(overloadRetryNotice({ message: 'stream disconnected (Reconnecting 1/3)' })).toBeNull();
+    expect(overloadRetryNotice({ message: 'rate limit exceeded', errorStatus: 429 })).toBeNull();
+    expect(overloadRetryNotice({ message: '缓存 capacity 已满' })).toBeNull();
+  });
+
+  it('形状异常一律静默, 不抛', () => {
+    expect(overloadRetryNotice(null)).toBeNull();
+    expect(overloadRetryNotice(undefined)).toBeNull();
+    expect(overloadRetryNotice('at capacity')).toBeNull();
+    expect(overloadRetryNotice({})).toBeNull();
+    expect(overloadRetryNotice({ message: 42 })).toBeNull();
+  });
+
+  it('结构化 codexErrorInfo 命中时不依赖文案措辞', () => {
+    // codex 改了过载文案后, 只认文案会让整段退避窗口在渠道侧一个字都不动 —— 也就是
+    // 本文件开头描述的那个"卡死了"观感复发。
+    expect(
+      overloadRetryNotice({
+        message: 'The upstream declined this request. (auto-retry 2/4)',
+        codexErrorInfo: 'serverOverloaded',
+      }),
+    ).toBe('模型服务繁忙，正在自动重试（2/4）…');
+    // 只有 tag、没有 message 时也要出提示(空 payload 守卫不能把它挡掉)。
+    expect(overloadRetryNotice({ codexErrorInfo: 'serverOverloaded' })).toBe(
+      '模型服务繁忙，正在自动重试…',
+    );
+  });
+
+  it('非过载的结构化 tag 保持静默', () => {
+    expect(
+      overloadRetryNotice({ message: 'stream gone', codexErrorInfo: 'responseStreamDisconnected' }),
+    ).toBeNull();
+    expect(overloadRetryNotice({ message: 'boom', codexErrorInfo: 'usageLimitExceeded' })).toBeNull();
+  });
+});
+
+describe('overloadFailureNotice', () => {
+  it('过载终态 → 指明「在这里重发」而不是桌面端重试', () => {
+    const notice = overloadFailureNotice(
+      'Selected model is at capacity. Please try a different model.',
+    );
+    expect(notice).not.toBeNull();
+    // 关键承诺: 桌面端点重试起的是新 turn, 结果不回流到这条渠道消息。
+    expect(notice).toContain('在这里重发这条消息');
+    expect(notice).toContain('不会回到这条消息里');
+  });
+
+  it('不声称重试过: 终态也可能来自"已有产出所以不重投"', () => {
+    // maker-core 的产出守卫会在 turn 已有 text / reasoning / tool 产出时**拒绝**自动
+    // 重投并立刻透终态, 那时一次重试都没发生过; 接管条件不满足时同理
+    // (review #844 codex P1)。渠道文案不得替它编造"重试多次"。
+    const notice = overloadFailureNotice(
+      'Selected model is at capacity. Please try a different model.',
+    );
+    expect(notice).not.toMatch(/重试多次|多次重试|重试.*仍未成功/);
+    // 仍然要说清"现在是什么状况", 否则用户只看到一句无信息的失败。
+    expect(notice).toContain('上游暂时没有可用容量');
+  });
+
+  it('非过载错误沿用原文(返回 null 让调用方不改写)', () => {
+    expect(overloadFailureNotice('process exited with code 1')).toBeNull();
+    expect(overloadFailureNotice('Request timed out', 504)).toBeNull();
+  });
+
+  it('结构化 codexErrorInfo 命中时不依赖文案措辞', () => {
+    // 只认文案时, codex 改措辞会让这条终态说明退回裸英文原文推给渠道用户。
+    const notice = overloadFailureNotice(
+      'The upstream declined this request.',
+      undefined,
+      'serverOverloaded',
+    );
+    expect(notice).toContain('模型服务繁忙');
+    expect(notice).toContain('在这里重发这条消息');
+  });
+
+  it('非过载的结构化 tag 不改写原文', () => {
+    expect(overloadFailureNotice('stream gone', undefined, 'responseStreamDisconnected')).toBeNull();
+  });
+});
+
+describe('terminalErrorText', () => {
+  it('maps output-limit for user turns, scheduler relay and hook failures', () => {
+    expect(terminalErrorText({ reason: 'output-limit', message: 'Pi reached the model output limit.' }))
+      .toBe('模型已达到输出长度上限，本轮回复可能不完整。可以发送新消息继续；若反复触发，请降低推理强度或先压缩对话记录。');
+    expect(terminalErrorText({ reason: 'output-limit' })).toContain('回复可能不完整');
+  });
+
+  it('Codex 容量终态 → 本地化说明(定时转播卡与用户 turn 共用同一映射)', () => {
+    // 三条渠道终态路径(handleTurnErrorAsync / finalizeTranspond / hook session-runner)
+    // 必须口径一致: 之前转播路径自己 extractErrMessage 取原文, 重试耗尽时卡片会从
+    // 「正在自动重试（N/M）」突然跳回英文原文(review #844 codex P1)。
+    const text = terminalErrorText({
+      message: 'Selected model is at capacity. Please try a different model.',
+    });
+    expect(text).toContain('模型服务繁忙');
+    expect(text).toContain('在这里重发这条消息');
+  });
+
+  it('只有状态码带 529 时也命中(errorStatus 不能在取文案时被丢掉)', () => {
+    // Anthropic 的 529 有时只体现在状态码上, message 里不含 529 字样。
+    expect(terminalErrorText({ message: 'SDK API request failed', errorStatus: 529 })).toContain(
+      '模型服务繁忙',
+    );
+  });
+
+  it('结构化 codexErrorInfo 从 data 里被取出并透传(三条终态路径共用)', () => {
+    const text = terminalErrorText({
+      message: 'The upstream declined this request.',
+      codexErrorInfo: 'serverOverloaded',
+    });
+    expect(text).toContain('模型服务繁忙');
+  });
+
+  it('非过载终态沿用上游原文', () => {
+    expect(terminalErrorText({ message: 'process exited with code 1' })).toBe(
+      'process exited with code 1',
+    );
+    expect(terminalErrorText({ message: 'Request timed out', errorStatus: 504 })).toBe(
+      'Request timed out',
+    );
+  });
+
+  it('形状异常时退回 String(data), 与被它取代的 extractErrMessage 逐字一致', () => {
+    expect(terminalErrorText('at capacity')).toContain('模型服务繁忙');
+    expect(terminalErrorText('boom')).toBe('boom');
+    expect(terminalErrorText(null)).toBe('null');
+    expect(terminalErrorText({})).toBe('[object Object]');
+  });
+
+  it('工具循环终态只输出渠道安全文案, 不泄漏内部分类', () => {
+    const text = terminalErrorText({
+      message: 'tool_use_loop_detected: missing_required_field',
+      reason: 'tool_use_loop_detected',
+      toolLoop: { kind: 'contract', count: 3 },
+    });
+
+    expect(text).toContain('无效的工具调用');
+    expect(text).toContain('3 次失败');
+    expect(text).not.toContain('tool_use_loop_detected');
+    expect(text).not.toContain('missing_required_field');
+  });
+
+  it('缺失或越界的 toolLoop 详情仍回落到通用安全文案', () => {
+    const text = terminalErrorText({
+      message: 'tool_use_loop_detected: secret_internal_hint',
+      reason: 'tool_use_loop_detected',
+      toolLoop: { kind: 'secret_internal_kind', count: 999999999 },
+    });
+
+    expect(text).toContain('重复调用工具次数过多');
+    expect(text).not.toContain('secret_internal_hint');
+    expect(text).not.toContain('secret_internal_kind');
+  });
+
+  /**
+   * Auto 档审阅器故障同样走非终止 error。渠道侧原来对这类一律静默 —— Slack /
+   * Telegram 上的用户只看到工具接连被拒、没有原因(codex P1 of #1574)。
+   */
+  it('Auto 档审阅器不可用 → 渠道侧说明 + 可执行动作', () => {
+    const notice = turnRetryNotice({
+      message: '[AUTO_REVIEW_UNAVAILABLE] Auto-review could not reach a decision (network or '
+        + 'service hiccup), so actions that need review are being handed to you to confirm.',
+      isTerminal: false,
+    });
+    expect(notice).toContain('自动审批暂时无法给出判断');
+    // 必须说清操作的去向 —— 现在是转交用户确认,不再是静默拒绝。
+    expect(notice).toContain('由你确认');
+    // 少打断只指向完全访问。默认权限在三条 Harness 上都不等于少确认。
+    expect(notice).toContain('完全访问');
+    expect(notice).toContain('风险更高');
+    expect(notice).not.toContain('默认权限');
+    // 不得把 [CODE] 前缀或英文原文推给渠道用户。
+    expect(notice).not.toContain('AUTO_REVIEW_UNAVAILABLE');
+    expect(notice).not.toContain('Auto-review could not');
+  });
+
+  it('个人微信不建议切到完全访问', () => {
+    const notice = turnRetryNotice({
+      message: '[AUTO_REVIEW_UNAVAILABLE] Auto-review could not reach a decision',
+      isTerminal: false,
+    }, { channel: 'wechat' });
+    expect(notice).toContain('个人微信不能使用「完全访问」');
+    expect(notice).toContain('直接确认');
+    expect(notice).not.toContain('想少被打断');
+    expect(notice).not.toContain('默认权限');
+  });
+
+  it('确认卡没送到 → 渠道侧说明这次不是用户拒绝', () => {
+    const notice = turnRetryNotice({
+      message: '[AUTO_REVIEW_CONFIRM_UNDELIVERED] Automatic review was unavailable, and the '
+        + 'confirmation request was not completed. This is not a user rejection.',
+      isTerminal: false,
+    });
+    expect(notice).toContain('这次拒绝不是你点的');
+    expect(notice).not.toContain('AUTO_REVIEW_CONFIRM_UNDELIVERED');
+    expect(notice).not.toContain('not a user rejection');
+  });
+
+  it('其它带 bracket code 的非终止 error 仍保持静默', () => {
+    // 只放开有明确渠道文案的那一条,不是所有 [CODE] 都外发。
+    expect(turnRetryNotice({
+      message: '[REMOTE_LOCAL_ATTACHMENT_UNSUPPORTED] Local attachments are not accessible.',
+    })).toBeNull();
+  });
+
+  it('message 为 undefined / null 时不得把字面量 "undefined" 给用户看', () => {
+    // 判 key 是否存在('message' in record)会让 message: undefined 也走进去, String() 出
+    // 字面量 "undefined"; 过载文案映射也会跟着取决于这个意外字符串(copilot 低置信提示)。
+    expect(terminalErrorText({ message: undefined })).toBe('[object Object]');
+    expect(terminalErrorText({ message: null })).toBe('[object Object]');
+    // 值存在就照常取值(含非字符串)。
+    expect(terminalErrorText({ message: 0 })).toBe('0');
+    expect(terminalErrorText({ message: 'boom' })).toBe('boom');
+  });
+});
+
+describe('额度类终态错误', () => {
+  const SPEND_CAP =
+    'You hit your spend cap set by the owner of your workspace. Ask them to raise it to keep using Codex.';
+  const PERSONAL = { surface: 'personal', supportsModelCommand: true } as const;
+
+  it('花费上限: 定位 bot、任务、模型和供应商，只给当前任务的恢复动作', () => {
+    const text = terminalErrorText({ message: SPEND_CAP }, { ...PERSONAL, providerLabel: 'OpenAI',
+      botLabel: 'Telegram 个人 bot · 测试助手', modelLabel: 'GPT-6 Astra', taskLabel: '我的任务（12345678）' });
+    expect(text.startsWith(quotaFailureNoticePrefix())).toBe(true);
+    expect(text).toContain('「OpenAI」已达到工作区所有者设置的花费上限');
+    expect(text).toContain('Telegram 个人 bot · 测试助手');
+    expect(text).toContain('GPT-6 Astra');
+    expect(text).toContain('我的任务（12345678）');
+    expect(text).toContain('联系工作区管理员');
+    expect(text).toContain('/model');
+    expect(text).not.toContain('设置 →');
+    expect(text).not.toContain(SPEND_CAP);
+  });
+
+  it('个人 /model 改当前任务，官方指向 Cindy 当前任务，不指向目录默认', () => {
+    const personal = terminalErrorText({ message: SPEND_CAP }, PERSONAL);
+    expect(personal).toContain('个人 bot');
+    expect(personal).toContain('/model');
+    expect(personal).not.toContain('新对话配置');
+    expect(personal).not.toContain('工作目录');
+    const official = terminalErrorText({ message: SPEND_CAP }, { surface: 'official' });
+    expect(official).toContain('官方 bot');
+    expect(official).toContain('在 Cindy 里打开这个任务');
+    expect(official).not.toContain('/model');
+    expect(official).not.toContain('/new');
+  });
+
+  it.each([false, undefined])('个人渠道未支持 /model (%s) 时只指向 Cindy 当前任务', (supportsModelCommand) => {
+    const text = terminalErrorText({ message: SPEND_CAP }, { surface: 'personal', supportsModelCommand });
+    expect(text).toContain('在 Cindy 里打开这个任务');
+    expect(text).toContain('更换供应商或模型');
+    expect(text).toContain('回到这里重发这条消息');
+    expect(text).not.toContain('/model');
+    expect(text).not.toContain('新对话配置');
+    expect(text).not.toContain('Telegram');
+  });
+
+  it.each([
+    { message: SPEND_CAP },
+    { message: 'Payment Required', errorStatus: 402 },
+    { message: 'billing', sdkError: 'billing_error' },
+    { message: 'limit', codexErrorInfo: 'usageLimitExceeded' },
+  ])('非 IM 调用方未传入口时保持原文，不混入 bot 指引: $message', (data) => {
+    expect(terminalErrorText(data)).toBe(data.message);
+  });
+
+  it('拿不到供应商名时退回「当前供应商」', () => {
+    expect(terminalErrorText({ message: SPEND_CAP }, PERSONAL)).toContain('当前供应商已达到工作区所有者设置的花费上限');
+  });
+
+  it('认上游的结构化信号: 402 / billing_error / provider_quota_limit / usageLimitExceeded', () => {
+    expect(isQuotaExhaustionFailure({ message: 'Payment Required', errorStatus: 402 })).toBe(true);
+    expect(isQuotaExhaustionFailure({ message: 'billing', sdkError: 'billing_error' })).toBe(true);
+    expect(isQuotaExhaustionFailure({ message: 'x', reason: 'provider_quota_limit' })).toBe(true);
+    expect(terminalErrorText({ message: 'limit', codexErrorInfo: 'usageLimitExceeded' }, PERSONAL)).toContain(
+      '账号用量已达上限',
+    );
+    expect(terminalErrorText({ message: 'insufficient_quota' }, PERSONAL)).toContain('账号余额或配额不足');
+  });
+
+  it('普通限流 / 其它错误不算额度耗尽, 沿用原有映射', () => {
+    expect(isQuotaExhaustionFailure({ message: 'rate limit exceeded', errorStatus: 429 })).toBe(false);
+    expect(isQuotaExhaustionFailure({ message: 'process exited with code 1' })).toBe(false);
+    expect(isQuotaExhaustionFailure(null)).toBe(false);
+    expect(terminalErrorText({ message: 'process exited with code 1' }, { ...PERSONAL, providerLabel: 'OpenAI' })).toBe(
+      'process exited with code 1',
+    );
+  });
+
+  it('不外发上游原文，显示标签中的敏感信息仍脱敏', () => {
+    const text = terminalErrorText({ message: 'insufficient_quota for key sk-abcdefghijklmnop' },
+      { ...PERSONAL, taskLabel: 'key sk-abcdefghijklmnop' });
+    expect(text).not.toContain('sk-abcdefghijklmnop');
+  });
+});
+
+describe('output-limit usage guidance', () => {
+  it('explains reasoning exhaustion and gives recovery actions', () => {
+    const text = terminalErrorText({ reason: 'output-limit', outputLimit: { outputTokens: 131072, reasoningTokens: 131064 } });
+    expect(text).toContain('131064');
+    expect(text).toContain('131072');
+    expect(text).toContain('降低推理强度');
+    expect(text).toContain('先压缩');
+    expect(text).not.toContain('可以发送新消息继续');
+  });
+  it('keeps ordinary output limits distinct and supports legacy payloads', () => {
+    const text = terminalErrorText({ reason: 'output-limit', outputLimit: { outputTokens: 131072, reasoningTokens: 1000 } });
+    expect(text).toContain('1000');
+    expect(text).toContain('可以发送新消息继续');
+    expect(terminalErrorText({ reason: 'output-limit' })).not.toContain('tokens');
+  });
+});
+
+describe('控制文案跟随界面语言', () => {
+  beforeEach(() => setMainLocale('en'));
+
+  it('English UI yields English retry progress with interpolated counts', () => {
+    expect(
+      overloadRetryNotice({ message: 'Selected model is at capacity. (auto-retry 2/4)' }),
+    ).toBe('The model service is busy. Retrying automatically (2/4)…');
+    expect(overloadRetryNotice({ message: 'Selected model is at capacity.' }))
+      .toBe('The model service is busy. Retrying automatically…');
+  });
+
+  it('English quota failure keeps provider, bot and recovery hint in English', () => {
+    const text = terminalErrorText(
+      { message: 'You hit your spend cap set by the owner of your workspace.' },
+      { surface: 'official', providerLabel: 'OpenAI', taskLabel: 'Fix login (12345678)' },
+    );
+    expect(text.split('\n')).toEqual([
+      '⚠️ Provider limit reached: “OpenAI” has reached the spending cap set by the workspace owner, so this task can\'t continue for now.',
+      'Source: official bot',
+      'Task: Fix login (12345678)',
+      'Ask a workspace admin to adjust the spending cap, or switch to another provider.',
+      'Open this task in Cindy, switch the provider or model, then come back and resend this message.',
+    ]);
+    expect(text.startsWith(quotaFailureNoticePrefix())).toBe(true);
+  });
+
+  it('switching language takes effect on the next message', () => {
+    const data = { message: 'Selected model is at capacity. (auto-retry 1/3)' };
+    expect(overloadRetryNotice(data)).toBe('The model service is busy. Retrying automatically (1/3)…');
+    setMainLocale('ja');
+    expect(overloadRetryNotice(data)).toBe('モデルサービスが混雑しています。自動で再試行しています（1/3）…');
+  });
+});

@@ -1,0 +1,1269 @@
+import { providerPresetOAuth } from '@cindy/model-providers';
+/**
+ * generic-oauth Runner + oauth-token 路由分支 + active-catalog 发现模型泛化 merge 单测。
+ *
+ * 覆盖（存储 / fetch / 时钟注入，不联网、不触电 Electron）：
+ *   - blob 缓存读写、has/logout 语义；
+ *   - 临期单飞刷新：refresh_token 交换、登出竞态不回写、并发只刷一次；
+ *   - 请求等待刷新，状态读取不启动刷新；
+ *   - discoverGenericOAuthModels 解析 OpenAI /models 形状 + 失败回 null；
+ *   - buildRouteDecision 的 oauth-token 分支（Bearer 覆盖、cc 抹 x-api-key、codex 抹 OpenAI
+ *     账号元数据头、无 token passthrough）；
+ *   - 登录流（回环回调模拟）成功路径 + 凭证落盘失败的登录硬失败 / 刷新保内存态语义；
+ *   - setDiscoveredProviderModels 的 additions-only merge。
+ */
+
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+
+import type { OAuthProviderDescriptor, ProviderView } from '@cindy/model-providers';
+import { fetchSavedOAuthProviderModels } from '../provider-model-fetch.js';
+
+import {
+  parseModelsListResponse,
+  cancelGenericOAuthLogin,
+  configureGenericOAuth,
+  deriveModelsDiscoveryUrl,
+  hasGenericOAuthLogin,
+  logoutGenericOAuth,
+  removeGenericOAuthCredentialsReversibly,
+  readCachedGenericOAuthAccessToken,
+  readGenericOAuthAccessToken,
+  refreshGenericOAuthIfNeeded,
+  discoverGenericOAuthModels,
+  resetGenericOAuthMemoryCache,
+  runGenericOAuthLogin,
+  type GenericOAuthStorage,
+} from '../generic-oauth.desktop.js';
+import {
+  buildRouteDecision,
+  beginProviderRouteMutation,
+  isHostInjectedAuthSession,
+  setOAuthTokenReader,
+  resolveSessionRouteDecision,
+} from '../provider-route.js';
+import {
+  setActiveCatalog,
+  setCustomProviders,
+  setDiscoveredProviderModels,
+  getActiveCatalog,
+} from '../active-catalog.js';
+import { setSessionProvider } from '../session-provider-store.js';
+
+const OAUTH: OAuthProviderDescriptor = {
+  authorizeUrl: 'https://auth.acme.example/oauth2/authorize',
+  tokenUrl: 'https://auth.acme.example/oauth2/token',
+  clientId: 'client-1',
+  scopes: 'openid offline_access',
+  modelsDiscoveryUrl: 'https://api.acme.example/v1/models',
+};
+const DEVICE_OAUTH: OAuthProviderDescriptor = {
+  flow: 'device-code',
+  deviceAuthorizationUrl: 'https://auth.acme.example/oauth2/device',
+  tokenUrl: 'https://auth.acme.example/oauth2/token',
+  clientId: 'device-client-1',
+  scopes: 'openid offline_access',
+  modelsDiscoveryUrl: 'https://api.acme.example/v1/models',
+};
+
+function memStorage(): GenericOAuthStorage & { map: Map<string, string> } {
+  const map = new Map<string, string>();
+  return {
+    map,
+    read: (id) => map.get(id) ?? null,
+    readStrict: (id) => map.get(id) ?? null,
+    write: (id, v) => {
+      map.set(id, v);
+      return true;
+    },
+    remove: (id) => {
+      map.delete(id);
+      return true;
+    },
+  };
+}
+
+let storage = memStorage();
+let nowMs = 1_000_000;
+let fetchCalls: { url: string; body?: string; headers?: Record<string, string> }[] = [];
+let fetchResponder: (url: string) => Response | Promise<Response> = () => new Response('{}', { status: 500 });
+let openedUrls: string[] = [];
+
+beforeEach(() => {
+  storage = memStorage();
+  nowMs = 1_000_000;
+  fetchCalls = [];
+  openedUrls = [];
+  resetGenericOAuthMemoryCache();
+  configureGenericOAuth({
+    storage,
+    now: () => nowMs,
+    fetchImpl: (async (url: RequestInfo | URL, init?: RequestInit) => {
+      fetchCalls.push({
+        url: String(url),
+        body: init?.body ? String(init.body) : undefined,
+        headers: (init?.headers ?? undefined) as Record<string, string> | undefined,
+      });
+      return fetchResponder(String(url));
+    }) as typeof fetch,
+    openExternal: async (url) => {
+      openedUrls.push(url);
+    },
+    sleep: async (ms) => {
+      nowMs += ms;
+    },
+  });
+});
+
+afterEach(() => {
+  resetGenericOAuthMemoryCache();
+  setOAuthTokenReader(() => null);
+});
+
+function seedBlob(providerId: string, blob: Record<string, unknown>): void {
+  storage.map.set(providerId, JSON.stringify(blob));
+  resetGenericOAuthMemoryCache(); // 让下次读走注入 storage
+}
+
+describe('Copilot account-specific model discovery (#6663)', () => {
+  it.each(['individual', 'business', 'enterprise'] as const)('uses the %s account host for automatic model discovery', async account => {
+    const oauth = providerPresetOAuth('github-copilot')!;
+    const token = `test-token;proxy-ep=proxy.${account}.githubcopilot.com;exp=9999999999`;
+    seedBlob('copilot-account', { access_token: token });
+    fetchResponder = () => new Response('{"data":[{"id":"test-model"}]}');
+    const original = 'https://api.individual.githubcopilot.com';
+    const expected = `https://api.${account}.githubcopilot.com/models`;
+    // Regression: login derives the URL from the preset, unlike the old fixture
+    // which supplied /models and concealed the erroneous /v1/models request.
+    const automatic = await discoverGenericOAuthModels('copilot-account', oauth, deriveModelsDiscoveryUrl(original), 'pi');
+    expect(automatic).toMatchObject([{ id: 'test-model' }]);
+    expect(fetchCalls.map(call => call.url)).toEqual([expected]);
+    expect(fetchCalls[0].headers).toMatchObject({ 'copilot-integration-id': 'vscode-chat' });
+  });
+
+  it.each(['individual', 'business', 'enterprise'] as const)('uses the %s account host when refreshing saved model lists', async account => {
+    const oauth = providerPresetOAuth('github-copilot')!;
+    const token = `test-token;proxy-ep=proxy.${account}.githubcopilot.com;exp=9999999999`;
+    seedBlob('copilot-account', { access_token: token });
+    const original = 'https://api.individual.githubcopilot.com';
+    const expected = `https://api.${account}.githubcopilot.com/models`;
+    const requests: string[] = [];
+    const provider: ProviderView = {
+      id: 'copilot-account', name: 'Copilot', source: 'user', connected: true,
+      auth: { method: 'oauth', oauth }, agents: ['pi'], models: {},
+      routing: { pi: { upstream: original, authStrategy: 'oauth-token', wireProtocol: 'openai-chat' } },
+    };
+    const saved = await fetchSavedOAuthProviderModels(provider, 'pi', 'copilot-account', () => true,
+      async (url, init) => {
+        requests.push(String(url));
+        expect(init?.headers).toMatchObject({ authorization: `Bearer ${token}`, 'copilot-integration-id': 'vscode-chat' });
+        return new Response('{"data":[{"id":"test-model"}]}');
+      });
+    expect(saved).toMatchObject({ ok: true, models: [{ id: 'test-model' }] });
+    expect(requests).toEqual([expected]);
+  });
+
+  it.each([
+    ['proxy-ep=proxy.business.githubcopilot.com.evil.test;', 'https://api.individual.githubcopilot.com/models'],
+    ['proxy-ep=proxy.business.githubcopilot.com;', 'https://custom.example/models'],
+  ])('preserves custom URLs and rejects untrusted token destinations', async (token, url) => {
+    seedBlob('copilot-account', { access_token: token });
+    fetchResponder = () => new Response('{"data":[{"id":"test-model"}]}');
+    await discoverGenericOAuthModels('copilot-account', providerPresetOAuth('github-copilot')!, url, 'pi');
+    expect(fetchCalls.map(call => call.url)).toEqual([url]);
+  });
+});
+
+describe('manual model refresh for saved OAuth providers', () => {
+  function savedProvider(presetId = 'openrouter'): ProviderView {
+    const baseUrl = presetId === 'nous'
+      ? 'https://inference-api.nousresearch.com/v1' : 'https://openrouter.ai/api/v1';
+    return {
+      id: `${presetId}-account`, name: presetId, source: 'user', connected: true,
+      auth: { method: 'oauth', oauth: providerPresetOAuth(presetId)! },
+      agents: ['claude-code', 'codex', 'pi'], models: {},
+      routing: Object.fromEntries(['claude-code', 'codex', 'pi'].map(agent => [agent, {
+        upstream: baseUrl, wireProtocol: 'openai-chat', authStrategy: 'oauth-token',
+      }])),
+    };
+  }
+
+  // Unit: refresh must reuse the saved login for both OpenRouter catalogs. The
+  // former single-response fixture rejected the speech URL and hid its models.
+  for (const presetId of ['openrouter', 'nous']) {
+    it.each(['claude-code', 'codex', 'pi'] as const)(`${presetId} refresh uses the saved login and upstream protocol for %s`, async agent => {
+      const provider = savedProvider(presetId);
+      // Display IDs and owner-scoped storage IDs deliberately differ.
+      seedBlob('scoped-account', { access_token: 'fake-oauth-access' });
+      const requests: string[] = [];
+      const result = await fetchSavedOAuthProviderModels(provider, agent, 'scoped-account', () => true,
+        async (url, init) => {
+          requests.push(String(url));
+          expect(init?.headers).toEqual({ authorization: 'Bearer fake-oauth-access' });
+          expect(init?.redirect).toBe('error');
+          if (new URL(String(url)).searchParams.get('output_modalities') === 'speech') {
+            return new Response(JSON.stringify({ data: [{
+              id: 'minimax/speech-2.8-turbo', architecture: { output_modalities: ['speech'] },
+            }] }));
+          }
+          return new Response(JSON.stringify({ data: [{ id: 'new-model', context_length: 123456 }] }));
+        });
+      const modelsUrl = provider.auth.oauth!.modelsDiscoveryUrl!;
+      expect(requests).toEqual(presetId === 'openrouter'
+        ? [modelsUrl, `${modelsUrl}?output_modalities=speech`] : [modelsUrl]);
+      expect(result).toMatchObject({ ok: true, models: [
+        { id: 'new-model', contextWindow: 123456 },
+        ...(presetId === 'openrouter' ? [{
+          id: 'minimax/speech-2.8-turbo', discoveredMetadata: { mode: 'audio_speech' },
+        }] : []),
+      ] });
+      expect(JSON.stringify(result)).not.toContain('fake-oauth-access');
+    });
+  }
+
+  it('renews an expiring login before fetching the model list', async () => {
+    const provider = savedProvider('nous');
+    seedBlob('scoped-account', { access_token: 'fake-expired', refresh_token: 'fake-refresh', expires_at: nowMs + 1000 });
+    fetchResponder = () => new Response(JSON.stringify({ access_token: 'fake-renewed', expires_in: 3600 }));
+    const result = await fetchSavedOAuthProviderModels(provider, 'pi', 'scoped-account', () => true,
+      async (_url, init) => {
+        expect(init?.headers).toEqual({ authorization: 'Bearer fake-renewed' });
+        return new Response('{"data":["new-model"]}');
+      });
+    expect(result.ok).toBe(true);
+    expect(fetchCalls).toHaveLength(1);
+    expect(fetchCalls[0]?.url).toBe(provider.auth.oauth!.tokenUrl);
+  });
+
+  it('forwards saved non-credential headers on OAuth model refresh', async () => {
+    const provider = savedProvider();
+    seedBlob('scoped-account', { access_token: 'fake-oauth-access' });
+    const result = await fetchSavedOAuthProviderModels(
+      provider, 'pi', 'scoped-account', () => true,
+      async (_url, init) => {
+        expect(init?.headers).toEqual({
+          authorization: 'Bearer fake-oauth-access',
+          'x-tenant': 'acme',
+        });
+        return new Response('{"data":["new-model"]}');
+      },
+      { 'X-Tenant': 'acme', Authorization: 'should-not-win' },
+    );
+    expect(result).toMatchObject({ ok: true, models: [{ id: 'new-model' }] });
+  });
+
+  it('does not issue a public unauthenticated request when the login is gone', async () => {
+    let requests = 0;
+    const result = await fetchSavedOAuthProviderModels(savedProvider(), 'pi', 'missing-account', () => true,
+      async () => { requests++; return new Response('{"data":["model"]}'); });
+    expect(result).toEqual({ ok: false, code: 'AUTH_INVALID' });
+    expect(requests).toBe(0);
+  });
+
+  // A new catalog must not reuse a revoked owner snapshot or publish a late result.
+  // Keep the original one-request maximum when ownership changes on the first reply.
+  it.each(['before-request', 'during-request', 'during-speech-request'])('discards a refresh after account/config changes %s', async phase => {
+    seedBlob('scoped-account', { access_token: 'fake-access' });
+    let current = phase !== 'before-request';
+    let requests = 0;
+    const result = await fetchSavedOAuthProviderModels(savedProvider(), 'pi', 'scoped-account', () => current,
+      async () => {
+        requests++;
+        if (phase === 'during-request' || requests === 2) current = false;
+        return new Response('{"data":["model"]}');
+      });
+    expect(result).toEqual({ ok: false, code: 'AUTH_INVALID' });
+    expect(requests).toBe(phase === 'before-request' ? 0 : phase === 'during-request' ? 1 : 2);
+  });
+});
+
+describe('blob 读写 / has / logout', () => {
+  it('无凭证 → has=false、token=null；写入后可读；logout 清空', () => {
+    expect(hasGenericOAuthLogin('acme')).toBe(false);
+    seedBlob('acme', { access_token: 'at-1' });
+    expect(hasGenericOAuthLogin('acme')).toBe(true);
+    expect(readCachedGenericOAuthAccessToken('acme', OAUTH)).toBe('at-1');
+    logoutGenericOAuth('acme');
+    expect(hasGenericOAuthLogin('acme')).toBe(false);
+    expect(storage.map.has('acme')).toBe(false);
+  });
+
+  it('坏 JSON blob 安全兜底为未登录', () => {
+    storage.map.set('acme', 'not-json');
+    resetGenericOAuthMemoryCache();
+    expect(hasGenericOAuthLogin('acme')).toBe(false);
+  });
+
+  it('可回滚删除会在配置写失败后恢复原 OAuth blob', () => {
+    seedBlob('acme', { access_token: 'at-1', refresh_token: 'rt-1' });
+
+    const restore = removeGenericOAuthCredentialsReversibly('acme');
+    expect(restore).not.toBeNull();
+    expect(storage.map.has('acme')).toBe(false);
+    expect(restore?.()).toBe(true);
+
+    resetGenericOAuthMemoryCache();
+    expect(readCachedGenericOAuthAccessToken('acme', OAUTH)).toBe('at-1');
+  });
+
+  it('冷缓存严格快照不可读时在删除前中止，不把现有凭证误判成缺失', () => {
+    storage.map.set('acme', JSON.stringify({ access_token: 'at-1' }));
+    const remove = storage.remove;
+    storage.remove = () => {
+      throw new Error('must not remove');
+    };
+    storage.readStrict = () => {
+      throw new Error('safeStorage unavailable');
+    };
+    resetGenericOAuthMemoryCache();
+
+    expect(removeGenericOAuthCredentialsReversibly('acme')).toBeNull();
+    expect(storage.map.get('acme')).toContain('at-1');
+
+    storage.remove = remove;
+  });
+
+  it('回滚按原始字符串恢复持久 blob，同时恢复删除前的热缓存', () => {
+    const raw = '{ "access_token": "durable", "refresh_token": "rt" }';
+    storage.map.set('acme', raw);
+    resetGenericOAuthMemoryCache();
+    expect(readCachedGenericOAuthAccessToken('acme', OAUTH)).toBe('durable');
+
+    const restore = removeGenericOAuthCredentialsReversibly('acme');
+    expect(restore?.()).toBe(true);
+    expect(storage.map.get('acme')).toBe(raw);
+    expect(readCachedGenericOAuthAccessToken('acme', OAUTH)).toBe('durable');
+  });
+
+  it('凭证删除失败时保留当前登录态并返回失败', () => {
+    seedBlob('acme', { access_token: 'at-1' });
+    storage.remove = () => false;
+
+    expect(logoutGenericOAuth('acme')).toBe(false);
+    expect(hasGenericOAuthLogin('acme')).toBe(true);
+  });
+});
+
+describe('临期刷新（单飞）', () => {
+  it.each(['claude-code', 'codex', 'pi'] as const)('waits for the production OAuth route on %s and closes refresh failures locally', async agent => {
+    setActiveCatalog({ version: 't', providers: [{
+      id: 'acme', name: 'Acme', source: 'builtin', agents: [agent],
+      auth: { method: 'oauth', oauth: OAUTH },
+      routing: { [agent]: { upstream: 'https://api.acme.example', authStrategy: 'oauth-token', wireProtocol: 'openai-chat' } },
+      models: { [agent]: [{ id: 'acme-1', name: 'A1', contextWindow: 1000, efforts: [], defaultEffort: null }] },
+    }] });
+    setSessionProvider('oauth-race', 'acme');
+    seedBlob('acme', { access_token: 'fake-expired', refresh_token: 'fake-refresh', expires_at: nowMs - 1 });
+    let release!: (response: Response) => void;
+    fetchResponder = () => new Promise<Response>(resolve => { release = resolve; });
+    setOAuthTokenReader(id => readGenericOAuthAccessToken(id, OAUTH));
+    let resolved = false;
+    const decision = Promise.resolve(resolveSessionRouteDecision('oauth-race', agent, null)).then(value => {
+      resolved = true;
+      return value;
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(resolved).toBe(false);
+    release(new Response(JSON.stringify({ access_token: 'fake-fresh', expires_in: 3600 })));
+    expect((await decision)?.headerOverride?.authorization).toBe('Bearer fake-fresh');
+
+    seedBlob('acme', { access_token: 'fake-expired', refresh_token: 'fake-refresh', expires_at: nowMs - 1 });
+    fetchResponder = () => new Response('{}', { status: 503 });
+    const failed = await resolveSessionRouteDecision('oauth-race', agent, null);
+    expect(failed?.localHandler).toBeTypeOf('function');
+    expect(failed?.upstreamOverride).toBeUndefined();
+    expect(failed?.headerOverride).toBeUndefined();
+  });
+
+  it('invalidates a session route when the connection changes while awaiting refresh', async () => {
+    setActiveCatalog({ version: 't', providers: [{ id: 'acme', name: 'Acme', source: 'builtin',
+      agents: ['pi'], auth: { method: 'oauth', oauth: OAUTH },
+      routing: { pi: { upstream: 'https://api.acme.example', authStrategy: 'oauth-token', wireProtocol: 'openai-chat' } },
+      models: { pi: [] },
+    }] });
+    setSessionProvider('oauth-config-race', 'acme');
+    let release!: (token: string) => void;
+    setOAuthTokenReader(() => new Promise<string>(resolve => { release = resolve; }));
+    const decision = resolveSessionRouteDecision('oauth-config-race', 'pi', null);
+    await Promise.resolve();
+    const finish = beginProviderRouteMutation('acme');
+    finish.commit();
+    finish();
+    release('fake-new-token');
+    expect((await decision)?.localHandler).toBeTypeOf('function');
+  });
+
+  // #7942: 生产模型发现入口；用挂起的刷新响应验证首个请求的凭证与出站顺序。
+  // 内存存储和 fetch 注入，不访问真实账号、网络或系统钥匙串。
+  it('does not dispatch model discovery until an expired credential refresh completes', async () => {
+    seedBlob('acme', { access_token: 'fake-expired', refresh_token: 'fake-refresh', expires_at: nowMs - 1 });
+    let release!: (response: Response) => void;
+    const refreshing = new Promise<Response>(resolve => { release = resolve; });
+    fetchResponder = url => url === OAUTH.tokenUrl
+      ? refreshing : new Response(JSON.stringify({ data: [{ id: 'test-model' }] }));
+    const discovery = discoverGenericOAuthModels('acme', OAUTH);
+    await Promise.resolve();
+    await Promise.resolve();
+    const beforeRelease = fetchCalls.filter(call => call.url === OAUTH.modelsDiscoveryUrl);
+    release(new Response(JSON.stringify({ access_token: 'fake-fresh', expires_in: 3600 })));
+    await discovery;
+    expect(beforeRelease).toHaveLength(0);
+    expect(fetchCalls.filter(call => call.url === OAUTH.modelsDiscoveryUrl)).toEqual([
+      expect.objectContaining({ headers: expect.objectContaining({ authorization: 'Bearer fake-fresh' }) }),
+    ]);
+  });
+
+  it('临期 + refresh_token → 交换新 token 并落盘', async () => {
+    seedBlob('acme', { access_token: 'old', refresh_token: 'rt-1', expires_at: nowMs + 1_000 });
+    fetchResponder = () =>
+      new Response(
+        JSON.stringify({ access_token: 'new', refresh_token: 'rt-2', expires_in: 3600 }),
+        { status: 200 },
+      );
+    await refreshGenericOAuthIfNeeded('acme', OAUTH);
+    expect(readCachedGenericOAuthAccessToken('acme', OAUTH)).toBe('new');
+    expect(fetchCalls[0]?.url).toBe(OAUTH.tokenUrl);
+    expect(fetchCalls[0]?.body).toContain('grant_type=refresh_token');
+    expect(fetchCalls[0]?.body).toContain('refresh_token=rt-1');
+  });
+
+  it('未临期 / 无 refresh_token → 不发请求', async () => {
+    seedBlob('acme', { access_token: 'ok', expires_at: nowMs + 10 * 60_000 });
+    await refreshGenericOAuthIfNeeded('acme', OAUTH);
+    expect(fetchCalls).toHaveLength(0);
+  });
+
+  it('刷新期间登出 → 不回写（撤销登出是禁止的）', async () => {
+    seedBlob('acme', { access_token: 'old', refresh_token: 'rt-1', expires_at: nowMs + 1_000 });
+    fetchResponder = () => {
+      // 刷新响应到达前用户登出。
+      logoutGenericOAuth('acme');
+      return new Response(JSON.stringify({ access_token: 'new', expires_in: 3600 }), {
+        status: 200,
+      });
+    };
+    await refreshGenericOAuthIfNeeded('acme', OAUTH);
+    expect(hasGenericOAuthLogin('acme')).toBe(false);
+  });
+
+  it('cached status reads do not start refresh requests', () => {
+    seedBlob('acme', { access_token: 'fake-old', refresh_token: 'fake-refresh', expires_at: nowMs - 1 });
+    expect(readCachedGenericOAuthAccessToken('acme', OAUTH)).toBe('fake-old');
+    expect(fetchCalls).toHaveLength(0);
+  });
+
+  it('shares one successful refresh across concurrent readers and returns the rotated token to all of them', async () => {
+    seedBlob('acme', { access_token: 'fake-old', refresh_token: 'fake-refresh', expires_at: nowMs - 1 });
+    let release!: (response: Response) => void;
+    fetchResponder = () => new Promise<Response>(resolve => { release = resolve; });
+    const requests = Array.from({ length: 8 }, () => readGenericOAuthAccessToken('acme', OAUTH));
+    expect(fetchCalls).toHaveLength(1);
+    release(new Response(JSON.stringify({ access_token: 'fake-fresh', refresh_token: 'fake-rotated', expires_in: 3600 })));
+    expect(await Promise.all(requests)).toEqual(Array(8).fill('fake-fresh'));
+    expect(fetchCalls).toHaveLength(1);
+  });
+
+  it.each([503, 200])('shares a failed refresh (%s) and rejects expired credentials for every waiter', async status => {
+    seedBlob('acme', { access_token: 'fake-old', refresh_token: 'fake-refresh', expires_at: nowMs - 1 });
+    let release!: (response: Response) => void;
+    fetchResponder = () => new Promise<Response>(resolve => { release = resolve; });
+    const requests = Array.from({ length: 8 }, () => readGenericOAuthAccessToken('acme', OAUTH));
+    expect(fetchCalls).toHaveLength(1);
+    release(new Response('{}', { status }));
+    const results = await Promise.allSettled(requests);
+    expect(results.every(result => result.status === 'rejected')).toBe(true);
+    expect(fetchCalls).toHaveLength(1);
+    fetchResponder = () => new Response(JSON.stringify({ access_token: 'fake-recovered', expires_in: 3600 }));
+    await expect(readGenericOAuthAccessToken('acme', OAUTH)).resolves.toBe('fake-recovered');
+    expect(fetchCalls).toHaveLength(2);
+  });
+
+  it.each(['logout', 'reset', 'relogin'] as const)('discards late refresh and cancels the old reader after %s', async action => {
+    seedBlob('acme', { access_token: 'fake-old', refresh_token: 'fake-same-refresh', expires_at: nowMs - 1 });
+    let release!: (response: Response) => void;
+    fetchResponder = () => new Promise<Response>(resolve => { release = resolve; });
+    const request = readGenericOAuthAccessToken('acme', OAUTH);
+    if (action === 'reset') resetGenericOAuthMemoryCache();
+    else logoutGenericOAuth('acme');
+    if (action === 'relogin') seedBlob('acme', {
+      access_token: 'fake-new-login', refresh_token: 'fake-same-refresh', expires_at: nowMs + 3600_000,
+    });
+    release(new Response(JSON.stringify({ access_token: 'fake-late', refresh_token: 'fake-late-refresh', expires_in: 3600 })));
+    await expect(request).rejects.toThrow('provider_oauth_login_changed');
+    expect(readCachedGenericOAuthAccessToken('acme', OAUTH)).toBe(
+      action === 'relogin' ? 'fake-new-login' : action === 'reset' ? 'fake-old' : null,
+    );
+  });
+
+  it('keeps a still-valid credential after a temporary refresh failure, but rejects it at expiry', async () => {
+    seedBlob('acme', { access_token: 'fake-valid', refresh_token: 'fake-refresh', expires_at: nowMs + 1000 });
+    fetchResponder = () => new Response('{}', { status: 503 });
+    await expect(readGenericOAuthAccessToken('acme', OAUTH)).resolves.toBe('fake-valid');
+    nowMs += 1000;
+    await expect(readGenericOAuthAccessToken('acme', OAUTH)).rejects.toThrow('provider_oauth_refresh_failed');
+  });
+
+  it('rejects an expired token without refresh credentials or a descriptor', async () => {
+    seedBlob('acme', { access_token: 'fake-expired', expires_at: nowMs - 1 });
+    await expect(readGenericOAuthAccessToken('acme', OAUTH)).rejects.toThrow('provider_oauth_refresh_failed');
+    await expect(readGenericOAuthAccessToken('acme', undefined)).rejects.toThrow('provider_oauth_refresh_failed');
+    expect(fetchCalls).toHaveLength(0);
+  });
+
+});
+
+describe('登录流与凭证落盘失败', () => {
+  /** 模拟浏览器授权：解析授权 URL 里的回调地址与 state，回打回环回调（fire-and-forget——
+   *  回调响应要等 succeed()/close() 才写回，await 会与登录流互相等死锁）。 */
+  function autoAuthorize(): void {
+    configureGenericOAuth({
+      openExternal: async (authUrl) => {
+        const u = new URL(authUrl);
+        const redirect = u.searchParams.get('redirect_uri')!;
+        const state = u.searchParams.get('state')!;
+        void fetch(`${redirect}?code=code-1&state=${encodeURIComponent(state)}`).catch(() => {});
+      },
+    });
+  }
+
+  it('成功路径：token 交换后凭证落盘 + 内存可读', async () => {
+    autoAuthorize();
+    fetchResponder = () =>
+      new Response(
+        JSON.stringify({ access_token: 'at-new', refresh_token: 'rt', expires_in: 3600 }),
+        { status: 200 },
+      );
+    const res = await runGenericOAuthLogin({ id: 'acme', name: 'Acme' }, OAUTH);
+    expect(res.ok).toBe(true);
+    expect(hasGenericOAuthLogin('acme')).toBe(true);
+    expect(JSON.parse(storage.map.get('acme')!).access_token).toBe('at-new');
+  });
+
+  it('迟到取消只回滚本次登录写入的凭证，不误删更新的 blob', async () => {
+    autoAuthorize();
+    fetchResponder = () =>
+      new Response(JSON.stringify({ access_token: 'at-new', expires_in: 3600 }), { status: 200 });
+    let rollback: (() => boolean) | undefined;
+
+    const res = await runGenericOAuthLogin({ id: 'acme', name: 'Acme' }, OAUTH, {
+      onCredentialPersisted: (fn) => {
+        rollback = fn;
+      },
+    });
+    expect(res.ok).toBe(true);
+    expect(rollback).toBeTypeOf('function');
+
+    storage.map.set('acme', JSON.stringify({ access_token: 'newer-login' }));
+    expect(rollback?.()).toBe(true);
+    expect(JSON.parse(storage.map.get('acme')!).access_token).toBe('newer-login');
+  });
+
+  it('取消回滚用严格持久读取核对本次 token，不受热路径 fail-soft 读取影响', async () => {
+    autoAuthorize();
+    fetchResponder = () =>
+      new Response(JSON.stringify({ access_token: 'at-new', expires_in: 3600 }), { status: 200 });
+    let rollback: (() => boolean) | undefined;
+
+    await runGenericOAuthLogin({ id: 'acme', name: 'Acme' }, OAUTH, {
+      onCredentialPersisted: (fn) => {
+        rollback = fn;
+      },
+    });
+    storage.read = () => null;
+
+    expect(rollback?.()).toBe(true);
+    expect(storage.map.has('acme')).toBe(false);
+  });
+
+  it('取消回滚无法严格核对持久 token 时报告失败并保留凭证', async () => {
+    autoAuthorize();
+    fetchResponder = () =>
+      new Response(JSON.stringify({ access_token: 'at-new', expires_in: 3600 }), { status: 200 });
+    let rollback: (() => boolean) | undefined;
+
+    await runGenericOAuthLogin({ id: 'acme', name: 'Acme' }, OAUTH, {
+      onCredentialPersisted: (fn) => {
+        rollback = fn;
+      },
+    });
+    storage.readStrict = () => {
+      throw new Error('safeStorage unavailable');
+    };
+
+    expect(rollback?.()).toBe(false);
+    expect(JSON.parse(storage.map.get('acme')!).access_token).toBe('at-new');
+  });
+
+  it('登录时 storage.write 失败 → 硬失败且不留「已连接」内存态（回归：防重启后授权静默丢失）', async () => {
+    autoAuthorize();
+    storage.write = () => false;
+    fetchResponder = () =>
+      new Response(JSON.stringify({ access_token: 'at-new', expires_in: 3600 }), { status: 200 });
+    const res = await runGenericOAuthLogin({ id: 'acme', name: 'Acme' }, OAUTH);
+    expect(res.ok).toBe(false);
+    expect(res.reason).toContain('安全存储');
+    expect(hasGenericOAuthLogin('acme')).toBe(false);
+    expect(storage.map.has('acme')).toBe(false);
+  });
+
+  it('刷新时 storage.write 失败 → 内存态仍更新（会话不断链），盘上保持旧值', async () => {
+    seedBlob('acme', { access_token: 'old', refresh_token: 'rt-1', expires_at: nowMs + 1_000 });
+    storage.write = () => false;
+    fetchResponder = () =>
+      new Response(JSON.stringify({ access_token: 'new', expires_in: 3600 }), { status: 200 });
+    await refreshGenericOAuthIfNeeded('acme', OAUTH);
+    expect(readCachedGenericOAuthAccessToken('acme', OAUTH)).toBe('new'); // 内存态已是新 token
+    expect(JSON.parse(storage.map.get('acme')!).access_token).toBe('old'); // 盘上还是旧值
+  });
+
+  it('Device Grant：展示一次性代码，按 pending / slow_down 轮询并安全落盘', async () => {
+    const waits: number[] = [];
+    configureGenericOAuth({ sleep: async (ms) => void waits.push(ms) });
+    let tokenPolls = 0;
+    fetchResponder = (url) => {
+      if (url === DEVICE_OAUTH.deviceAuthorizationUrl) {
+        return new Response(
+          JSON.stringify({
+            device_code: 'secret-device-code',
+            user_code: 'ABCD-EFGH',
+            verification_uri: 'https://auth.acme.example/device',
+            verification_uri_complete: 'https://auth.acme.example/device?user_code=ABCD-EFGH',
+            expires_in: 600,
+            interval: 1,
+          }),
+          { status: 200 },
+        );
+      }
+      tokenPolls += 1;
+      if (tokenPolls === 1) {
+        return new Response(JSON.stringify({ error: 'authorization_pending' }), { status: 400 });
+      }
+      if (tokenPolls === 2) {
+        return new Response(JSON.stringify({ error: 'slow_down' }), { status: 400 });
+      }
+      return new Response(
+        JSON.stringify({
+          access_token: 'device-access',
+          refresh_token: 'device-refresh',
+          expires_in: 3600,
+        }),
+        { status: 200 },
+      );
+    };
+    const progress: unknown[] = [];
+
+    const result = await runGenericOAuthLogin(
+      { id: 'device', name: 'Device Provider' },
+      DEVICE_OAUTH,
+      { onProgress: (event) => progress.push(event) },
+    );
+
+    expect(result).toEqual({ ok: true });
+    expect(progress).toEqual([
+      {
+        phase: 'device-code',
+        verificationUrl: 'https://auth.acme.example/device?user_code=ABCD-EFGH',
+        userCode: 'ABCD-EFGH',
+        expiresAt: nowMs + 10 * 60_000,
+      },
+    ]);
+    expect(waits).toEqual([1_000, 1_000, 6_000]);
+    expect(openedUrls).toEqual([]);
+    expect(new URLSearchParams(fetchCalls[0]?.body).get('client_id')).toBe('device-client-1');
+    expect(new URLSearchParams(fetchCalls[1]?.body).get('grant_type')).toBe(
+      'urn:ietf:params:oauth:grant-type:device_code',
+    );
+    const persisted = storage.map.get('device')!;
+    expect(JSON.parse(persisted).access_token).toBe('device-access');
+    expect(persisted).not.toContain('secret-device-code');
+    expect(persisted).not.toContain('ABCD-EFGH');
+  });
+
+  it('Device Grant：持续 pending 时按注入时钟到期，不会无限轮询', async () => {
+    let tokenPolls = 0;
+    fetchResponder = (url) => {
+      if (url === DEVICE_OAUTH.deviceAuthorizationUrl) {
+        return new Response(
+          JSON.stringify({
+            device_code: 'secret-device-code',
+            user_code: 'ABCD-EFGH',
+            verification_uri: 'https://auth.acme.example/device',
+            expires_in: 2,
+            interval: 1,
+          }),
+          { status: 200 },
+        );
+      }
+      tokenPolls += 1;
+      return new Response(JSON.stringify({ error: 'authorization_pending' }), { status: 400 });
+    };
+
+    const result = await runGenericOAuthLogin(
+      { id: 'device', name: 'Device Provider' },
+      DEVICE_OAUTH,
+      { onProgress: () => undefined },
+    );
+
+    expect(result).toEqual({ ok: false, reason: 'device_code_expired' });
+    expect(tokenPolls).toBe(2);
+    expect(nowMs).toBe(1_002_000);
+    expect(storage.map.has('device')).toBe(false);
+  });
+
+  it('Device Grant：标准 client_id/scope 不会被扩展参数覆盖', async () => {
+    fetchResponder = () => new Response('{}', { status: 200 });
+    const result = await runGenericOAuthLogin(
+      { id: 'device', name: 'Device Provider' },
+      {
+        ...DEVICE_OAUTH,
+        extraDeviceParams: {
+          client_id: 'wrong-client',
+          scope: 'wrong-scope',
+          audience: 'models',
+        },
+      },
+    );
+
+    expect(result).toEqual({
+      ok: false,
+      reason: 'invalid_device_authorization_response',
+    });
+    const body = new URLSearchParams(fetchCalls[0]?.body);
+    expect(body.getAll('client_id')).toEqual(['device-client-1']);
+    expect(body.getAll('scope')).toEqual(['openid offline_access']);
+    expect(body.get('audience')).toBe('models');
+  });
+
+  it('Authorization Code：标准 PKCE 参数不会被扩展参数或端点 query 覆盖', async () => {
+    configureGenericOAuth({
+      openExternal: async (authUrl) => {
+        openedUrls.push(authUrl);
+        cancelGenericOAuthLogin('acme');
+      },
+    });
+    const result = await runGenericOAuthLogin(
+      { id: 'acme', name: 'Acme' },
+      {
+        ...OAUTH,
+        authorizeUrl: `${OAUTH.authorizeUrl}?client_id=endpoint-client`,
+        extraAuthParams: {
+          client_id: 'wrong-client',
+          scope: 'wrong-scope',
+          audience: 'models',
+        },
+      },
+    );
+
+    expect(result).toEqual({ ok: false, reason: 'login_cancelled' });
+    const authUrl = new URL(openedUrls[0]!);
+    expect(authUrl.searchParams.getAll('client_id')).toEqual(['client-1']);
+    expect(authUrl.searchParams.getAll('scope')).toEqual(['openid offline_access']);
+    expect(authUrl.searchParams.get('audience')).toBe('models');
+  });
+
+  it('Device Grant：进度回调后取消，不再轮询或写入凭证', async () => {
+    fetchResponder = () =>
+      new Response(
+        JSON.stringify({
+          device_code: 'secret-device-code',
+          user_code: 'ABCD-EFGH',
+          verification_uri: 'https://auth.acme.example/device',
+          expires_in: 600,
+        }),
+        { status: 200 },
+      );
+
+    const result = await runGenericOAuthLogin(
+      { id: 'device', name: 'Device Provider' },
+      DEVICE_OAUTH,
+      { onProgress: () => cancelGenericOAuthLogin('device') },
+    );
+
+    expect(result).toEqual({ ok: false, reason: 'login_cancelled' });
+    expect(fetchCalls).toHaveLength(1);
+    expect(storage.map.has('device')).toBe(false);
+  });
+
+  it('Device Grant：拒绝非 https 验证页响应', async () => {
+    fetchResponder = () =>
+      new Response(
+        JSON.stringify({
+          device_code: 'secret-device-code',
+          user_code: 'ABCD-EFGH',
+          verification_uri: 'http://auth.acme.example/device',
+          expires_in: 600,
+        }),
+        { status: 200 },
+      );
+
+    const result = await runGenericOAuthLogin(
+      { id: 'device', name: 'Device Provider' },
+      DEVICE_OAUTH,
+    );
+    expect(result).toEqual({
+      ok: false,
+      reason: 'invalid_device_authorization_response',
+    });
+  });
+});
+
+describe('discoverGenericOAuthModels', () => {
+  // PR #6900 unit regression: the login follow-up (unlike saved refresh) could
+  // send more Bearer requests after cancellation. Hold a real catalog response
+  // at each async boundary; no subsequent page or late result may escape.
+  it.each(['before-request', 'first-page', 'next-page', 'speech-page', 'active'] as const)(
+    'checks login ownership before every catalog request: %s', async (phase) => {
+      seedBlob('router', { access_token: 'fake-login-key' });
+      const oauth = providerPresetOAuth('openrouter')!;
+      const endpoint = oauth.modelsDiscoveryUrl!;
+      let current = phase !== 'before-request';
+      let release!: (value: unknown) => void;
+      const waiting = new Promise<unknown>(resolve => { release = resolve; });
+      const pausedUrl = phase === 'next-page' ? `${endpoint}?cursor=next`
+        : phase === 'speech-page' ? `${endpoint}?output_modalities=speech` : endpoint;
+      fetchResponder = (url) => {
+        const payload = url.includes('output_modalities=speech')
+          ? { data: [{ id: 'tts', architecture: { output_modalities: ['speech'] } }] }
+          : { data: ['chat'], ...(url === endpoint ? { next_cursor: 'next' } : {}) };
+        const response = new Response(JSON.stringify(payload));
+        if (url === pausedUrl && current && phase !== 'active') {
+          response.json = () => waiting.then(() => payload);
+        }
+        return response;
+      };
+      const pending = discoverGenericOAuthModels('router', oauth, undefined, 'claude-code', () => current);
+      if (phase !== 'before-request' && phase !== 'active') {
+        await vi.waitFor(() => expect(fetchCalls.at(-1)?.url).toBe(pausedUrl));
+        current = false;
+        release(undefined);
+      }
+      const result = await pending;
+      expect(fetchCalls.map(({ url }) => url)).toEqual(
+        phase === 'before-request' ? [] : [endpoint,
+          ...(['next-page', 'speech-page', 'active'].includes(phase) ? [`${endpoint}?cursor=next`] : []),
+          ...(['speech-page', 'active'].includes(phase) ? [`${endpoint}?output_modalities=speech`] : []),
+        ],
+      );
+      for (const request of fetchCalls) expect(request.headers).toEqual({ authorization: 'Bearer fake-login-key' });
+      if (phase === 'active') expect(result?.map(model => model.id)).toEqual(['chat', 'tts']);
+      else expect(result).toBeNull();
+    },
+  );
+
+  it('解析 {data:[{id}]} 形状并去重', async () => {
+    seedBlob('acme', { access_token: 'at' });
+    fetchResponder = () =>
+      new Response(JSON.stringify({ data: [{ id: 'm-1' }, { id: 'm-2' }, { id: 'm-1' }] }), {
+        status: 200,
+      });
+    const models = await discoverGenericOAuthModels('acme', OAUTH);
+    expect(models).toEqual([
+      { id: 'm-1', name: 'm-1', discoveredMetadata: {} },
+      { id: 'm-2', name: 'm-2', discoveredMetadata: {} },
+    ]);
+  });
+
+  it('未登录 / 非 2xx / 坏形状 → null', async () => {
+    expect(await discoverGenericOAuthModels('acme', OAUTH)).toBeNull(); // 未登录
+    seedBlob('acme', { access_token: 'at' });
+    fetchResponder = () => new Response('{}', { status: 401 });
+    expect(await discoverGenericOAuthModels('acme', OAUTH)).toBeNull();
+    fetchResponder = () => new Response('{"weird":true}', { status: 200 });
+    expect(await discoverGenericOAuthModels('acme', OAUTH)).toBeNull();
+  });
+
+  it('cc-wire 发现请求带 anthropic-version(缺失会被 Anthropic 兼容端点 400 拒);codex/缺省不带', async () => {
+    seedBlob('acme', { access_token: 'at' });
+    fetchResponder = () => new Response(JSON.stringify({ data: [{ id: 'm' }] }), { status: 200 });
+    await discoverGenericOAuthModels('acme', OAUTH, undefined, 'claude-code');
+    expect(fetchCalls[0]?.headers).toEqual({
+      authorization: 'Bearer at',
+      'anthropic-version': '2023-06-01',
+    });
+    await discoverGenericOAuthModels('acme', OAUTH, undefined, 'codex');
+    expect(fetchCalls[1]?.headers).toEqual({ authorization: 'Bearer at' });
+    await discoverGenericOAuthModels('acme', OAUTH);
+    expect(fetchCalls[2]?.headers).toEqual({ authorization: 'Bearer at' });
+  });
+
+  it('显式 discoveryUrl 优先于描述符声明；两者皆缺 → null 不发请求', async () => {
+    seedBlob('acme', { access_token: 'at' });
+    fetchResponder = () => new Response(JSON.stringify({ data: [{ id: 'm' }] }), { status: 200 });
+    await discoverGenericOAuthModels('acme', OAUTH, 'https://derived.example/v1/models');
+    expect(fetchCalls[0]?.url).toBe('https://derived.example/v1/models');
+    const noDiscovery = { ...OAUTH, modelsDiscoveryUrl: undefined };
+    expect(await discoverGenericOAuthModels('acme', noDiscovery)).toBeNull();
+    expect(fetchCalls).toHaveLength(1); // 第二次没发请求
+  });
+});
+
+describe('deriveModelsDiscoveryUrl', () => {
+  it('keeps the Codex backend path without inserting an extra API version', () => {
+    expect(deriveModelsDiscoveryUrl('https://relay.example/backend-api/codex')).toBe(
+      'https://relay.example/backend-api/codex/models',
+    );
+    expect(deriveModelsDiscoveryUrl('https://relay.example/team/backend-api/codex/?tenant=a#ignored')).toBe(
+      'https://relay.example/team/backend-api/codex/models?tenant=a',
+    );
+    expect(deriveModelsDiscoveryUrl('https://relay.example/codex')).toBe(
+      'https://relay.example/codex/v1/models',
+    );
+  });
+
+  it('/vN 结尾只追加 /models，其余追加 /v1/models（尾斜杠归一）', () => {
+    expect(deriveModelsDiscoveryUrl('https://openrouter.ai/api/v1')).toBe(
+      'https://openrouter.ai/api/v1/models',
+    );
+    expect(deriveModelsDiscoveryUrl('https://api.acme.example/anthropic')).toBe(
+      'https://api.acme.example/anthropic/v1/models',
+    );
+    expect(deriveModelsDiscoveryUrl('https://api.acme.example/')).toBe(
+      'https://api.acme.example/v1/models',
+    );
+  });
+
+  it('基于 pathname 追加模型端点，保留 query 并丢弃 fragment', () => {
+    expect(deriveModelsDiscoveryUrl('https://api.acme.example/v1?tenant=a#ignored')).toBe(
+      'https://api.acme.example/v1/models?tenant=a',
+    );
+    expect(deriveModelsDiscoveryUrl('https://api.acme.example/root/?tenant=a')).toBe(
+      'https://api.acme.example/root/v1/models?tenant=a',
+    );
+  });
+});
+
+describe('oauth-token 路由分支', () => {
+  it('uses the Copilot account host without allowing arbitrary token destinations', () => {
+    const routing = { upstream: 'https://api.individual.githubcopilot.com', authStrategy: 'oauth-token' as const };
+    expect(buildRouteDecision(routing, null, 'pi', null, 'tid=fake;proxy-ep=proxy.business.githubcopilot.com;exp=123')?.upstreamOverride).toBe('https://api.business.githubcopilot.com');
+    expect(buildRouteDecision(routing, null, 'pi', null, 'proxy-ep=proxy.business.githubcopilot.com.evil.test;')?.upstreamOverride).toBe(routing.upstream);
+    expect(buildRouteDecision({ ...routing, upstream: 'https://custom.example' }, null, 'pi', null, 'proxy-ep=proxy.business.githubcopilot.com;')?.upstreamOverride).toBe('https://custom.example');
+  });
+
+  const routing = {
+    upstream: 'https://api.acme.example',
+    authStrategy: 'oauth-token' as const,
+    headerDelete: ['anthropic-beta'],
+  };
+
+  it('有 token：Bearer 覆盖 + upstream override；cc 额外抹 x-api-key', () => {
+    const d = buildRouteDecision(routing, null, 'claude-code', null, 'at-9');
+    expect(d).toEqual({
+      headerOverride: { authorization: 'Bearer at-9' },
+      upstreamOverride: 'https://api.acme.example',
+      headerDelete: ['anthropic-beta', 'x-api-key'],
+    });
+    const dc = buildRouteDecision(routing, null, 'codex', null, 'at-9');
+    // codex：描述符自带的删除项保留，并整组追加 OpenAI 账号元数据头
+    // （ChatGPT OAuth spawn 的子进程会带这些头，发往第三方上游前必须抹掉；
+    // 自定义供应商目录条目无法声明 headerDelete，只能靠 oauth-token 分支代码层兜底）。
+    expect(dc?.headerDelete).toEqual(
+      expect.arrayContaining([
+        'anthropic-beta',
+        'chatgpt-account-id',
+        'openai-beta',
+        'originator',
+        'session_id',
+      ]),
+    );
+    expect(dc?.headerDelete).toHaveLength(5);
+  });
+
+  it('无 token → 仍路由到本供应商上游并置哑 token（绝不回落默认路由防凭证泄漏）', () => {
+    const d = buildRouteDecision(routing, null, 'claude-code', null, null);
+    expect(d?.upstreamOverride).toBe('https://api.acme.example');
+    expect(d?.headerOverride?.authorization).toBe('Bearer xdt-missing-provider-oauth-token');
+    expect(d?.headerDelete).toContain('x-api-key');
+  });
+
+  it('isHostInjectedAuthSession: oauth-token 会话视为 host 注入鉴权（codex env-key 态不落默认网关）', () => {
+    setActiveCatalog({
+      version: 't',
+      providers: [
+        {
+          id: 'acme',
+          name: 'Acme',
+          source: 'builtin',
+          agents: ['codex'],
+          auth: { method: 'oauth', oauth: OAUTH },
+          routing: { codex: { upstream: 'https://api.acme.example', authStrategy: 'oauth-token' } },
+          models: { codex: [] },
+        },
+      ],
+    });
+    setSessionProvider('sess-ht', 'acme');
+    expect(isHostInjectedAuthSession('sess-ht', 'codex')).toBe(true);
+    expect(isHostInjectedAuthSession('sess-ht', 'claude-code')).toBe(false); // 该 agent 无路由
+    expect(isHostInjectedAuthSession('sess-unknown', 'codex')).toBe(false); // 未选供应商
+  });
+
+  it('resolveSessionRouteDecision 经注入 token reader 走通全链路', async () => {
+    setActiveCatalog({
+      version: 't',
+      providers: [
+        {
+          id: 'acme',
+          name: 'Acme',
+          source: 'builtin',
+          agents: ['claude-code'],
+          auth: { method: 'oauth', oauth: OAUTH },
+          routing: { 'claude-code': routing },
+          models: {
+            'claude-code': [
+              { id: 'acme-1', name: 'A1', contextWindow: 1000, efforts: [], defaultEffort: null },
+            ],
+          },
+        },
+      ],
+    });
+    setSessionProvider('sess-1', 'acme');
+    setOAuthTokenReader((id) => (id === 'acme' ? 'at-x' : null));
+    // OAuth 路由统一等待异步 reader。
+    const d = await resolveSessionRouteDecision('sess-1', 'claude-code', null);
+    expect(d?.headerOverride?.authorization).toBe('Bearer at-x');
+    expect(d?.upstreamOverride).toBe('https://api.acme.example');
+  });
+});
+
+describe('setDiscoveredProviderModels additions-only merge', () => {
+  it('只补新 id，静态条目 first-wins；空数组清空 discovery', () => {
+    setActiveCatalog({
+      version: 't',
+      providers: [
+        {
+          id: 'acme',
+          name: 'Acme',
+          source: 'builtin',
+          agents: ['claude-code'],
+          auth: { method: 'oauth', oauth: OAUTH },
+          routing: {
+            'claude-code': { upstream: 'https://api.acme.example', authStrategy: 'oauth-token' },
+          },
+          models: {
+            'claude-code': [
+              {
+                id: 'static-1',
+                name: 'Static',
+                contextWindow: 1000,
+                efforts: [],
+                defaultEffort: null,
+              },
+            ],
+          },
+        },
+      ],
+    });
+    setDiscoveredProviderModels('acme', 'claude-code', [
+      {
+        id: 'static-1',
+        name: 'OVERRIDE-IGNORED',
+        contextWindow: 1,
+        efforts: [],
+        defaultEffort: null,
+      },
+      {
+        id: 'disc-1',
+        name: 'Discovered',
+        contextWindow: 200_000,
+        efforts: [],
+        defaultEffort: null,
+      },
+    ]);
+    const p = getActiveCatalog().providers.find((x) => x.id === 'acme')!;
+    expect(p.models['claude-code']!.map((m) => m.name)).toEqual(['Static', 'Discovered']);
+
+    setDiscoveredProviderModels('acme', 'claude-code', []);
+    const p2 = getActiveCatalog().providers.find((x) => x.id === 'acme')!;
+    expect(p2.models['claude-code']!.map((m) => m.id)).toEqual(['static-1']);
+  });
+
+  it('自定义供应商同样吃到发现 augment（回归：custom 追加须在 augment 之前）', () => {
+    setActiveCatalog({ version: 't', providers: [] });
+    setCustomProviders([
+      {
+        id: 'my-sub',
+        name: 'My Sub',
+        source: 'user',
+        agents: ['claude-code'],
+        auth: { method: 'oauth', oauth: OAUTH },
+        routing: {
+          'claude-code': { upstream: 'https://api.my.example', authStrategy: 'oauth-token' },
+        },
+        models: { 'claude-code': [] },
+      },
+    ]);
+    setDiscoveredProviderModels('my-sub', 'claude-code', [
+      { id: 'disc-a', name: 'Disc A', contextWindow: 200_000, efforts: [], defaultEffort: null },
+    ]);
+    const p = getActiveCatalog().providers.find((x) => x.id === 'my-sub')!;
+    expect(p.models['claude-code']!.map((m) => m.id)).toEqual(['disc-a']);
+    // 清理进程级单例状态，避免泄漏到其它用例。
+    setDiscoveredProviderModels('my-sub', 'claude-code', []);
+    setCustomProviders([]);
+  });
+});
+
+// ── PR3:generic 裸文本 done 消除(callback-pages-classification 页壳改造点 5)──
+
+describe('close() 回执路径(裸 done 消除)', () => {
+  it('code 已回、exchange 未决时取消 → 浏览器收到品牌化失败页,绝不再收裸文本 done(唯一输出路径断言)', async () => {
+    let callbackResponse: Promise<Response> | null = null;
+    let exchangeStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      exchangeStarted = resolve;
+    });
+    configureGenericOAuth({
+      openExternal: async (authUrl) => {
+        const u = new URL(authUrl);
+        const redirect = u.searchParams.get('redirect_uri')!;
+        const state = u.searchParams.get('state')!;
+        callbackResponse = fetch(`${redirect}?code=code-1&state=${encodeURIComponent(state)}`);
+      },
+      // token exchange 悬挂直到 abort:复现「code 已回、succeed/fail 前流程被终结」
+      fetchImpl: ((_url: RequestInfo | URL, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          exchangeStarted();
+          init?.signal?.addEventListener('abort', () =>
+            reject(new DOMException('aborted', 'AbortError')),
+          );
+        })) as typeof fetch,
+    });
+
+    const login = runGenericOAuthLogin({ id: 'acme', name: 'Acme' }, OAUTH);
+    await started;
+    cancelGenericOAuthLogin('acme');
+    const res = await login;
+    expect(res.ok).toBe(false);
+
+    const body = await (await callbackResponse!).text();
+    expect(body).not.toBe('done');
+    expect(body).not.toContain('>done<');
+    // 唯一输出路径 = shared builder(legacy visual):品牌失败页 + provider 文案
+    expect(body).toContain('data-cindy-oauth-result="error"');
+    expect(body).toContain('<span class="badge"');
+    expect(body).toContain('Acme');
+  });
+});
+
+describe('explicit provider metadata fields', () => {
+  it('preserves false, empty efforts and null defaults without inventing a supplied name', async () => {
+    const { parseModelsListResponse } = await import('../generic-oauth.desktop.js');
+    expect(
+      parseModelsListResponse({
+        data: [
+          {
+            id: 'model',
+            name: '',
+            mode: 'audio_transcription',
+            modalities: { input: ['audio'], output: ['text'] },
+            context_length: 64000,
+            max_output_tokens: 8000,
+            reasoning: { supportedEfforts: [], defaultEffort: null },
+            supports_fast_mode: false,
+            supports_image_input: false,
+          },
+        ],
+      }),
+    ).toEqual([
+      {
+        id: 'model',
+        name: 'model',
+        contextWindow: 64000,
+        discoveredMetadata: {
+          mode: 'audio_transcription',
+          modalities: { input: ['audio'], output: ['text'] },
+          contextWindow: 64000,
+          maxOutputTokens: 8000,
+          efforts: [],
+          defaultEffort: null,
+          supportsFastMode: false,
+          supportsImageInput: false,
+        },
+      },
+    ]);
+  });
+});
+
+
+describe('OpenRouter discovery metadata', () => {
+  it('imports provider facts without requiring a known model name', () => {
+    expect(parseModelsListResponse({ data: [{ id: 'new-vendor/new-model', name: 'New model',
+      context_length: 131072, architecture: { input_modalities: ['text', 'image'], output_modalities: ['text'] },
+      top_provider: { max_completion_tokens: 32768 },
+      pricing: { prompt: '0.0000007', completion: '0.0000014', input_cache_read: '0' },
+      reasoning: { supported_efforts: ['none', 'low', 'high'], default_effort: 'high' },
+      supported_parameters: ['tools', 'reasoning'],
+    }] }, 'https://openrouter.ai/api/v1/models')).toMatchObject([{ id: 'new-vendor/new-model',
+      discoveredMetadata: { contextWindow: 131072, maxOutputTokens: 32768,
+        modalities: { input: ['text', 'image'], output: ['text'] }, supportsImageInput: true,
+        supportsToolCalls: true, efforts: ['low', 'high'], defaultEffort: 'high' },
+      discoveredCost: { input: 0.7, output: 1.4, cacheRead: 0 },
+    }]);
+  });
+
+  it('keeps missing fields unknown and does not fabricate free prices or effort levels', () => {
+    const [model] = parseModelsListResponse({ data: [{ id: 'unlisted', pricing: { prompt: '', completion: '-1' } }] })!;
+    expect(model.discoveredMetadata).toEqual({});
+    expect(model.discoveredCost).toBeUndefined();
+  });
+});
+
+
+describe('official preset OAuth contracts', () => {
+  it('OpenRouter uses PKCE JSON exchange and stores the permanent key', async () => {
+    let authorization!: URL;
+    configureGenericOAuth({ openExternal: async url => {
+      authorization = new URL(url);
+      const callback = new URL(authorization.searchParams.get('callback_url')!);
+      expect(callback.searchParams.get('state')).toBe(authorization.searchParams.get('state'));
+      callback.searchParams.set('code', 'test-authorization-code');
+      void fetch(callback).catch(() => {});
+    } });
+    fetchResponder = () => new Response(JSON.stringify({ key: 'test-openrouter-key' }));
+    const oauth = providerPresetOAuth('openrouter')!;
+    const result = await runGenericOAuthLogin({ id: 'or-test', name: 'OpenRouter' }, oauth);
+    expect(result.ok).toBe(true);
+    expect(authorization.searchParams.has('redirect_uri')).toBe(false);
+    expect(authorization.searchParams.get('code_challenge_method')).toBe('S256');
+    expect(fetchCalls[0]!.headers?.['content-type']).toBe('application/json');
+    expect(JSON.parse(fetchCalls[0]!.body!)).toMatchObject({ code: 'test-authorization-code', code_challenge_method: 'S256' });
+    const stored = JSON.parse(storage.map.get('or-test')!);
+    expect(stored.access_token).toBe('test-openrouter-key');
+    expect(stored.expires_at).toBe(Number.MAX_SAFE_INTEGER);
+    expect(stored.refresh_token).toBeUndefined();
+  });
+
+  it('Nous rotates its refresh credential via the required header', async () => {
+    seedBlob('nous-test', { access_token: 'test-old', refresh_token: 'test-refresh', expires_at: nowMs - 1 });
+    fetchResponder = () => new Response(JSON.stringify({ access_token: 'test-new', refresh_token: 'test-rotated', expires_in: 600 }));
+    await refreshGenericOAuthIfNeeded('nous-test', providerPresetOAuth('nous')!);
+    expect(fetchCalls[0]!.headers?.['x-nous-refresh-token']).toBe('test-refresh');
+    expect(new URLSearchParams(fetchCalls[0]!.body).has('refresh_token')).toBe(false);
+    expect(JSON.parse(storage.map.get('nous-test')!).refresh_token).toBe('test-rotated');
+  });
+
+  it('Copilot exchanges the GitHub credential for an inference token and refreshes it', async () => {
+    seedBlob('copilot-test', { access_token: 'test-old', refresh_token: 'test-github', expires_at: nowMs - 1 });
+    fetchResponder = () => new Response(JSON.stringify({ token: 'test-copilot-inference', expires_at: nowMs / 1000 + 3600 }));
+    await refreshGenericOAuthIfNeeded('copilot-test', providerPresetOAuth('github-copilot')!);
+    expect(fetchCalls[0]!.url).toBe('https://api.github.com/copilot_internal/v2/token');
+    expect(fetchCalls[0]!.headers?.authorization).toBe('Bearer test-github');
+    expect(readCachedGenericOAuthAccessToken('copilot-test', undefined)).toBe('test-copilot-inference');
+  });
+});
+
+
+it('MiniMax uses its PKCE user-code grant and millisecond polling interval', async () => {
+  const oauth = providerPresetOAuth('minimax-global')!;
+  let polls = 0;
+  fetchResponder = url => url.endsWith('/oauth/code')
+    ? new Response(JSON.stringify({ user_code: 'TEST-CODE', verification_uri: 'https://platform.minimax.io/oauth', expired_in: 300, interval: 2000 }))
+    : new Response(JSON.stringify(++polls === 1 ? { status: 'pending' } : { status: 'success', access_token: 'test-mini-access', refresh_token: 'test-mini-refresh', expired_in: 600 }));
+  const result = await runGenericOAuthLogin({ id: 'mini-test', name: 'MiniMax' }, oauth);
+  expect(result.ok).toBe(true);
+  expect(new URLSearchParams(fetchCalls[0]!.body).get('code_challenge_method')).toBe('S256');
+  expect(new URLSearchParams(fetchCalls[1]!.body).get('grant_type')).toBe('urn:ietf:params:oauth:grant-type:user_code');
+  expect(new URLSearchParams(fetchCalls[1]!.body).get('code_verifier')).toBeTruthy();
+  expect(nowMs).toBe(1_004_000);
+  expect(JSON.parse(storage.map.get('mini-test')!).expires_at).toBe(nowMs + 600_000);
+});

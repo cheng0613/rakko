@@ -1,0 +1,142 @@
+/**
+ * L2 user-recipe layer loader (host side).
+ *
+ * Scans `userData/browser-recipes/<site>/recipes/*.json`, legacy `recipe.json`
+ * and `siteguide.json`, and parses
+ * them with @cindy/mcps' pure `parseRecipes`/`parseSiteGuides`, so the MCP package
+ * stays free of electron/fs. The result (resolved maps + a `version` content
+ * fingerprint) is injected into the browser MCP via `BrowserMcpDeps.getUserRecipes`,
+ * where it is merged over the bundled L1 catalog (user shadows builtin by id).
+ *
+ * `buildUserRecipes` is PURE (entries → maps + version) for unit testing; the
+ * thin `loadUserBrowserRecipes` does the fs scan. Modeled on
+ * `apps/desktop/src/main/local-themes/loader.ts`.
+ */
+import crypto from 'node:crypto';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import { parseRecipes, parseSiteGuides, type Recipe, type SiteGuide } from '@cindy/mcps';
+
+import { createLogger } from '../logger.js';
+import { readAtomicFileSync } from '../utils/atomicWriteFile.js';
+
+
+export interface UserRecipesResult {
+  recipes: Map<string, Recipe>;
+  siteGuides: Map<string, SiteGuide>;
+  /** Content fingerprint; changes whenever any user file changes (cache key). */
+  version: string;
+  diagnostics: string[];
+}
+export function createUserRecipeLoader(getUserDataDir: () => string) {
+const app = { getPath: (_: string) => getUserDataDir() };
+
+
+const log = createLogger('browser-recipes');
+
+/** Deterministic fingerprint over the raw entries (empty → ''). */
+function computeVersion(...entryMaps: Array<Record<string, string>>): string {
+  const parts: string[] = [];
+  for (const entries of entryMaps) {
+    for (const key of Object.keys(entries).sort()) parts.push(`${key}\0${entries[key]}`);
+  }
+  if (parts.length === 0) return '';
+  return crypto.createHash('sha1').update(parts.join('')).digest('hex');
+}
+
+/**
+ * PURE: parse raw `{path → json}` entries per file (error-isolated, so one bad
+ * user file never breaks the layer), dedupe recipes by id / guides by site, and
+ * compute the version fingerprint.
+ */
+function buildUserRecipes(
+  recipeEntries: Record<string, string>,
+  guideEntries: Record<string, string>,
+): UserRecipesResult {
+  const recipes = new Map<string, Recipe>();
+  const siteGuides = new Map<string, SiteGuide>();
+  const diagnostics: string[] = [];
+
+  for (const [filePath, raw] of Object.entries(recipeEntries)) {
+    try {
+      for (const [id, recipe] of parseRecipes({ [filePath]: raw })) {
+        if (recipes.has(id)) {
+          diagnostics.push(`duplicate user recipe id "${id}" (${filePath}); kept first`);
+          continue;
+        }
+        // Give legacy files an owning site without rewriting them. If they fail,
+        // the MCP can persist suspension in the same site's per-id file.
+        const parent = path.dirname(filePath);
+        const site = path.basename(path.basename(parent) === 'recipes' ? path.dirname(parent) : parent);
+        const validation = recipe.validation ?? (/^[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}$/.test(site)
+          ? { site, state: 'active' as const } : undefined);
+        recipes.set(id, { ...recipe, ...(validation ? { validation } : {}) });
+      }
+    } catch (err) {
+      diagnostics.push(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  for (const [filePath, raw] of Object.entries(guideEntries)) {
+    try {
+      for (const [site, guide] of parseSiteGuides({ [filePath]: raw })) siteGuides.set(site, guide);
+    } catch (err) {
+      diagnostics.push(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  return { recipes, siteGuides, version: computeVersion(recipeEntries, guideEntries), diagnostics };
+}
+
+/** Root dir for the L2 user-recipe layer (per-checkout userData). */
+function userRecipesDir(): string {
+  return path.join(app.getPath('userData'), 'browser-recipes');
+}
+
+async function readIfExists(filePath: string): Promise<string | null> {
+  return readAtomicFileSync(filePath);
+}
+
+/** Scan the L2 dir and build the user-recipe layer. Missing dir → empty layer. */
+async function loadUserBrowserRecipes(dir = userRecipesDir()): Promise<UserRecipesResult> {
+  let siteDirs: string[] = [];
+  try {
+    const entries = await fs.readdir(dir, { withFileTypes: true });
+    siteDirs = entries.filter((e) => e.isDirectory()).map((e) => e.name);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      log.warn('failed to read user recipes dir', { dir, error: String(err) });
+    }
+    return { recipes: new Map(), siteGuides: new Map(), version: '', diagnostics: [] };
+  }
+
+  const recipeEntries: Record<string, string> = {};
+  const guideEntries: Record<string, string> = {};
+  for (const site of siteDirs) {
+    // New per-id files win over legacy recipe.json; no destructive migration.
+    const recipesDir = path.join(dir, site, 'recipes');
+    let names: string[] = [];
+    try { names = await fs.readdir(recipesDir); }
+    catch (err) { if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err; }
+    const files = new Set(names.filter((name) => /\.json(?:\.bak)?$/.test(name)).map((name) => name.replace(/\.bak$/, '')));
+    for (const name of [...files].sort()) {
+      const file = path.join(recipesDir, name);
+      const raw = await readIfExists(file);
+      if (raw != null) recipeEntries[file] = raw;
+    }
+    const recipePath = path.join(dir, site, 'recipe.json');
+    const guidePath = path.join(dir, site, 'siteguide.json');
+    const recipeRaw = await readIfExists(recipePath);
+    if (recipeRaw != null) recipeEntries[recipePath] = recipeRaw;
+    const guideRaw = await readIfExists(guidePath);
+    if (guideRaw != null) guideEntries[guidePath] = guideRaw;
+  }
+
+  const result = buildUserRecipes(recipeEntries, guideEntries);
+  if (result.diagnostics.length) {
+    log.warn('user recipe layer diagnostics', { diagnostics: result.diagnostics });
+  }
+  return result;
+}
+return { buildUserRecipes, userRecipesDir, loadUserBrowserRecipes };
+}

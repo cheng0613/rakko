@@ -1,0 +1,52 @@
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { describe, expect, it } from 'vitest';
+
+const source = readFileSync(
+  resolve(__dirname, '..', 'components', 'new-chat', 'ChatInput.tsx'),
+  'utf8',
+).replace(/\r\n?/g, '\n');
+
+describe('ChatInput Ghost snapshot contract', () => {
+  it('never performs a synchronous Ghost list IPC in the composer', () => {
+    expect(source).not.toContain('ghosts.listSync()');
+  });
+
+  it('derives the $ palette from the workdir-filtered installed snapshot', () => {
+    expect(source).toContain(
+      'const ghostsForCommand = pluginsForMenu;',
+    );
+    expect(source).toContain(
+      'const ghostCommandItems = useMemo(() => {\n    if (!isGhostSigil) return [];\n    return ghostsForCommand',
+    );
+    expect(source).toContain('}, [ghostSourceLabels, ghostsForCommand, isGhostSigil, t]);');
+  });
+
+  it('uses the latest installed snapshot and workdir at send time', () => {
+    expect(source).toContain('const installedGhostsRef = useRef(installedGhosts);');
+    expect(source).toContain('installedGhostsRef.current = installedGhosts;');
+    expect(source).toMatch(
+      /const eligibleGhosts: GhostCommandSource\[\]\s*=\s*sourceRemoteGhosts \?\? filterGhostsForWorkdir\(\s*installedGhostsRef\.current,\s*workingDirRef\.current,\s*\);[\s\S]*?expandGhostCommand\(text,\s*eligibleGhosts\)/,
+    );
+  });
+
+  it('does not expose controller-local plugin rows in device-link sessions', () => {
+    expect(source).toContain('useInstalledGhosts(deviceLinkDeviceId === null)');
+    expect(source).toContain('? remoteComposerGhosts.ghosts');
+    expect(source).toContain(
+      '[deviceLinkDeviceId, pluginsForMenu, pluginAvailableIds, remoteHostId, t]',
+    );
+  });
+
+  it('uses serialized text for the local plan-mode command', () => {
+    expect(source).toMatch(
+      /isPlanModeComposerCommandText\(\s*editorText,?/,
+    );
+  });
+
+  it('persists the explicit no-effort sentinel for Cindy Make creation', () => {
+    expect(source).toContain("const selectedEffort = composerSelection.display.effort ?? initialEffort ?? '';");
+    expect(source).toContain('effort: selectedEffort,');
+    expect(source).not.toContain('...(initialEffort === null ? {} : { effort: activeEffort })');
+  });
+});

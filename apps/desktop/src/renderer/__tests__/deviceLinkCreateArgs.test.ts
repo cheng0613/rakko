@@ -1,0 +1,651 @@
+/**
+ * deviceLinkCreateArgs.test.ts —— device-link 远程建会话参数组装(「归属一致」行为断言)。
+ *
+ * 锁住历史上真实出过的 bug:控制端在远程项目下建会话,被控端却把它建成项目外的独立会话。
+ * 根因是 create 参数 workspaceKind 没传 'project'。这里直接对组装函数做行为断言(而非 grep
+ * 源码接线),确保带项目目录时 workspaceKind 必为 'project' → 两端归属一致。
+ *
+ * 2026-07(#807)起 workingDir 可缺省:「在对端设备上开不绑项目的对话」是合法意图。
+ * 归属一致的断言因此变成**双向**的 —— 有目录必 'project',无目录必 'dialogue',
+ * 且无目录时不能把 workingDir 塞进 payload(否则被控端会拿空串去校验路径)。
+ */
+import { describe, it, expect } from 'vitest';
+
+import type { CatalogModel, ProviderView } from '@cindy/model-providers';
+
+import {
+  buildDeviceLinkCreateArgs,
+  buildProvisionalRemoteSession,
+  resolveDeviceLinkSubmission,
+} from '@/features/cc-agent/deviceLinkCreateArgs';
+
+function catalogModel(
+  id: string,
+  capabilities: Partial<CatalogModel> = {},
+): CatalogModel {
+  return {
+    id,
+    name: id,
+    group: 'test',
+    sortOrder: 0,
+    contextWindow: 200_000,
+    efforts: [],
+    defaultEffort: null,
+    supportsFastMode: false,
+    status: 'active',
+    ...capabilities,
+  } as CatalogModel;
+}
+
+/** 被控端供应商目录的最小形态(与 draftModelCalibration.test.ts 同款构造)。 */
+function deviceProvider(
+  id: string,
+  connected: boolean,
+  modelIds: string[],
+  agent: 'claude-code' | 'pi' = 'claude-code',
+  capabilities: Partial<CatalogModel> = {},
+): ProviderView {
+  return {
+    id,
+    name: id,
+    source: 'builtin',
+    agents: [agent],
+    models: { [agent]: modelIds.map((modelId) => catalogModel(modelId, capabilities)) },
+    routing: {
+      [agent]: { upstream: 'https://provider.test', authStrategy: 'none' },
+    },
+    auth: { method: 'oauth' },
+    connected,
+  } as unknown as ProviderView;
+}
+
+describe('buildDeviceLinkCreateArgs', () => {
+  it.each([undefined, '/remote/project'])('carries initial plan mode through creation and provisional UI (%s)', (workingDir) => {
+    const args = resolveDeviceLinkSubmission({
+      agentKind: 'codex', workingDir, capabilityAgentKind: 'codex', deviceProviders: [],
+      candidate: { model: 'gpt-5.4', effort: 'high', permissionMode: 'auto', fastMode: false, planModeEnabled: true },
+    });
+    expect(args.planMode).toBe(true);
+    expect(args).not.toHaveProperty('planModeEnabled');
+    const row = buildProvisionalRemoteSession({ sessionId: 'remote', workDir: workingDir ?? '/dialogue/remote', args, nowIso: '2026-10-08T00:00:00Z' });
+    expect(row.planModeEnabled).toBe(true);
+  });
+
+  it('归属一致核心:workspaceKind 恒为 project(被控端据此挂到项目下,不独立)', () => {
+    const args = buildDeviceLinkCreateArgs({
+      agentKind: 'cc',
+      workingDir: '/host/proj',
+      model: 'claude-sonnet-4-6',
+      effort: 'medium',
+      permissionMode: 'acceptEdits',
+      fastMode: false,
+    });
+    expect(args.workspaceKind).toBe('project');
+    expect(args.workingDir).toBe('/host/proj');
+  });
+
+  it('agentKind 归一到 maker-core 形态:cc → claude-code,codex/pi 保持原值', () => {
+    expect(buildDeviceLinkCreateArgs({ agentKind: 'cc', workingDir: '/p', model: 'm', effort: 'medium', permissionMode: 'acceptEdits', fastMode: false }).agentKind).toBe('claude-code');
+    expect(buildDeviceLinkCreateArgs({ agentKind: 'codex', workingDir: '/p', model: 'm', effort: 'high', permissionMode: 'auto', fastMode: false }).agentKind).toBe('codex');
+    expect(buildDeviceLinkCreateArgs({ agentKind: 'pi', workingDir: '/p', model: 'm', effort: 'high', permissionMode: 'auto', fastMode: false }).agentKind).toBe('pi');
+  });
+
+  it('其余字段原样透传(model/effort/permissionMode/fastMode)', () => {
+    const args = buildDeviceLinkCreateArgs({
+      agentKind: 'codex',
+      workingDir: '/host/repo',
+      model: 'gpt-5.5',
+      effort: 'high',
+      permissionMode: 'auto',
+      fastMode: true,
+    });
+    expect(args).toEqual({
+      agentKind: 'codex',
+      workingDir: '/host/repo',
+      workspaceKind: 'project',
+      model: 'gpt-5.5',
+      effort: 'high',
+      permissionMode: 'auto',
+      fastMode: true,
+    });
+  });
+
+  it('无 effort 模型用空串交给被控端准入层', () => {
+    const args = buildDeviceLinkCreateArgs({
+      agentKind: 'pi',
+      workingDir: '/host/repo',
+      model: 'qwen3:14b',
+      effort: null,
+      permissionMode: 'auto',
+      fastMode: false,
+    });
+    expect(args.effort).toBe('');
+  });
+
+  // [12] 远程 create 透传 extraDirs:被控端 bootstrapSession 再按 set-extra-dirs 同款校验,
+  // 这里只锁「控制端是否把草稿 extraDirs 带进 create args」这一接线。
+  it('非空 extraDirs 透传进 args', () => {
+    const args = buildDeviceLinkCreateArgs({
+      agentKind: 'cc',
+      workingDir: '/host/proj',
+      model: 'claude-sonnet-4-6',
+      effort: 'medium',
+      permissionMode: 'acceptEdits',
+      fastMode: false,
+      extraDirs: ['/host/refs', '/host/docs'],
+    });
+    expect(args.extraDirs).toEqual(['/host/refs', '/host/docs']);
+  });
+
+  it('空数组 / 缺省 extraDirs 不出现在 args(payload 干净,被控端只在非空时才校验)', () => {
+    const base = {
+      agentKind: 'cc' as const,
+      workingDir: '/host/proj',
+      model: 'm',
+      effort: 'medium' as const,
+      permissionMode: 'acceptEdits' as const,
+      fastMode: false,
+    };
+    expect('extraDirs' in buildDeviceLinkCreateArgs({ ...base, extraDirs: [] })).toBe(false);
+    expect('extraDirs' in buildDeviceLinkCreateArgs({ ...base, extraDirs: undefined })).toBe(false);
+    expect('extraDirs' in buildDeviceLinkCreateArgs(base)).toBe(false);
+  });
+
+  // P2:草稿选定的来源(被控端供应商)透传进 create args,被控端 bootstrapSession 落 provider_id。
+  const base = {
+    agentKind: 'codex' as const,
+    workingDir: '/host/repo',
+    model: 'gpt-5.5',
+    effort: 'high' as const,
+    permissionMode: 'auto' as const,
+    fastMode: false,
+  };
+
+  it('非空 providerId 透传进 args(被控端 create 时落 provider_id → 首个请求即按所选来源路由)', () => {
+    expect(buildDeviceLinkCreateArgs({ ...base, providerId: 'openai' }).providerId).toBe('openai');
+  });
+
+  it('null / 空 / 缺省 providerId 不出现在 args(跟随默认路由 → provider_id 留 NULL,no-break)', () => {
+    expect('providerId' in buildDeviceLinkCreateArgs({ ...base, providerId: null })).toBe(false);
+    expect('providerId' in buildDeviceLinkCreateArgs({ ...base, providerId: '' })).toBe(false);
+    expect('providerId' in buildDeviceLinkCreateArgs(base)).toBe(false);
+  });
+
+  // 远程 worktree:控制端先经隧道调被控端 worktree:create(以预生成 id 登记绑定),
+  // 再以同一 id + worktree 路径建会话 —— id 两步同值,被控端 close-session 才能按绑定回收。
+  it('预生成 id 透传进 args(远程 worktree 流程:与 worktree:create 登记的绑定同 id)', () => {
+    const args = buildDeviceLinkCreateArgs({
+      ...base,
+      id: 'session-preset-1',
+      workingDir: '/host/repo/.xdt-worktrees/auto-x1',
+    });
+    expect(args.id).toBe('session-preset-1');
+    expect(args.workingDir).toBe('/host/repo/.xdt-worktrees/auto-x1');
+    expect(args.workspaceKind).toBe('project');
+  });
+
+  it('缺省 id 不出现在 args(非 worktree 流程由被控端自行生成)', () => {
+    expect('id' in buildDeviceLinkCreateArgs(base)).toBe(false);
+  });
+
+  // #807:跨设备纯对话。每台设备都有自己的一批对话,「在对端开个不绑项目的对话」必须走通。
+  describe('无项目目录 = 在该设备上建 standalone dialogue', () => {
+    const noDir = {
+      agentKind: 'cc' as const,
+      model: 'claude-sonnet-4-6',
+      effort: 'medium' as const,
+      permissionMode: 'acceptEdits' as const,
+      fastMode: false,
+    };
+
+    it('缺省 workingDir → workspaceKind 为 dialogue,且不带 workingDir 字段', () => {
+      const args = buildDeviceLinkCreateArgs(noDir);
+      expect(args.workspaceKind).toBe('dialogue');
+      expect('workingDir' in args).toBe(false);
+    });
+
+    it('空串 / 纯空白 workingDir 同样落到 dialogue(不把脏值当真实路径送去被控端校验)', () => {
+      for (const dir of ['', '   ', '\t']) {
+        const args = buildDeviceLinkCreateArgs({ ...noDir, workingDir: dir });
+        expect(args.workspaceKind).toBe('dialogue');
+        expect('workingDir' in args).toBe(false);
+      }
+    });
+
+    it('归属一致是双向的:两个字段同源派生,不可能出现「带目录却标 dialogue」', () => {
+      expect(buildDeviceLinkCreateArgs({ ...noDir, workingDir: '/host/proj' }).workspaceKind).toBe('project');
+      expect(buildDeviceLinkCreateArgs(noDir).workspaceKind).toBe('dialogue');
+    });
+
+    it('workingDir 两端去空白后透传(避免被控端 guard 因首尾空格判成不同目录)', () => {
+      expect(buildDeviceLinkCreateArgs({ ...noDir, workingDir: '  /host/proj  ' }).workingDir).toBe('/host/proj');
+    });
+
+    it('dialogue 也照样透传 extraDirs / providerId(对话同样可带引用目录与指定来源)', () => {
+      const args = buildDeviceLinkCreateArgs({
+        ...noDir,
+        extraDirs: ['/host/refs'],
+        providerId: 'anthropic',
+      });
+      expect(args.workspaceKind).toBe('dialogue');
+      expect(args.extraDirs).toEqual(['/host/refs']);
+      expect(args.providerId).toBe('anthropic');
+    });
+  });
+});
+
+describe('buildProvisionalRemoteSession', () => {
+  const NOW = '2026-07-30T03:00:00.000Z';
+  const project = buildDeviceLinkCreateArgs({
+    agentKind: 'codex',
+    workingDir: '/peer/proj',
+    model: 'gpt-5.4',
+    effort: 'high',
+    permissionMode: 'plan',
+    fastMode: true,
+    extraDirs: ['/peer/refs'],
+    providerId: 'openai',
+  });
+  const dialogue = buildDeviceLinkCreateArgs({
+    agentKind: 'cc',
+    model: 'sonnet',
+    effort: 'medium',
+    permissionMode: 'default',
+    fastMode: false,
+  });
+
+  it('workingDir 取被控端 create 响应的 workDir —— 纯对话的运行目录控制端根本猜不到', () => {
+    // 这条是整个临时行存在的理由:SessionView 的 delayed-create 交接要求 workingDir 非空,
+    // 而 dialogue 的运行目录由被控端分配,只能从响应里拿。
+    const row = buildProvisionalRemoteSession({
+      sessionId: 's-1',
+      workDir: '/peer/.cindy/dialogues/s-1',
+      args: dialogue,
+      nowIso: NOW,
+    });
+    expect(row.workingDir).toBe('/peer/.cindy/dialogues/s-1');
+    expect(row.workspaceKind).toBe('dialogue');
+  });
+
+  it('运行配置照抄刚提交的 args,不另推一遍(否则临时行会和对端实际建的不一致)', () => {
+    const row = buildProvisionalRemoteSession({
+      sessionId: 's-2',
+      workDir: '/peer/proj',
+      args: project,
+      nowIso: NOW,
+    });
+    expect(row.model).toBe('gpt-5.4');
+    expect(row.effort).toBe('high');
+    expect(row.permissionMode).toBe('plan');
+    expect(row.fastMode).toBe(true);
+    expect(row.providerId).toBe('openai');
+    expect(row.extraDirs).toEqual(['/peer/refs']);
+    expect(row.workspaceKind).toBe('project');
+  });
+
+  it('agentKind 转回本机形态(args 里是 maker-core 形态)', () => {
+    expect(
+      buildProvisionalRemoteSession({ sessionId: 's', workDir: '/w', args: project, nowIso: NOW })
+        .agentKind,
+    ).toBe('codex');
+    expect(
+      buildProvisionalRemoteSession({ sessionId: 's', workDir: '/w', args: dialogue, nowIso: NOW })
+        .agentKind,
+    ).toBe('cc');
+    const pi = buildDeviceLinkCreateArgs({
+      agentKind: 'pi', model: 'gpt-5.4', effort: 'high', permissionMode: 'auto', fastMode: true,
+    });
+    expect(
+      buildProvisionalRemoteSession({ sessionId: 's', workDir: '/w', args: pi, nowIso: NOW })
+        .agentKind,
+    ).toBe('pi');
+  });
+
+  it('新会话的确定初值:active / 未置顶 / 计数为 0 / 标题与被控端 create 的默认值一致', () => {
+    const row = buildProvisionalRemoteSession({
+      sessionId: 's-3',
+      workDir: '/w',
+      args: dialogue,
+      nowIso: NOW,
+    });
+    expect(row.status).toBe('active');
+    expect(row.pinnedAt).toBeNull();
+    expect(row.clearedAt).toBeNull();
+    expect(row.sdkSessionId).toBeNull();
+    expect(row.totalTokenUsage).toBe(0);
+    // 被控端 create 出来的标题正是 'New Maker'(auto-title 的覆写判据也认这个值)。
+    expect(row.title).toBe('New Maker');
+  });
+
+  it('userSendAt 与被控端新行一致为空:「正在发第一条」交给投影层的首条发送叠加层', () => {
+    const row = buildProvisionalRemoteSession({
+      sessionId: 's-4',
+      workDir: '/w',
+      args: dialogue,
+      nowIso: NOW,
+    });
+    expect(row.userSendAt).toBeNull();
+    expect(row.createdAt).toBe(NOW);
+    expect(row.updatedAt).toBe(NOW);
+  });
+
+  it('providerId 缺省(跟随默认路由)时落 null,不留 undefined', () => {
+    const row = buildProvisionalRemoteSession({
+      sessionId: 's-5',
+      workDir: '/w',
+      args: dialogue,
+      nowIso: NOW,
+    });
+    expect(row.providerId).toBeNull();
+    expect(row.extraDirs).toEqual([]);
+  });
+});
+
+// 远程控制下新建任务,Agent 在同账号第三台电脑运行(与手机新建任务同一个 create-session 参数)。
+describe('Agent 在另一台电脑运行', () => {
+  const NOW = '2026-10-09T03:00:00.000Z';
+  const candidate = {
+    model: 'c-model',
+    effort: 'high' as const,
+    permissionMode: 'default' as const,
+    fastMode: false,
+  };
+  // 模型目录是运行 Agent 的那台电脑的:来源在那份目录里解析。
+  const agentComputerCatalog = [deviceProvider('c-open', true, ['c-model'])];
+
+  it('agentDeviceId 交给被控电脑,来源按那台电脑的目录解析', () => {
+    const args = resolveDeviceLinkSubmission({
+      agentKind: 'cc',
+      workingDir: '/peer/proj',
+      candidate,
+      deviceProviders: agentComputerCatalog,
+      capabilityAgentKind: 'claude-code',
+      agentDeviceId: 'device-c',
+    });
+    expect(args.agentDeviceId).toBe('device-c');
+    expect(args.providerId).toBe('c-open');
+    expect(args.model).toBe('c-model');
+  });
+
+  it('Agent 在被控电脑本身时不带这个字段(旧被控电脑与原有调用不变)', () => {
+    for (const agentDeviceId of [undefined, null, '']) {
+      const args = resolveDeviceLinkSubmission({
+        agentKind: 'cc',
+        candidate,
+        deviceProviders: agentComputerCatalog,
+        capabilityAgentKind: 'claude-code',
+        agentDeviceId,
+      });
+      expect('agentDeviceId' in args).toBe(false);
+    }
+  });
+
+  it('临时行就带上 Agent 所在电脑;不带时不出现这个字段', () => {
+    const remote = buildDeviceLinkCreateArgs({
+      agentKind: 'cc',
+      model: 'c-model',
+      effort: 'high',
+      permissionMode: 'default',
+      fastMode: false,
+      agentDeviceId: 'device-c',
+    });
+    expect(
+      buildProvisionalRemoteSession({ sessionId: 's-6', workDir: '/w', args: remote, nowIso: NOW })
+        .agentDeviceId,
+    ).toBe('device-c');
+    const plain = buildDeviceLinkCreateArgs({
+      agentKind: 'cc',
+      model: 'b-model',
+      effort: 'high',
+      permissionMode: 'default',
+      fastMode: false,
+    });
+    expect(
+      'agentDeviceId' in
+        buildProvisionalRemoteSession({ sessionId: 's-7', workDir: '/w', args: plain, nowIso: NOW }),
+    ).toBe(false);
+  });
+});
+
+/**
+ * resolveDeviceLinkSubmission —— 远程建会话参数的**唯一入口**。
+ *
+ * 这组断言存在的理由是结构性的:在它之前,「普通发送」与「新建目标」各自推导这组值,于是任何
+ * 一条校准规则漏加在一边就长出一个只在其中一条路径上复现的缺陷 —— 第 25 轮的 providerId
+ * 正是如此(发送有 ChatInput 兜底、建目标直接把未认证来源写进被控端 sessions.provider_id)。
+ * 最后一条断言把「两条路径必须等价」本身变成可执行的检查。
+ */
+describe('resolveDeviceLinkSubmission', () => {
+  const AGENT = 'claude-code' as const;
+  const candidate = {
+    model: 'claude-sonnet-4-6',
+    effort: 'medium' as const,
+    permissionMode: 'default' as const,
+    fastMode: false,
+  };
+
+  it('仍然有效的显式来源原样保留', () => {
+    const args = resolveDeviceLinkSubmission({
+      agentKind: 'cc',
+      workingDir: '/peer/proj',
+      candidate: { ...candidate, providerId: 'anthropic' },
+      deviceProviders: [deviceProvider('anthropic', true, ['claude-sonnet-4-6'])],
+      capabilityAgentKind: AGENT,
+    });
+    expect(args.providerId).toBe('anthropic');
+    // 转调底层组装:归属一致的派生不受影响。
+    expect(args.workspaceKind).toBe('project');
+    expect(args.workingDir).toBe('/peer/proj');
+  });
+
+  it('被控端已断开时保留显式连接，交给被控端校验而不改用其他账号', () => {
+    const args = resolveDeviceLinkSubmission({
+      agentKind: 'cc',
+      candidate: { ...candidate, providerId: 'stale-source' },
+      deviceProviders: [deviceProvider('anthropic', true, ['claude-sonnet-4-6'])],
+      capabilityAgentKind: AGENT,
+    });
+    expect(args.providerId).toBe('stale-source');
+  });
+
+  it('来源仍在但已不提供当前模型时仍保留账号身份', () => {
+    const args = resolveDeviceLinkSubmission({
+      agentKind: 'cc',
+      candidate: { ...candidate, providerId: 'other' },
+      deviceProviders: [
+        deviceProvider('other', true, ['some-other-model']),
+        deviceProvider('anthropic', true, ['claude-sonnet-4-6']),
+      ],
+      capabilityAgentKind: AGENT,
+    });
+    expect(args.providerId).toBe('other');
+  });
+
+  it('没有任何来源提供模型时也不丢弃显式账号', () => {
+    const args = resolveDeviceLinkSubmission({
+      agentKind: 'cc',
+      candidate: { ...candidate, providerId: 'stale-source' },
+      deviceProviders: [deviceProvider('other', true, ['some-other-model'])],
+      capabilityAgentKind: AGENT,
+    });
+    expect(args.providerId).toBe('stale-source');
+  });
+
+  it('目录尚未加载完时仍保留显式账号', () => {
+    const args = resolveDeviceLinkSubmission({
+      agentKind: 'cc',
+      candidate: { ...candidate, providerId: 'anything' },
+      deviceProviders: [],
+      capabilityAgentKind: AGENT,
+    });
+    expect(args.providerId).toBe('anything');
+  });
+
+  it('提交前按选中来源清掉已知无 effort 模型的旧档位', () => {
+    const args = resolveDeviceLinkSubmission({
+      agentKind: 'pi',
+      candidate: { ...candidate, model: 'qwen3:14b', effort: 'medium', providerId: 'ollama' },
+      deviceProviders: [deviceProvider('ollama', true, ['qwen3:14b'], 'pi', { effortsUnknown: false })],
+      capabilityAgentKind: 'pi',
+    });
+    expect(args.effort).toBe('');
+  });
+
+  it('提交前把选中来源已失效的 effort 校准到该来源默认档位', () => {
+    const args = resolveDeviceLinkSubmission({
+      agentKind: 'pi',
+      candidate: { ...candidate, model: 'qwen3:14b', effort: 'medium', providerId: 'ollama' },
+      deviceProviders: [deviceProvider('ollama', true, ['qwen3:14b'], 'pi', {
+        efforts: ['low', 'high'], defaultEffort: 'high',
+      })],
+      capabilityAgentKind: 'pi',
+    });
+    expect(args.effort).toBe('high');
+  });
+
+  it('提交前无默认档位时回落到选中来源当前档位列表首项', () => {
+    const args = resolveDeviceLinkSubmission({
+      agentKind: 'pi',
+      candidate: { ...candidate, model: 'qwen3:14b', effort: 'medium', providerId: 'ollama' },
+      deviceProviders: [deviceProvider('ollama', true, ['qwen3:14b'], 'pi', { efforts: ['low', 'high'] })],
+      capabilityAgentKind: 'pi',
+    });
+    expect(args.effort).toBe('low');
+  });
+
+  it('提交前失效的默认档位也回落到当前列表首项', () => {
+    const args = resolveDeviceLinkSubmission({
+      agentKind: 'pi',
+      candidate: { ...candidate, model: 'qwen3:14b', effort: 'medium', providerId: 'ollama' },
+      deviceProviders: [deviceProvider('ollama', true, ['qwen3:14b'], 'pi', {
+        efforts: ['low', 'high'], defaultEffort: 'medium',
+      })],
+      capabilityAgentKind: 'pi',
+    });
+    expect(args.effort).toBe('low');
+  });
+
+  it('提交前保留选中来源合法档位，不受同名无档位来源或默认值影响', () => {
+    const args = resolveDeviceLinkSubmission({
+      agentKind: 'pi',
+      candidate: { ...candidate, model: 'qwen3:14b', effort: 'medium', providerId: 'reasoning' },
+      deviceProviders: [
+        deviceProvider('plain', true, ['qwen3:14b'], 'pi'),
+        deviceProvider('reasoning', true, ['qwen3:14b'], 'pi', {
+          efforts: ['medium', 'high'], defaultEffort: 'high',
+        }),
+      ],
+      capabilityAgentKind: 'pi',
+    });
+    expect(args.providerId).toBe('reasoning');
+    expect(args.effort).toBe('medium');
+  });
+
+  it('提交前只按选中来源的当前能力校准，不使用其他同名来源支持的旧档位', () => {
+    const args = resolveDeviceLinkSubmission({
+      agentKind: 'pi',
+      candidate: { ...candidate, model: 'qwen3:14b', effort: 'medium', providerId: 'updated' },
+      deviceProviders: [
+        deviceProvider('other', true, ['qwen3:14b'], 'pi', { efforts: ['medium', 'high'] }),
+        deviceProvider('updated', true, ['qwen3:14b'], 'pi', {
+          efforts: ['low', 'high'], defaultEffort: 'high',
+        }),
+      ],
+      capabilityAgentKind: 'pi',
+    });
+    expect(args.providerId).toBe('updated');
+    expect(args.effort).toBe('high');
+  });
+
+  it('未指定来源时按解析出的默认来源校准失效档位', () => {
+    const args = resolveDeviceLinkSubmission({
+      agentKind: 'pi',
+      candidate: { ...candidate, model: 'qwen3:14b', effort: 'medium', providerId: null },
+      deviceProviders: [deviceProvider('ollama', true, ['qwen3:14b'], 'pi', {
+        efforts: ['low', 'high'], defaultEffort: 'high',
+      })],
+      capabilityAgentKind: 'pi',
+    });
+    expect(args.providerId).toBe('ollama');
+    expect(args.effort).toBe('high');
+  });
+
+  it.each<{ efforts: CatalogModel['efforts'] }>([
+    { efforts: [] },
+    { efforts: ['low', 'high'] },
+  ])('档位能力未知时保留候选档位 (%j)', ({ efforts }) => {
+    const args = resolveDeviceLinkSubmission({
+      agentKind: 'pi',
+      candidate: { ...candidate, model: 'qwen3:14b', effort: 'medium', providerId: 'ollama' },
+      deviceProviders: [deviceProvider('ollama', true, ['qwen3:14b'], 'pi', {
+        efforts, defaultEffort: 'high', effortsUnknown: true,
+      })],
+      capabilityAgentKind: 'pi',
+    });
+    expect(args.effort).toBe('medium');
+  });
+
+  it.each(['medium', 'high'])('旧主机空档位表缺少能力标记时保留候选档位 (%s)', (effort) => {
+    const args = resolveDeviceLinkSubmission({
+      agentKind: 'pi',
+      candidate: { ...candidate, model: 'qwen3:14b', effort, providerId: 'ollama' },
+      deviceProviders: [deviceProvider('ollama', true, ['qwen3:14b'], 'pi')],
+      capabilityAgentKind: 'pi',
+    });
+    expect(args.effort).toBe(effort);
+  });
+
+  it.each(['missing-provider', 'missing-model'])('缺少选中来源或模型时不使用其他来源校准 (%s)', (providerId) => {
+    const args = resolveDeviceLinkSubmission({
+      agentKind: 'pi',
+      candidate: { ...candidate, model: 'qwen3:14b', effort: 'medium', providerId },
+      deviceProviders: [
+        deviceProvider('missing-model', true, ['different-model'], 'pi'),
+        deviceProvider('other', true, ['qwen3:14b'], 'pi', { efforts: ['low', 'high'] }),
+      ],
+      capabilityAgentKind: 'pi',
+    });
+    expect(args.providerId).toBe(providerId);
+    expect(args.effort).toBe('medium');
+  });
+
+  it('无项目目录 → dialogue,且不把 workingDir 塞进 payload(转调派生未被绕过)', () => {
+    const args = resolveDeviceLinkSubmission({
+      agentKind: 'codex',
+      candidate: { ...candidate, providerId: null },
+      deviceProviders: [deviceProvider('anthropic', true, ['claude-sonnet-4-6'])],
+      capabilityAgentKind: AGENT,
+      extraDirs: ['/peer/ref'],
+      id: 'preset-id',
+    });
+    expect(args.workspaceKind).toBe('dialogue');
+    expect('workingDir' in args).toBe(false);
+    expect(args.agentKind).toBe('codex');
+    expect(args.extraDirs).toEqual(['/peer/ref']);
+    expect(args.id).toBe('preset-id');
+  });
+
+  it('同一组候选值:发送路径与建目标路径的输出必须完全一致', () => {
+    // 两条路径的差别只在候选值**从哪来**(ChatInput 回传 / 组件派生),不在如何校准与组装。
+    // 喂同一组值就必须得到同一份 args —— 这正是第 25 轮那类「只在一条路径上复现」的缺陷
+    // 在结构上不可能再出现的原因。
+    const shared = {
+      agentKind: 'cc' as const,
+      workingDir: '/peer/proj',
+      extraDirs: ['/peer/ref'],
+      deviceProviders: [deviceProvider('anthropic', true, ['claude-sonnet-4-6'])],
+      capabilityAgentKind: AGENT,
+    };
+    const fromSend = resolveDeviceLinkSubmission({
+      ...shared,
+      candidate: { ...candidate, providerId: 'stale-source' },
+    });
+    const fromGoal = resolveDeviceLinkSubmission({
+      ...shared,
+      candidate: { ...candidate, providerId: 'stale-source' },
+    });
+    expect(fromGoal).toEqual(fromSend);
+    // 且两者都已被校准(不是「一致地都错」)。
+    expect(fromSend.providerId).toBe('stale-source');
+  });
+});

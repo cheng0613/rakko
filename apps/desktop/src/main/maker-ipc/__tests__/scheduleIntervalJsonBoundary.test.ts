@@ -1,0 +1,319 @@
+/**
+ * schedule IPC 的 device-link JSON 边界翻译。
+ *
+ * Mobile 清空 intervalMs 只能用可序列化的 null 表达(device-link 经
+ * JSON.stringify,值为 undefined 的 key 会被丢掉),而引擎契约是
+ * 「带 key 的 undefined = 显式清空;省略 key = 不修改」。desktop IPC 入口的
+ * normalizeNullableIntervalMs 负责这一步翻译:null → 带 key 的 undefined,
+ * 数值与省略 key 两种形态原样透传。
+ *
+ * electron mock 头与 scheduleReadiness.test.ts 相同(import '../schedule'
+ * 的模块链需要这三个 mock 才能 collect)。
+ */
+
+import { describe, expect, it, vi } from 'vitest';
+import type { Schedule, CreateScheduleInput, UpdateScheduleInput } from '@cindy/maker-scheduler';
+import { BUILTIN_TEMPLATES, Scheduler } from '@cindy/maker-scheduler';
+import { applyTemplateToMobileScheduleDraft, buildMobileScheduleInput, createMobileScheduleDraft, updateDraftBoundSessionId } from '@cindy/maker-shared/schedule-form';
+
+const handlers = vi.hoisted(() => new Map<string, (...args: unknown[]) => Promise<unknown>>());
+const generation = vi.hoisted(() => ({ install: vi.fn(), providers: vi.fn(), sessionProvider: vi.fn() }));
+vi.mock('../../scheduler-host/hook-script-generator.js', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../../scheduler-host/hook-script-generator.js')>(),
+  installHookScript: generation.install,
+}));
+vi.mock('../../maker-host/createDesktopProviderService.js', () => ({
+  getDesktopProviderService: () => ({ listProviders: generation.providers }),
+}));
+vi.mock('../../maker-host/session-provider-store.js', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../../maker-host/session-provider-store.js')>(),
+  getSessionProvider: generation.sessionProvider,
+}));
+
+vi.mock('electron', () => ({
+  ipcMain: { handle: vi.fn((name, handler) => handlers.set(name, handler)) },
+  BrowserWindow: { getAllWindows: vi.fn(() => []) },
+  app: {
+    getPath: vi.fn(() => '/tmp/cindy-test-user-data'),
+    getAppPath: vi.fn(() => '/tmp/cindy-test-app'),
+    isPackaged: false,
+  },
+}));
+
+vi.mock('../../device-link/broadcast-tap.js', () => ({
+  getSafeDataOwnerPushStamp: vi.fn(() => undefined),
+  tapWindowBroadcast: vi.fn(),
+}));
+
+vi.mock('../../device-link/invoke-context.js', () => ({ isDeviceLinkInvoke: () => true }));
+
+vi.mock('../../agent-island/service.js', () => ({
+  getAgentIslandService: () => null,
+}));
+
+import {
+  normalizeLegacyDeviceLinkIntervalClear,
+  normalizeLegacyDeviceLinkModelSelection,
+  registerScheduleHandlers,
+  setSchedulerReady,
+  normalizeNullableIntervalMs,
+} from '../schedule';
+
+function hasOwn(value: object, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
+describe('normalizeNullableIntervalMs(device-link JSON 边界)', () => {
+  it('null 翻译成带 key 的 undefined(引擎的显式清空表达)', () => {
+    const out = normalizeNullableIntervalMs({ cronExpr: '0 9 * * *', intervalMs: null });
+    expect(hasOwn(out, 'intervalMs')).toBe(true);
+    expect(out.intervalMs).toBeUndefined();
+    expect(out.cronExpr).toBe('0 9 * * *');
+  });
+
+  it('数值原样透传(同一对象,不额外拷贝)', () => {
+    const patch = { intervalMs: 600_000 };
+    expect(normalizeNullableIntervalMs(patch)).toBe(patch);
+  });
+
+  it('省略 key 原样透传,不会被伪造成清空', () => {
+    const patch: { prompt: string; intervalMs?: number | null } = { prompt: 'p' };
+    const out = normalizeNullableIntervalMs(patch);
+    expect(out).toBe(patch);
+    expect(hasOwn(out, 'intervalMs')).toBe(false);
+  });
+
+  it('mobile 清空 patch 走完 JSON round-trip 后仍能翻译成清空表达', () => {
+    // 模拟 device-link 真实线上形态:mobile 发 null → JSON.stringify/parse →
+    // desktop 归一化。这条链任何一环丢 key,清空间隔就静默失效。
+    const wire = JSON.parse(
+      JSON.stringify({ cronExpr: '*/10 * * * *', recurring: true, intervalMs: null }),
+    ) as { cronExpr: string; recurring: boolean; intervalMs?: number | null };
+    expect(hasOwn(wire, 'intervalMs')).toBe(true);
+
+    const out = normalizeNullableIntervalMs(wire);
+    expect(hasOwn(out, 'intervalMs')).toBe(true);
+    expect(out.intervalMs).toBeUndefined();
+  });
+});
+
+describe('normalizeLegacyDeviceLinkIntervalClear(旧版 mobile 的清空兼容)', () => {
+  // 旧版 mobile 全量表单的 wire 形态:带 cronExpr / manual / notify,清空间隔时
+  // 不带 intervalMs key(经 JSON 序列化被丢),靠旧引擎隐式清空表达语义。
+  const legacyForm = {
+    name: '巡检',
+    cronExpr: '0 9 * * *',
+    recurring: true,
+    manual: false,
+    notify: { desktop: true, feishu: false },
+  };
+
+  it('device-link 来源 + 旧全量表单缺 intervalMs key → 翻译成显式清空', () => {
+    const out = normalizeLegacyDeviceLinkIntervalClear({ ...legacyForm }, true);
+    expect(hasOwn(out, 'intervalMs')).toBe(true);
+    expect(out.intervalMs).toBeUndefined();
+  });
+
+  it('非 device-link 来源的同形态 patch 原样透传(MCP / renderer 的真 partial 不受影响)', () => {
+    const patch = { ...legacyForm };
+    expect(normalizeLegacyDeviceLinkIntervalClear(patch, false)).toBe(patch);
+  });
+
+  it('新版 mobile 恒带 intervalMs key(数值或 null 归一化后的 undefined),不会命中兼容分支', () => {
+    const withNumber = { ...legacyForm, intervalMs: 600_000 };
+    expect(normalizeLegacyDeviceLinkIntervalClear(withNumber, true)).toBe(withNumber);
+
+    const clearedByNull = normalizeLegacyDeviceLinkIntervalClear(
+      normalizeNullableIntervalMs({ ...legacyForm, intervalMs: null }),
+      true,
+    );
+    expect(hasOwn(clearedByNull, 'intervalMs')).toBe(true);
+    expect(clearedByNull.intervalMs).toBeUndefined();
+  });
+
+  it('device-link 的非全量 partial(缺 manual/notify 标记)不被伪造成清空', () => {
+    const partial = { cronExpr: '0 9 * * *' };
+    expect(normalizeLegacyDeviceLinkIntervalClear(partial, true)).toBe(partial);
+  });
+});
+
+
+describe('scheduled model selection IPC compatibility', () => {
+  // Integration: a shared provider id must never enter the local utility HTTP
+  // generator, even if a local provider happens to have that same id.
+  it('reports unsupported remote script generation before looking up local credentials', async () => {
+    const getMaker = vi.fn(() => null);
+    registerScheduleHandlers(getMaker);
+    const result = await handlers.get('maker:schedule:generate-pre-run-hook')!(null, {
+      description: 'check changes', modelAgentDeviceId: 'shared:owner', providerId: 'same-id',
+      agentKind: 'codex', model: 'remote-model',
+    });
+    expect(result).toMatchObject({ ok: false, reason: 'no_candidate',
+      attempts: [{ providerId: 'same-id', model: 'remote-model', reason: 'unsupported_transport' }] });
+    expect(getMaker).not.toHaveBeenCalled();
+  });
+  const existing = { id: 'bound-schedule', targetSessionId: 'bound', agentKind: 'codex',
+    modelAgentKind: 'pi', model: 'pi-model', providerId: 'pi-source', effort: 'high', fastMode: true } as Schedule;
+  const fullForm = { cronExpr: '0 9 * * *', manual: false, notify: { desktop: true, feishu: false },
+    targetSessionId: 'bound', agentKind: 'codex', model: 'pi-model' } as UpdateScheduleInput;
+
+  // PR #6830, unit: actual IPC + Scheduler + storage, after a JSON round-trip.
+  // The old remote MCP could set this route but could never restore follow mode.
+  it('persists remote model clearing while omitted model fields remain untouched', async () => {
+    let saved = { ...existing, modelAgentDeviceId: 'shared:owner', name: 'Bound', prompt: 'Run',
+      recurring: true, timezone: 'UTC', cronExpr: '0 9 * * *', status: 'active', workspaceKind: 'dialogue' } as Schedule;
+    const storage = {
+      get: vi.fn(async () => ({ ...saved })),
+      update: vi.fn(async (_id: string, patch: Partial<Schedule>) => (saved = { ...saved, ...patch })),
+    };
+    setSchedulerReady(new Scheduler({ storage: storage as never, runner: { fire: vi.fn() } }), storage as never);
+    registerScheduleHandlers();
+    await handlers.get('maker:schedule:update')!(null, saved.id, JSON.parse(JSON.stringify({ name: 'Renamed' })));
+    expect(saved).toMatchObject({ modelAgentDeviceId: 'shared:owner', modelAgentKind: 'pi', model: 'pi-model' });
+    const clear = { modelAgentDeviceId: null, modelAgentKind: null, model: null, providerId: null, effort: null, fastMode: false };
+    await handlers.get('maker:schedule:update')!(null, saved.id, JSON.parse(JSON.stringify(clear)));
+    const reopened = await handlers.get('maker:schedule:get')!(null, saved.id);
+    expect(reopened).toMatchObject({ name: 'Renamed', targetSessionId: 'bound', agentKind: 'codex',
+      modelAgentDeviceId: undefined, modelAgentKind: undefined, model: undefined, providerId: undefined, effort: undefined, fastMode: false });
+  });
+
+  // PR #6830, unit: a remote bound task supplies cwd only when the user explicitly
+  // selects a local Codex model. The generator must use the connected local source.
+  it('resolves an explicit local hook model without inheriting the remote task route', async () => {
+    generation.providers.mockResolvedValue([{ id: 'local-source', source: 'user', connected: true, agents: ['codex'],
+      routing: { codex: {} }, models: { codex: [{ id: 'local-model', name: 'Local', contextWindow: 1000 }] } }]);
+    generation.sessionProvider.mockReturnValue('remote-source');
+    generation.install.mockResolvedValue({ command: 'node check.mjs' });
+    const maker = { getSessionMeta: vi.fn(async () => ({ agentKind: 'claude-code', model: 'remote-model', agentDeviceId: 'studio' })) };
+    registerScheduleHandlers(() => maker as never);
+    const result = await handlers.get('maker:schedule:generate-pre-run-hook')!(null, {
+      description: 'check changes', targetSessionId: 'bound', resolveBoundSessionRoute: true,
+      modelAgentDeviceId: '', agentKind: 'codex', model: 'local-model',
+    });
+    expect(result).toMatchObject({ ok: true, command: 'node check.mjs' });
+    expect(generation.install).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({
+      agentKind: 'codex', model: 'local-model', providerId: 'local-source',
+    }));
+    const calls = generation.install.mock.calls.length;
+    const unavailable = await handlers.get('maker:schedule:generate-pre-run-hook')!(null, {
+      description: 'check changes', targetSessionId: 'bound', resolveBoundSessionRoute: true,
+      modelAgentDeviceId: '', agentKind: 'codex', model: 'missing',
+    });
+    expect(unavailable).toMatchObject({ ok: false, reason: 'no_candidate' });
+    expect(generation.install).toHaveBeenCalledTimes(calls);
+  });
+
+  it('normalizes an old Mobile full form inside the update handler before partial merge', async () => {
+    const updateFromCurrent = vi.fn(async (_id, update) => ({ ...existing, ...await update(existing) }));
+    setSchedulerReady({ updateFromCurrent } as never, {} as never);
+    registerScheduleHandlers();
+    const wire = JSON.parse(JSON.stringify({ ...fullForm, model: 'codex-model' }));
+    const result = await handlers.get('maker:schedule:update')!(null, existing.id, wire);
+    expect(result).toMatchObject({ agentKind: 'codex', modelAgentKind: 'codex', model: 'codex-model', fastMode: false });
+    expect(result).toHaveProperty('providerId', undefined);
+    expect(result).toHaveProperty('effort', undefined);
+    expect(updateFromCurrent).toHaveBeenCalledTimes(1);
+    expect(existing).toMatchObject({ modelAgentKind: 'pi', providerId: 'pi-source', fastMode: true });
+  });
+
+  it('preserves an untouched old full form and genuine local/remote partial updates', () => {
+    expect(normalizeLegacyDeviceLinkModelSelection(existing, fullForm, true)).toBe(fullForm);
+    const partial = { model: 'other' };
+    expect(normalizeLegacyDeviceLinkModelSelection(existing, partial, true)).toBe(partial);
+    const local = { ...fullForm, model: 'other' };
+    expect(normalizeLegacyDeviceLinkModelSelection(existing, local, false)).toBe(local);
+    const modern = { ...fullForm, model: 'other', modelAgentKind: 'pi' as const };
+    expect(normalizeLegacyDeviceLinkModelSelection(existing, modern, true)).toBe(modern);
+  });
+
+  it('clears the old explicit route when the old full form clears its model', () => {
+    const wire = JSON.parse(JSON.stringify({ ...fullForm, model: undefined }));
+    expect(normalizeLegacyDeviceLinkModelSelection(existing, wire, true)).toMatchObject({
+      modelAgentKind: undefined, model: undefined, providerId: undefined, effort: undefined, fastMode: false,
+    });
+  });
+
+  it.each([
+    { model: '', rebind: false }, { model: '   ', rebind: false }, { model: '', rebind: true },
+    // Integration, PR #6830: clearing a saved location through JSON must restore
+    // follow mode, not produce an incomplete explicit local selection.
+    { model: '', rebind: false, modelAgentDeviceId: 'shared:owner' },
+    { model: '', rebind: false, modelAgentDeviceId: '' },
+  ])('saves and reopens a Mobile bound form after clearing its model: %j', async ({ model, rebind, modelAgentDeviceId }) => {
+    let saved = { ...existing, ...fullForm, name: 'Bound', prompt: 'Run', modelAgentDeviceId,
+      recurring: true, timezone: 'UTC', status: 'active', workspaceKind: 'dialogue' } as Schedule;
+    const storage = {
+      get: vi.fn(async () => ({ ...saved })),
+      update: vi.fn(async (_id: string, patch: Partial<Schedule>) => {
+        saved = { ...saved, ...patch };
+        return { ...saved };
+      }),
+    };
+    const scheduler = new Scheduler({ storage: storage as never, runner: { fire: vi.fn() } });
+    setSchedulerReady(scheduler, storage as never);
+    registerScheduleHandlers();
+    const originalDraft = createMobileScheduleDraft({ ...saved, source: 'user' });
+    const draft = rebind
+      ? { ...updateDraftBoundSessionId(originalDraft, 'new-codex', 'codex'), persistentSession: true }
+      : originalDraft;
+    const targetSessionId = rebind ? 'new-codex' : 'bound';
+    const wire = JSON.parse(JSON.stringify(buildMobileScheduleInput({ ...draft, model })));
+    expect(wire).not.toHaveProperty('modelAgentKind');
+    const result = await handlers.get('maker:schedule:update')!(null, existing.id, wire);
+    expect(result).toMatchObject({ agentKind: 'codex', targetSessionId, persistentSession: rebind,
+      modelAgentKind: undefined, modelAgentDeviceId: undefined, model: undefined, providerId: undefined, effort: 'high', fastMode: false });
+    expect(storage.update).toHaveBeenCalledTimes(1);
+    const reopened = createMobileScheduleDraft({ ...saved, source: 'user' });
+    expect(reopened).toMatchObject({ agentKind: 'codex', model: '', modelAgentKind: undefined });
+    const unchanged = JSON.parse(JSON.stringify(buildMobileScheduleInput({ ...reopened, name: 'Renamed' })));
+    await handlers.get('maker:schedule:update')!(null, existing.id, unchanged);
+    expect(saved).toMatchObject({ name: 'Renamed', agentKind: 'codex', model: undefined, modelAgentKind: undefined });
+  });
+
+  it.each([true, false])('passes a Mobile template choice and Fast=%s through the real creation handler', async (fastMode) => {
+    const template = BUILTIN_TEMPLATES[0]!;
+    const draft = applyTemplateToMobileScheduleDraft(createMobileScheduleDraft(), {
+      ...template, agentKind: 'pi', model: 'pi-model', providerId: 'pi-source', fastMode: true,
+      useWorktree: false,
+    });
+    const input = buildMobileScheduleInput({ ...draft, targetSessionId: 'bound', effort: 'high', fastMode });
+    const create = vi.fn(async (input: CreateScheduleInput) => input);
+    setSchedulerReady({ create } as never, {} as never);
+    registerScheduleHandlers();
+    const wire = JSON.parse(JSON.stringify({ templateId: template.id, overrides: input }));
+    await handlers.get('maker:schedule:create-from-template')!(null, wire);
+    expect(create).toHaveBeenCalledWith(expect.objectContaining({
+      targetSessionId: 'bound', agentKind: 'pi', modelAgentKind: 'pi', model: 'pi-model',
+      providerId: 'pi-source', effort: 'high', fastMode,
+    }));
+  });
+
+  // PR #6832: template creation dropped the runtime location while retaining its
+  // model/provider. Existing template cases bound a task and had no device field.
+  // Unit tier: JSON -> real IPC handler -> creation input, with a remote-only route.
+  it.each(['studio', null, undefined])('preserves template runtime location %s through the JSON handler', async (agentDeviceId) => {
+    const create = vi.fn(async (input: CreateScheduleInput) => input);
+    setSchedulerReady({ create } as never, {} as never);
+    registerScheduleHandlers();
+    const wire = JSON.parse(JSON.stringify({
+      templateId: BUILTIN_TEMPLATES[0]!.id,
+      overrides: { agentDeviceId, agentKind: 'codex', model: 'remote-only', providerId: 'remote-source' },
+    }));
+    const result = await handlers.get('maker:schedule:create-from-template')!(null, wire);
+    expect(result).toMatchObject({ agentKind: 'codex', model: 'remote-only', providerId: 'remote-source' });
+    expect((result as CreateScheduleInput).agentDeviceId).toBe(agentDeviceId);
+  });
+
+  it.skipIf(process.platform === 'win32')('rejects a template override whose pre-run hook has a shell syntax error', async () => {
+    const create = vi.fn(async (input: CreateScheduleInput) => input);
+    setSchedulerReady({ create } as never, {} as never);
+    registerScheduleHandlers();
+    const wire = JSON.parse(JSON.stringify({
+      templateId: BUILTIN_TEMPLATES[0]!.id,
+      overrides: { preRunHook: { command: `node '/a b/x.mjs'//'` } },
+    }));
+    await expect(handlers.get('maker:schedule:create-from-template')!(null, wire))
+      .rejects.toThrow(/shell syntax error/);
+    expect(create).not.toHaveBeenCalled();
+  });
+});

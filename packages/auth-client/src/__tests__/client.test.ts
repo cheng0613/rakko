@@ -1,0 +1,1082 @@
+import { describe, expect, it, vi } from "vitest";
+
+import {
+  AuthApiError,
+  captchaRequiredActionForVerificationKind,
+  CindyAuthClient,
+  discoverSsoOrgRealm,
+  parseAccountDeletionReceiptRecord,
+  parseAuthSessionRecord,
+  reduceAuthFlow,
+  serializeAccountDeletionReceiptRecord,
+  soleAutoStartSsoMethod,
+  soleLoginMethod,
+  ssoOrgDiscoveryToMethods,
+  serializeAuthSessionRecord,
+  type AuthFetch,
+  type AuthFetchResponse,
+} from "../index.js";
+
+function response(status: number, data: unknown): AuthFetchResponse {
+  return { ok: status >= 200 && status < 300, status, json: async () => data };
+}
+
+/** 拼接出与真实密钥同形、内容无意义的夹具，避免密钥形态字面量进入仓库历史。 */
+const fakeSecret = (...parts: string[]) => parts.join("-");
+
+function client(fetch: AuthFetch = vi.fn(async () => response(200, {}))) {
+  return new CindyAuthClient({
+    baseUrl: "https://auth.example.com/",
+    region: "cn",
+    deviceId: "device-1",
+    clientType: "desktop",
+    locale: "zh-CN",
+    fetch,
+  });
+}
+
+describe("CindyAuthClient", () => {
+  it.each(["request", "response"] as const)("reports the original %s error before mapping it", async (stage) => {
+    const original = new TypeError("socket closed", { cause: new Error("proxy rejected CONNECT") });
+    const onRequestError = vi.fn();
+    const instance = new CindyAuthClient({
+      baseUrl: "https://auth.example.com", region: "cn", deviceId: "device-1", clientType: "desktop",
+      fetch: async () => {
+        if (stage === "request") throw original;
+        return { ok: true, status: 200, json: async () => { throw original; } };
+      },
+      onRequestError,
+    });
+    await expect(instance.refresh("unused-token")).rejects.toMatchObject({
+      code: stage === "request" ? "NETWORK_ERROR" : "INVALID_RESPONSE",
+    });
+    expect(onRequestError).toHaveBeenCalledExactlyOnceWith(
+      "/api/auth/refresh", stage === "request" ? 0 : 200, original,
+    );
+  });
+
+  it("ignores a failing error logger without changing the mapped request error", async () => {
+    const onRequestError = vi.fn(() => { throw new Error("logger unavailable"); });
+    const original = new TypeError("proxy refused tunnel");
+    const instance = new CindyAuthClient({
+      baseUrl: "https://auth.example.com", region: "cn", deviceId: "device-1", clientType: "desktop",
+      fetch: async () => { throw original; },
+      onRequestError,
+    });
+    await expect(instance.refresh("unused-token")).rejects.toMatchObject({
+      code: "NETWORK_ERROR",
+    });
+    expect(onRequestError).toHaveBeenCalledExactlyOnceWith(
+      "/api/auth/refresh", 0, original,
+    );
+  });
+
+  it("returns parsed HTTP error text to the caller without sending it to the exception logger", async () => {
+    const onRequestError = vi.fn();
+    const instance = new CindyAuthClient({
+      baseUrl: "https://auth.example.com", region: "cn", deviceId: "device-1", clientType: "desktop",
+      fetch: async () => response(400, { error: { code: "INVALID_PARAMS", message: "private display name rejected" } }),
+      onRequestError,
+    });
+    await expect(instance.refresh("unused-token")).rejects.toMatchObject({
+      code: "INVALID_PARAMS", message: "private display name rejected",
+    });
+    expect(onRequestError).not.toHaveBeenCalled();
+  });
+
+  // #9574 Codex P2: correlation-id redaction must not rewrite AuthApiError.code.
+  // runLoginAction treats TOKEN_EXPIRED as a dead ticket and clears private
+  // state; folding it into AUTH_REQUEST_FAILED leaves that ticket in place.
+  // 测试价值
+  // - 生产入口与可观察结果：CindyAuthClient.refresh；非 429 的 error.code 原样成为 AuthApiError.code，被拒时变成 AUTH_REQUEST_FAILED
+  // - Bug／规则依据：PR #9574 Codex P2；authManager runLoginAction 依赖 TOKEN_EXPIRED
+  // - 现有覆盖缺口：相邻用例只覆盖 INVALID_PARAMS 透传，没有覆盖会被 Token 前缀误伤的码，也没有覆盖错误码上的密钥与手机号形态
+  // - 最小失败输入：401 + error.code=TOKEN_EXPIRED（修复前变成 AUTH_REQUEST_FAILED）；sk- 与纯数字手机号仍必须变成 AUTH_REQUEST_FAILED
+  // - tier：unit，进程内注入 fetch，不打网络
+  it.each([
+    {
+      label: "keeps TOKEN_EXPIRED instead of treating the Token prefix as a credential",
+      code: "TOKEN_EXPIRED",
+      expected: "TOKEN_EXPIRED",
+    },
+    {
+      label: "keeps INVALID_OTP",
+      code: "INVALID_OTP",
+      expected: "INVALID_OTP",
+    },
+    {
+      label: "drops an sk- shaped error code",
+      code: fakeSecret("sk", "proj", "not-an-error-code"),
+      expected: "AUTH_REQUEST_FAILED",
+    },
+    {
+      label: "drops a phone-shaped error code",
+      code: "13800138000",
+      expected: "AUTH_REQUEST_FAILED",
+    },
+  ])("server error code filter: $label", async ({ code, expected }) => {
+    const fetch: AuthFetch = async () =>
+      response(401, { error: { code, message: "unused" } });
+    await expect(client(fetch).refresh("unused-token")).rejects.toMatchObject({
+      code: expected,
+      statusCode: 401,
+    });
+  });
+
+  // Native SyntaxError.message includes body excerpts even when no response object is logged.
+  it.each([200, 400])("logs only the JSON error type for a malformed %s response", async (status) => {
+    const onRequestError = vi.fn();
+    const instance = new CindyAuthClient({
+      baseUrl: "https://auth.example.com", region: "cn", deviceId: "device-1", clientType: "desktop",
+      fetch: async () => new Response("private display name", { status }),
+      onRequestError,
+    });
+    await expect(instance.refresh("unused-token")).rejects.toMatchObject({
+      code: "INVALID_RESPONSE", statusCode: status,
+    });
+    expect(onRequestError).toHaveBeenCalledExactlyOnceWith(
+      "/api/auth/refresh", status, "SyntaxError",
+    );
+  });
+
+  it.each([
+    ["120", 120_000],
+    ["Wed, 07 Oct 2026 06:02:00 GMT", 120_000],
+    ["Wed, 07 Oct 2026 05:00:00 GMT", 0],
+    ["0", 0],
+    ["-2", undefined],
+    ["1.5", undefined],
+    ["junk", undefined],
+    ["999999999999999999999999", undefined],
+    ["", undefined],
+  ])(
+    "preserves a valid Retry-After without guessing: %s",
+    async (value, delay) => {
+      const now = Date.parse("2026-10-07T06:00:00Z");
+      const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+      try {
+        const fetch: AuthFetch = async () => ({
+          ...response(429, {}),
+          headers: {
+            get: (name) =>
+              name === "retry-after" ? value : "Wed, 07 Oct 2026 06:00:00 GMT",
+          },
+        });
+        await expect(
+          client(fetch).requestCode("phone", "13800138000"),
+        ).rejects.toMatchObject({
+          code: "RATE_LIMITED",
+          retryAt: delay === undefined ? undefined : now + delay,
+        });
+      } finally {
+        clock.mockRestore();
+      }
+    },
+  );
+
+  it("keeps a non-JSON 429 actionable and corrects HTTP-date for server clock skew", async () => {
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    try {
+      const fetch: AuthFetch = async () => ({
+        ok: false,
+        status: 429,
+        headers: {
+          get: (name) =>
+            name === "retry-after"
+              ? "Wed, 07 Oct 2026 06:02:00 GMT"
+              : "Wed, 07 Oct 2026 06:00:00 GMT",
+        },
+        json: async () => {
+          throw new SyntaxError("HTML response");
+        },
+      });
+      await expect(client(fetch).getProviders()).rejects.toMatchObject({
+        code: "RATE_LIMITED",
+        retryAt: now + 120_000,
+      });
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  // #9356: RATE_LIMITED stays the client category. The server's own code and a
+  // correlation id must survive so a failed send can be matched later; a missing
+  // or unsafe id is recorded as absent instead of guessed.
+  type RateLimitDiagnosticRow = {
+    label: string;
+    body: unknown;
+    headers: Record<string, string | undefined>;
+    serverCode: string | undefined;
+    requestId: string | undefined;
+    hasRetryAt: boolean;
+  };
+
+  it.each<RateLimitDiagnosticRow>([
+    {
+      label: "keeps a daily-quota code beside the category",
+      body: { error: { code: "SMS_DAILY_LIMIT", message: "daily limit" } },
+      headers: { "x-request-id": "req-9356", "retry-after": "3600" },
+      serverCode: "SMS_DAILY_LIMIT",
+      requestId: "req-9356",
+      hasRetryAt: true,
+    },
+    {
+      label: "records a short retry window without inventing a server code",
+      body: { error: { code: "RETRY_TOO_SOON", message: "retry later" } },
+      headers: { "x-litellm-call-id": "call-60", "retry-after": "60" },
+      serverCode: "RETRY_TOO_SOON",
+      requestId: "call-60",
+      hasRetryAt: true,
+    },
+    {
+      label: "marks a 429 with no wait and no correlation id as absent",
+      body: { message: "slow down" },
+      headers: {},
+      serverCode: undefined,
+      requestId: undefined,
+      hasRetryAt: false,
+    },
+    {
+      label: "drops a request id that could carry a credential or phone number",
+      body: { error: { code: "not a code", message: "unused" } },
+      headers: { "x-request-id": "+8615100000000" },
+      serverCode: undefined,
+      requestId: undefined,
+      hasRetryAt: false,
+    },
+    {
+      // #9574: the charset whitelist alone accepts a bare phone number. That value
+      // must stay out of the error object the desktop log copies verbatim.
+      label: "drops a digit-only phone number that the charset whitelist would keep",
+      body: { error: { code: "RATE_LIMITED", message: "slow down" } },
+      headers: { "x-request-id": "13800138000" },
+      serverCode: "RATE_LIMITED",
+      requestId: undefined,
+      hasRetryAt: false,
+    },
+    {
+      // Spaced numbers and "Bearer ..." already fail the charset whitelist. These
+      // shapes pass it (digits, or a credential prefix plus the allowed charset)
+      // and must still drop.
+      label: "drops a spaced-looking digit phone and an sk- key the charset whitelist accepts",
+      body: { error: { code: "RATE_LIMITED", message: "slow down" } },
+      headers: {
+        "x-request-id": "138-0013-8000",
+        "x-litellm-call-id": fakeSecret("sk", "proj", "not-a-request-id"),
+      },
+      serverCode: "RATE_LIMITED",
+      requestId: undefined,
+      hasRetryAt: false,
+    },
+    {
+      label: "drops a pk- key and a Bearer token written without a space",
+      body: { error: { code: "RATE_LIMITED", message: "slow down" } },
+      headers: {
+        "x-request-id": fakeSecret("pk", "live", "not-a-request-id"),
+        "x-litellm-call-id": "Bearer" + fakeSecret("sk", "not-a-request-id"),
+      },
+      serverCode: "RATE_LIMITED",
+      requestId: undefined,
+      hasRetryAt: false,
+    },
+  ])("preserves 429 diagnostics: $label", async (row) => {
+    const now = Date.parse("2026-10-07T06:00:00Z");
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    try {
+      const fetch: AuthFetch = async () => ({
+        ...response(429, row.body),
+        headers: { get: (name) => row.headers[name.toLowerCase()] ?? null },
+      });
+      await expect(
+        client(fetch).requestCode("phone", "13800138000"),
+      ).rejects.toMatchObject({
+        code: "RATE_LIMITED",
+        statusCode: 429,
+        serverCode: row.serverCode,
+        requestId: row.requestId,
+        retryAt: row.hasRetryAt ? expect.any(Number) : undefined,
+      });
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  // #9574: HTTP 200 with `{}` fails the sent-body contract. The id was already
+  // read from the header and must ride along on INVALID_RESPONSE, same as a
+  // non-JSON body. A phone-shaped or key-shaped header still counts as absent,
+  // and the thrown error must not echo the response body.
+  it.each([
+    {
+      label: "keeps a safe request id when the sent body is empty",
+      header: "req-empty-body",
+      requestId: "req-empty-body",
+    },
+    {
+      label: "drops a phone-shaped request id when the sent body is empty",
+      header: "13800138000",
+      requestId: undefined,
+    },
+  ])("request-code contract failure: $label", async (row) => {
+    const fetch: AuthFetch = async () => ({
+      ...response(200, {}),
+      headers: { get: (name) => (name.toLowerCase() === "x-request-id" ? row.header : null) },
+    });
+    await expect(
+      client(fetch).requestCode("phone", "13800138000"),
+    ).rejects.toMatchObject({
+      code: "INVALID_RESPONSE",
+      statusCode: 200,
+      requestId: row.requestId,
+      message: "Authentication server response did not match the client contract",
+    });
+  });
+
+  it("propagates SMS request-code rate limits instead of reporting a successful send", async () => {
+    const fetch = vi.fn<AuthFetch>(async () =>
+      response(429, {
+        error: { code: "RATE_LIMITED", message: "Too many requests" },
+      }),
+    );
+    await expect(
+      client(fetch).requestCode("phone", "13800138000"),
+    ).rejects.toMatchObject({
+      code: "RATE_LIMITED",
+      statusCode: 429,
+      serverCode: "RATE_LIMITED",
+    });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(fetch.mock.calls[0]?.[0]).toBe(
+      "https://auth.example.com/api/auth/phone/request-code",
+    );
+  });
+
+  it("validates provider region and normalizes the base URL", async () => {
+    const fetch = vi.fn(async () =>
+      response(200, {
+        region: "cn",
+        attribution: "phone",
+        email: true,
+        phone: true,
+        social: ["apple"],
+      }),
+    );
+    await expect(client(fetch).getProviders()).resolves.toMatchObject({
+      region: "cn",
+    });
+    expect(fetch).toHaveBeenCalledWith(
+      "https://auth.example.com/api/auth/providers",
+      expect.anything(),
+    );
+  });
+
+  it("fails closed on a region mismatch", async () => {
+    const fetch = vi.fn(async () =>
+      response(200, {
+        region: "global",
+        attribution: "email",
+        email: true,
+        phone: false,
+        social: ["google"],
+      }),
+    );
+    await expect(client(fetch).getProviders()).rejects.toMatchObject({
+      code: "REGION_MISMATCH",
+    });
+  });
+
+  it("parses the optional captcha config from providers", async () => {
+    const fetch = vi.fn(async () =>
+      response(200, {
+        region: "cn",
+        attribution: "phone",
+        email: true,
+        phone: true,
+        social: [],
+        captcha: {
+          provider: "turnstile",
+          siteKey: "scenario-captcha-sitekey",
+          requiredFor: ["email_request_code"],
+        },
+      }),
+    );
+    await expect(client(fetch).getProviders()).resolves.toMatchObject({
+      captcha: { provider: "turnstile", requiredFor: ["email_request_code"] },
+    });
+    // 客户端预认短信发码动作；服务端以后仅需下发该值即可启用，无需客户端发版。
+    // 其他 append-only 未知动作仍忽略，不让整份 providers 解析失败。
+    const extendedFetch = vi.fn(async () =>
+      response(200, {
+        region: "cn",
+        attribution: "phone",
+        email: true,
+        phone: true,
+        social: [],
+        captcha: {
+          provider: "turnstile",
+          siteKey: "scenario-captcha-sitekey",
+          requiredFor: [
+            "email_request_code",
+            "phone_request_code",
+            "future_request_code",
+          ],
+        },
+      }),
+    );
+    const extended = await client(extendedFetch).getProviders();
+    expect(extended.captcha?.requiredFor).toEqual([
+      "email_request_code",
+      "phone_request_code",
+    ]);
+    expect(captchaRequiredActionForVerificationKind("email")).toBe(
+      "email_request_code",
+    );
+    expect(captchaRequiredActionForVerificationKind("phone")).toBe(
+      "phone_request_code",
+    );
+    // 旧 server 缺字段 → undefined(可选字段,不整份拒绝)
+    const legacyFetch = vi.fn(async () =>
+      response(200, {
+        region: "cn",
+        attribution: "phone",
+        email: true,
+        phone: true,
+        social: [],
+      }),
+    );
+    const legacy = await client(legacyFetch).getProviders();
+    expect(legacy.captcha).toBeUndefined();
+  });
+
+  it("keeps recognized discovery methods when the server appends an unknown type", async () => {
+    const fetch = vi.fn(async () =>
+      response(200, {
+        methods: [{ type: "email_code" }, { type: "passkey", id: "future-1" }],
+      }),
+    );
+    await expect(client(fetch).discover("user@example.com")).resolves.toEqual([
+      { type: "email_code" },
+    ]);
+  });
+
+  it("fails closed when discovery returns only unrecognized methods", async () => {
+    const fetch = vi.fn(async () =>
+      response(200, { methods: [{ type: "passkey", id: "future-1" }] }),
+    );
+    await expect(
+      client(fetch).discover("user@example.com"),
+    ).rejects.toMatchObject({
+      code: "INVALID_RESPONSE",
+    });
+  });
+
+  it("carries captchaToken in the email request-code body only when provided", async () => {
+    const fetch = vi.fn<AuthFetch>(async () =>
+      response(200, { status: "sent" }),
+    );
+    await client(fetch).requestCode("email", "user@example.com");
+    const bare = JSON.parse(
+      (fetch.mock.calls[0]?.[1] as { body: string }).body,
+    ) as Record<string, unknown>;
+    expect(bare).toEqual({ email: "user@example.com", locale: "zh-CN" });
+    await client(fetch).requestCode("email", "user@example.com", {
+      captchaToken: "captcha-token-1",
+    });
+    const withToken = JSON.parse(
+      (fetch.mock.calls[1]?.[1] as { body: string }).body,
+    ) as Record<string, unknown>;
+    expect(withToken).toEqual({
+      email: "user@example.com",
+      locale: "zh-CN",
+      captchaToken: "captcha-token-1",
+    });
+  });
+
+  it("parses all auth-server outcome states", async () => {
+    const outcomes = [
+      { status: "binding_required", bindType: "phone", bindTicket: "bind-1" },
+      {
+        status: "sso_verification_required",
+        verificationTicket: "sso-ticket-1",
+        channel: "email",
+        targetMasked: "a***@example.com",
+      },
+      {
+        status: "select_account",
+        loginTicket: "login-1",
+        accountToken: "account-access",
+        accountRefreshToken: "account-refresh",
+        accounts: [
+          {
+            id: "m1",
+            kind: "personal",
+            role: "owner",
+            displayName: "Cindy",
+            email: null,
+            orgId: null,
+            orgName: null,
+          },
+        ],
+      },
+      {
+        status: "ok",
+        accountDeletionRestored: true,
+        accessToken: "access",
+        refreshToken: "refresh",
+        membership: {
+          id: "m1",
+          passportId: "p1",
+          kind: "personal",
+          role: "owner",
+          displayName: "Cindy",
+          email: null,
+          orgId: null,
+          orgName: null,
+        },
+      },
+    ];
+    const fetch = vi.fn(async () => response(200, outcomes.shift()));
+    await expect(
+      client(fetch).verifyCode("email", "a@example.com", "123456"),
+    ).resolves.toMatchObject({ status: "binding_required" });
+    await expect(
+      client(fetch).verifyCode("phone", "+8613800000000", "123456"),
+    ).resolves.toMatchObject({ status: "sso_verification_required" });
+    await expect(
+      client(fetch).verifyCode("phone", "+8613800000000", "123456"),
+    ).resolves.toMatchObject({ status: "select_account" });
+    await expect(
+      client(fetch).selectAccount("login-1", "m1"),
+    ).resolves.toMatchObject({
+      status: "ok",
+      accountDeletionRestored: true,
+    });
+  });
+
+  it("keeps Apple native login compatible when the SDK omits authorizationCode", async () => {
+    const fetch = vi.fn<AuthFetch>(async () =>
+      response(200, {
+        status: "binding_required",
+        bindType: "email",
+        bindTicket: "bind-apple",
+      }),
+    );
+    const auth = client(fetch);
+
+    await expect(
+      auth.exchangeNativeSocial("apple", {
+        identityToken: "identity-token",
+        rawNonce: "raw-nonce-placeholder",
+      }),
+    ).resolves.toMatchObject({ status: "binding_required" });
+
+    const body = JSON.parse(String(fetch.mock.calls[0]?.[1]?.body));
+    expect(body).toMatchObject({
+      identityToken: "identity-token",
+      rawNonce: "raw-nonce-placeholder",
+    });
+    expect(body).not.toHaveProperty("authorizationCode");
+  });
+
+  it("uses an authenticated challenge and an unauthenticated receipt for account deletion", async () => {
+    const pending = {
+      status: "pending" as const,
+      requestedAt: "2026-07-22T00:00:00.000Z",
+      deleteAfter: "2026-08-21T00:00:00.000Z",
+    };
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(
+        response(200, {
+          available: true,
+          verification: {
+            channel: "email",
+            maskedTarget: "a***@example.com",
+          },
+          manualAppleRevocationRequired: false,
+        }),
+      )
+      .mockResolvedValueOnce(
+        response(200, {
+          challengeId: "challenge-1",
+          receiptToken: "receipt-1",
+          channel: "email",
+          maskedTarget: "a***@example.com",
+          expiresAt: "2026-07-22T00:10:00.000Z",
+        }),
+      )
+      .mockResolvedValueOnce(response(200, pending))
+      .mockResolvedValueOnce(response(200, pending));
+    const auth = client(fetch);
+
+    await expect(
+      auth.getAccountDeletionAvailability("access-token"),
+    ).resolves.toMatchObject({ available: true });
+    const challenge =
+      await auth.requestAccountDeletionChallenge("access-token");
+    await expect(
+      auth.confirmAccountDeletion("access-token", {
+        challengeId: challenge.challengeId,
+        receiptToken: challenge.receiptToken,
+        code: "123456",
+        acknowledged: true,
+      }),
+    ).resolves.toEqual(pending);
+    await expect(
+      auth.getAccountDeletionStatus(challenge.receiptToken),
+    ).resolves.toEqual(pending);
+
+    expect(fetch.mock.calls[0]?.[1]?.headers).toMatchObject({
+      Authorization: "Bearer access-token",
+    });
+    expect(fetch.mock.calls[1]?.[1]?.headers).toMatchObject({
+      Authorization: "Bearer access-token",
+    });
+    expect(fetch.mock.calls[2]?.[1]?.headers).toMatchObject({
+      Authorization: "Bearer access-token",
+    });
+    expect(fetch.mock.calls[3]?.[1]?.headers).not.toHaveProperty(
+      "Authorization",
+    );
+  });
+
+  it("uses account tokens only for account control and exchanges a resource token", async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(
+        response(200, {
+          memberships: [
+            {
+              id: "org-membership",
+              kind: "org",
+              role: "member",
+              displayName: "Corp User",
+              email: "user@example.com",
+              orgId: "org-1",
+              orgName: "Corp",
+              orgSlug: "org-corp",
+            },
+          ],
+        }),
+      )
+      .mockResolvedValueOnce(
+        response(200, {
+          status: "ok",
+          accessToken: "org-access",
+          refreshToken: "org-refresh",
+          membership: {
+            id: "org-membership",
+            kind: "org",
+            role: "member",
+            displayName: "Corp User",
+            email: "user@example.com",
+            orgId: "org-1",
+            orgName: "Corp",
+          },
+        }),
+      )
+      .mockResolvedValueOnce(
+        response(200, {
+          accountToken: "rotated-account-access",
+          accountRefreshToken: "rotated-account-refresh",
+        }),
+      )
+      .mockResolvedValueOnce(response(200, { status: "ok" }));
+    const auth = client(fetch);
+    await expect(
+      auth.getAccountMemberships("account-access"),
+    ).resolves.toHaveLength(1);
+    await expect(
+      auth.exchangeAccountMembership("account-access", "org-membership"),
+    ).resolves.toMatchObject({ accessToken: "org-access" });
+    await expect(auth.refreshAccount("account-refresh")).resolves.toEqual({
+      accountToken: "rotated-account-access",
+      accountRefreshToken: "rotated-account-refresh",
+    });
+    await expect(
+      auth.logoutAccount("rotated-account-access"),
+    ).resolves.toBeUndefined();
+    expect(fetch.mock.calls[0]?.[1]?.headers).toMatchObject({
+      Authorization: "Bearer account-access",
+    });
+    expect(fetch.mock.calls[1]?.[1]?.headers).toMatchObject({
+      Authorization: "Bearer account-access",
+    });
+    expect(fetch.mock.calls[2]?.[0]).toBe(
+      "https://auth.example.com/api/auth/account/refresh",
+    );
+    expect(fetch.mock.calls[3]?.[1]?.headers).toMatchObject({
+      Authorization: "Bearer rotated-account-access",
+    });
+    expect(fetch.mock.calls[3]?.[1]).toMatchObject({
+      method: "POST",
+      body: "{}",
+    });
+  });
+
+  it("maps server errors without leaking malformed responses", async () => {
+    const fetch = vi.fn(async () =>
+      response(401, { error: { code: "INVALID_CODE", message: "bad" } }),
+    );
+    await expect(
+      client(fetch).verifyCode("email", "a@example.com", "000000"),
+    ).rejects.toEqual(
+      expect.objectContaining({ code: "INVALID_CODE", statusCode: 401 }),
+    );
+  });
+
+  it("discovers enterprise SSO connections by org id and maps to login methods", async () => {
+    const fetch = vi.fn(async () =>
+      response(200, {
+        region: "cn",
+        orgName: "Disco Corp",
+        connections: [
+          { connectionId: "conn-1", protocol: "saml", connectionName: "Okta" },
+        ],
+      }),
+    );
+    const discovery = await client(fetch).discoverSsoOrg("disco-corp");
+    expect(fetch).toHaveBeenCalledWith(
+      "https://auth.example.com/api/auth/sso/discovery",
+      expect.objectContaining({ body: JSON.stringify({ org: "disco-corp" }) }),
+    );
+    expect(ssoOrgDiscoveryToMethods(discovery)).toEqual([
+      {
+        type: "sso",
+        connectionId: "conn-1",
+        protocol: "saml",
+        orgName: "Disco Corp",
+        connectionName: "Okta",
+        ssoRequired: false,
+      },
+    ]);
+    expect(
+      soleAutoStartSsoMethod(ssoOrgDiscoveryToMethods(discovery)),
+    ).toMatchObject({
+      type: "sso",
+      connectionId: "conn-1",
+    });
+  });
+
+  it("maps an empty SSO connection list to the precise ORG_SSO_NOT_FOUND error", async () => {
+    const fetch = vi.fn(async () =>
+      response(200, { region: "cn", orgName: "Empty Corp", connections: [] }),
+    );
+    await expect(
+      client(fetch).discoverSsoOrg("empty-corp"),
+    ).rejects.toMatchObject({ code: "ORG_SSO_NOT_FOUND" });
+  });
+
+  it("fails closed when SSO discovery responds from the wrong region", async () => {
+    const fetch = vi.fn(async () =>
+      response(200, {
+        region: "global",
+        orgName: "Disco Corp",
+        connections: [
+          { connectionId: "conn-1", protocol: "saml", connectionName: "Okta" },
+        ],
+      }),
+    );
+    await expect(
+      client(fetch).discoverSsoOrg("disco-corp"),
+    ).rejects.toMatchObject({
+      code: "REGION_MISMATCH",
+    });
+  });
+
+  it("checks the response region before treating an empty connection list as not found", async () => {
+    const fetch = vi.fn(async () =>
+      response(200, {
+        region: "global",
+        orgName: "Misrouted Corp",
+        connections: [],
+      }),
+    );
+    await expect(
+      client(fetch).discoverSsoOrg("misrouted-corp"),
+    ).rejects.toMatchObject({
+      code: "REGION_MISMATCH",
+    });
+  });
+
+  it("builds PKCE authorize URLs for social and SSO", () => {
+    const auth = client();
+    const url = new URL(
+      auth.buildAuthorizeUrl({
+        kind: "sso",
+        providerOrConnectionId: "conn/a",
+        redirectUri: "http://127.0.0.1:4567/auth",
+        codeChallenge: "a".repeat(43),
+        state: "state-1",
+      }),
+    );
+    expect(url.pathname).toBe("/api/auth/sso/conn%2Fa/authorize");
+    expect(url.searchParams.get("client_state")).toBe("state-1");
+    expect(url.searchParams.get("device_id")).toBe("device-1");
+  });
+});
+
+describe("soleLoginMethod", () => {
+  it("returns the only method when discovery has no real choice", () => {
+    expect(soleLoginMethod([{ type: "email_code" }])).toEqual({
+      type: "email_code",
+    });
+  });
+
+  it("returns null when enterprise and personal methods both exist", () => {
+    expect(
+      soleLoginMethod([
+        { type: "email_code" },
+        {
+          type: "sso",
+          connectionId: "conn-1",
+          protocol: "oidc",
+          orgName: "心动网络",
+          connectionName: "心动",
+          ssoRequired: false,
+        },
+      ]),
+    ).toBeNull();
+  });
+});
+
+describe("soleAutoStartSsoMethod", () => {
+  const ssoA = {
+    type: "sso" as const,
+    connectionId: "conn-1",
+    protocol: "oidc" as const,
+    orgName: "心动网络",
+    connectionName: "心动",
+    ssoRequired: false,
+  };
+  const ssoB = {
+    ...ssoA,
+    connectionId: "conn-2",
+    connectionName: "Okta",
+  };
+
+  it("auto-starts a lone SSO connection from the org entry", () => {
+    expect(soleAutoStartSsoMethod([ssoA])).toEqual(ssoA);
+  });
+
+  it("auto-starts when enterprise email discovery only offers SSO", () => {
+    expect(soleAutoStartSsoMethod([{ ...ssoA, ssoRequired: true }])).toEqual({
+      ...ssoA,
+      ssoRequired: true,
+    });
+  });
+
+  it("keeps method-choice when the user can still pick personal email", () => {
+    expect(soleAutoStartSsoMethod([{ type: "email_code" }, ssoA])).toBeNull();
+  });
+
+  it("keeps method-choice when multiple SSO connections remain", () => {
+    expect(soleAutoStartSsoMethod([ssoA, ssoB])).toBeNull();
+  });
+
+  it("does not treat personal-only email as an SSO auto-start", () => {
+    expect(soleAutoStartSsoMethod([{ type: "email_code" }])).toBeNull();
+  });
+
+  it("does not auto-start an empty method list", () => {
+    expect(soleAutoStartSsoMethod([])).toBeNull();
+  });
+});
+
+describe("discoverSsoOrgRealm", () => {
+  const discovery = (region: "cn" | "global") => ({
+    region,
+    orgName: `${region} Corp`,
+    connections: [
+      {
+        connectionId: `${region}-1`,
+        protocol: "oidc" as const,
+        connectionName: "SSO",
+      },
+    ],
+  });
+  const found = (region: "cn" | "global") => ({
+    discoverSsoOrg: vi.fn(async () => discovery(region)),
+  });
+  const notFound = () => ({
+    discoverSsoOrg: vi.fn(async () => {
+      throw new AuthApiError("ORG_SSO_NOT_FOUND", 404, "not found");
+    }),
+  });
+  const unavailable = () => ({
+    discoverSsoOrg: vi.fn(async () => {
+      throw new AuthApiError("NETWORK_ERROR", 0, "offline");
+    }),
+  });
+
+  it.each([
+    ["cn", found("cn"), notFound()],
+    ["global", notFound(), found("global")],
+  ] as const)(
+    "selects %s only when the peer explicitly reports not found",
+    async (region, cn, global) => {
+      await expect(
+        discoverSsoOrgRealm("corp", { cn, global }),
+      ).resolves.toMatchObject({
+        region,
+        discovery: { region },
+      });
+    },
+  );
+
+  it("rejects an identifier present in both regions as ambiguous", async () => {
+    await expect(
+      discoverSsoOrgRealm("corp", { cn: found("cn"), global: found("global") }),
+    ).rejects.toMatchObject({ code: "ORG_REALM_AMBIGUOUS" });
+  });
+
+  it("preserves not-found only when both regions explicitly report it", async () => {
+    await expect(
+      discoverSsoOrgRealm("corp", { cn: notFound(), global: notFound() }),
+    ).rejects.toMatchObject({ code: "ORG_SSO_NOT_FOUND" });
+  });
+
+  it("fails closed when either region is unavailable, even if the other succeeds", async () => {
+    await expect(
+      discoverSsoOrgRealm("corp", { cn: found("cn"), global: unavailable() }),
+    ).rejects.toMatchObject({ code: "ORG_REALM_UNAVAILABLE" });
+  });
+});
+
+describe("auth session realm record", () => {
+  it("round-trips realm and refresh token as one versioned record", () => {
+    const raw = serializeAuthSessionRecord("global", "refresh-secret");
+    expect(parseAuthSessionRecord(raw)).toEqual({
+      version: 1,
+      realm: "global",
+      refreshToken: "refresh-secret",
+    });
+  });
+
+  it.each([
+    null,
+    "not-json",
+    JSON.stringify({ version: 2, realm: "cn", refreshToken: "token" }),
+    JSON.stringify({ version: 1, realm: "us", refreshToken: "token" }),
+    JSON.stringify({ version: 1, realm: "cn", refreshToken: "" }),
+  ])("rejects malformed records without throwing", (raw) => {
+    expect(parseAuthSessionRecord(raw)).toBeNull();
+  });
+
+  it("keeps an account-deletion receipt bound to its realm after logout", () => {
+    const raw = serializeAccountDeletionReceiptRecord(
+      "global",
+      "receipt-secret",
+      "passport-1",
+    );
+    expect(parseAccountDeletionReceiptRecord(raw)).toEqual({
+      version: 2,
+      realm: "global",
+      receiptToken: "receipt-secret",
+      authIdentity: "passport-1",
+    });
+    expect(
+      parseAccountDeletionReceiptRecord(
+        serializeAccountDeletionReceiptRecord("cn", "legacy-receipt"),
+      ),
+    ).toEqual({
+      version: 1,
+      realm: "cn",
+      receiptToken: "legacy-receipt",
+    });
+    expect(parseAccountDeletionReceiptRecord("legacy-receipt")).toBeNull();
+  });
+});
+
+describe("reduceAuthFlow", () => {
+  it("keeps a cross-region discovery pending until the user confirms", () => {
+    const providers = {
+      region: "global" as const,
+      attribution: "email" as const,
+      email: true,
+      phone: false,
+      social: [],
+    };
+    const methods = [
+      {
+        type: "sso" as const,
+        connectionId: "cn-sso",
+        protocol: "oidc" as const,
+        orgName: "CN Corp",
+        connectionName: "Enterprise SSO",
+        ssoRequired: false,
+      },
+    ];
+    const confirmation = reduceAuthFlow(null, {
+      type: "realm-switch-required",
+      targetRegion: "cn",
+      providers,
+      methods,
+    });
+    expect(confirmation).toEqual({
+      step: "realm-confirmation",
+      targetRegion: "cn",
+      providers,
+      methods,
+    });
+    if (confirmation.step !== "realm-confirmation") {
+      throw new Error("expected realm confirmation");
+    }
+
+    expect(
+      reduceAuthFlow(confirmation, {
+        type: "discovery-loaded",
+        email: "",
+        methods: confirmation.methods,
+      }),
+    ).toEqual({
+      step: "method-choice",
+      email: "",
+      methods,
+    });
+  });
+
+  it("projects secret-bearing outcomes into public states", () => {
+    const state = reduceAuthFlow(null, {
+      type: "outcome",
+      outcome: {
+        status: "select_account",
+        loginTicket: "secret-ticket",
+        accounts: [
+          {
+            id: "m1",
+            kind: "personal",
+            role: "owner",
+            displayName: "Cindy",
+            email: null,
+            orgId: null,
+            orgName: null,
+          },
+        ],
+      },
+    });
+    expect(state).toEqual(
+      expect.objectContaining({ step: "account-selection" }),
+    );
+    expect(JSON.stringify(state)).not.toContain("secret-ticket");
+  });
+
+  it("projects SSO verification tickets without exposing the ticket", () => {
+    const state = reduceAuthFlow(null, {
+      type: "outcome",
+      outcome: {
+        status: "sso_verification_required",
+        verificationTicket: "secret-sso-ticket",
+        channel: "sms",
+        targetMasked: "+8613****11",
+      },
+    });
+    expect(state).toEqual({
+      step: "sso-verification",
+      channel: "sms",
+      targetMasked: "+8613****11",
+      codeRequested: false,
+    });
+    expect(JSON.stringify(state)).not.toContain("secret-sso-ticket");
+  });
+});

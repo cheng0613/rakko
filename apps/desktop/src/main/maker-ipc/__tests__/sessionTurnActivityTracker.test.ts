@@ -1,0 +1,153 @@
+/**
+ * sessionTurnActivityTracker.test.ts —— 本地「逻辑 turn」视图(anySessionInTurn 关窗 busy 判断 +
+ * reconcileTurnIdle 的依赖)。
+ *
+ * 核心性质:turn 正常结束(terminal 广播)时 isSessionInTurn 必须**立即**翻 false;keepalive grace
+ * (只服务 background throttling)绝不能拖住它。
+ * 注意:per-session 的 `maker:session-in-turn` 查询**不**依赖本 tracker —— 它以 live
+ * `session.isTurnRunning()` 为权威(规避 tracker 在 turn 异常死亡时 stale 为 in-turn),本测只锁 tracker 自身行为。
+ */
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import {
+  collectInTurnSessionIds,
+  isSessionTurnDispatchBoundaryBusy,
+  SessionTurnActivityTracker,
+} from '../sessionTurnActivityTracker';
+
+beforeEach(() => vi.useFakeTimers());
+afterEach(() => vi.useRealTimers());
+
+describe('SessionTurnActivityTracker.isSessionInTurn', () => {
+  it('setSessionInTurn 翻起/落下', () => {
+    const t = new SessionTurnActivityTracker();
+    expect(t.isSessionInTurn('s')).toBe(false); // 未知 session → false(安全默认)
+    t.setSessionInTurn('s', true);
+    expect(t.isSessionInTurn('s')).toBe(true);
+    expect(isSessionTurnDispatchBoundaryBusy(t, 's', null)).toBe(true);
+    t.setSessionInTurn('s', false);
+    expect(t.isSessionInTurn('s')).toBe(false);
+    expect(isSessionTurnDispatchBoundaryBusy(t, 's', null)).toBe(false);
+  });
+
+  it('主监听方与额外旁观者都收到 turn 变化;旁观者出错不影响其他人,可取消订阅', () => {
+    const t = new SessionTurnActivityTracker();
+    const main = vi.fn();
+    const observer = vi.fn();
+    t.setSessionTurnChangeListener(main);
+    t.addSessionTurnObserver(() => {
+      throw new Error('observer failure');
+    });
+    const stop = t.addSessionTurnObserver(observer);
+    t.setSessionInTurn('s1', true);
+    t.setSessionInTurn('s1', false);
+    expect(main).toHaveBeenCalledTimes(2);
+    expect(observer).toHaveBeenCalledTimes(2);
+    stop();
+    t.setSessionInTurn('s1', true);
+    expect(main).toHaveBeenCalledTimes(3);
+    expect(observer).toHaveBeenCalledTimes(2);
+  });
+
+  it('terminal 广播 → isSessionInTurn 立即 false(keepalive grace 不拖住它)', () => {
+    const t = new SessionTurnActivityTracker();
+    t.setSessionInTurn('s', true);
+    t.scheduleIdleAfterTerminalBroadcast('s');
+    // 关键:不等 grace 计时器,isSessionInTurn 当下就是 false → 看门狗据此安全收尾
+    expect(t.isSessionInTurn('s')).toBe(false);
+    // grace 期内 anySessionInTurn 也已为 false(只有 keepalive 还 true,服务 throttling)
+    expect(t.anySessionInTurn()).toBe(false);
+    vi.advanceTimersByTime(2000); // grace 过后仍 false
+    expect(t.isSessionInTurn('s')).toBe(false);
+    t.deleteSession('s');
+  });
+
+  it('deleteSession → isSessionInTurn false', () => {
+    const t = new SessionTurnActivityTracker();
+    t.setSessionInTurn('s', true);
+    t.deleteSession('s');
+    expect(t.isSessionInTurn('s')).toBe(false);
+  });
+
+  it('一个 session 在跑不影响另一个的 per-session 查询', () => {
+    const t = new SessionTurnActivityTracker();
+    t.setSessionInTurn('a', true);
+    expect(t.isSessionInTurn('a')).toBe(true);
+    expect(t.isSessionInTurn('b')).toBe(false); // per-session,不串
+  });
+});
+
+describe('isSessionTurnDispatchBoundaryBusy', () => {
+  it('keeps coordinator dispatch busy while maker-core live state is running before tracker starts', () => {
+    const t = new SessionTurnActivityTracker();
+    expect(isSessionTurnDispatchBoundaryBusy(t, 's', { isTurnRunning: () => true })).toBe(true);
+  });
+
+  it('keeps coordinator dispatch busy after live state goes idle until terminal delivery is processed', () => {
+    const t = new SessionTurnActivityTracker();
+    t.setSessionInTurn('s', true);
+    expect(isSessionTurnDispatchBoundaryBusy(t, 's', { isTurnRunning: () => false })).toBe(true);
+  });
+
+  it('keeps coordinator dispatch busy after status idle broadcast until terminal broadcast', () => {
+    const t = new SessionTurnActivityTracker();
+    t.setSessionInTurn('s', true);
+    t.scheduleIdleAfterStatusBroadcast('s');
+
+    expect(t.isSessionInTurn('s')).toBe(false);
+    expect(t.anySessionInTurn()).toBe(false);
+    expect(isSessionTurnDispatchBoundaryBusy(t, 's', { isTurnRunning: () => false })).toBe(true);
+
+    t.scheduleIdleAfterTerminalBroadcast('s');
+    expect(isSessionTurnDispatchBoundaryBusy(t, 's', { isTurnRunning: () => false })).toBe(false);
+  });
+
+  it('releases coordinator dispatch after terminal broadcast even during keepalive grace', () => {
+    const t = new SessionTurnActivityTracker();
+    t.setSessionInTurn('s', true);
+    t.scheduleIdleAfterTerminalBroadcast('s');
+
+    expect(isSessionTurnDispatchBoundaryBusy(t, 's', { isTurnRunning: () => false })).toBe(false);
+    vi.advanceTimersByTime(2000);
+    expect(isSessionTurnDispatchBoundaryBusy(t, 's', null)).toBe(false);
+  });
+});
+
+describe('SessionTurnActivityTracker per-session change listener', () => {
+  it('notifies only when a session enters or leaves its turn, including when it closes', () => {
+    const t = new SessionTurnActivityTracker();
+    const changes: string[] = [];
+    t.setSessionTurnChangeListener((sessionId) => changes.push(sessionId));
+    t.setSessionInTurn('s', true);
+    t.setSessionInTurn('s', true);
+    t.scheduleIdleAfterStatusBroadcast('s');
+    t.scheduleIdleAfterTerminalBroadcast('s');
+    t.setSessionInTurn('s', true);
+    t.deleteSession('s');
+    t.deleteSession('s');
+    expect(changes).toEqual(['s', 's', 's', 's']);
+  });
+
+  it('keeps tracking turns when the listener throws', () => {
+    const t = new SessionTurnActivityTracker();
+    t.setSessionTurnChangeListener(() => {
+      throw new Error('listener failed');
+    });
+    t.setSessionInTurn('s', true);
+    expect(t.isSessionInTurn('s')).toBe(true);
+  });
+});
+
+
+describe('collectInTurnSessionIds', () => {
+  it('includes tracker turns and live turns that are not latched yet, once each', () => {
+    const tracker = new SessionTurnActivityTracker();
+    tracker.setSessionInTurn('tracked', true);
+    tracker.setSessionInTurn('idle', false);
+    expect(collectInTurnSessionIds(tracker, [
+      { id: 'tracked', isTurnRunning: () => true },
+      { id: 'live', isTurnRunning: () => true },
+      { id: 'stopped', isTurnRunning: () => false },
+    ])).toEqual(['tracked', 'live']);
+  });
+});

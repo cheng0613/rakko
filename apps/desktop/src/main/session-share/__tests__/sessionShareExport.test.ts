@@ -1,0 +1,902 @@
+/**
+ * 导出编排集成测试:mock DB / bridge / 媒体 store,用 temp projectsRoot 放真实
+ * jsonl,走完整 exportSessionShare → openPayload → JSZip 解包验证内容。
+ */
+import { createHash } from 'node:crypto';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { promises as fsp } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+import JSZip from 'jszip';
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
+
+const tmpRoot = mkdtempSync(path.join(os.tmpdir(), 'xdtshare-export-test-'));
+const projectsRoot = path.join(tmpRoot, 'claude-home', 'projects');
+const workingDir = path.join(tmpRoot, 'proj');
+
+// ── mocks ──
+const sessionRowRef: { row: Record<string, unknown> | null } = { row: null };
+const messagesRef: { rows: Array<Record<string, unknown>> } = { rows: [] };
+// orca:active team / worker 列表 / worker 会话行与消息(按 SQL 分发)
+const activeTeamRef: { row: Record<string, unknown> | null } = { row: null };
+const getActiveTeamByLeadMock = vi.fn(async () => activeTeamRef.row);
+const workerRowsRef: { rows: Array<Record<string, unknown>> } = { rows: [] };
+const workerSessionsById = new Map<string, Record<string, unknown>>();
+const workerMessagesBySession = new Map<string, Array<Record<string, unknown>>>();
+
+vi.mock('electron', () => ({
+  app: { getVersion: () => '9.9.9', getPath: () => tmpRoot },
+}));
+vi.mock('../../localDb/client/current.js', () => ({
+  getDbClient: () => ({
+    queryOne: async (_sql: string, params: unknown[]) => {
+      const id = params?.[0];
+      if (typeof id === 'string' && id !== 'xdt-session-1') {
+        return workerSessionsById.get(id) ?? null;
+      }
+      return sessionRowRef.row;
+    },
+    // 模拟 readMessageRows 的 clearedAt 过滤(真实 SQL 是 created_at > ?)
+    query: async (sql: string, params: unknown[]) => {
+      if (typeof sql === 'string' && sql.includes('FROM orca_workers')) return workerRowsRef.rows;
+      const sessionId = params?.[0];
+      if (typeof sessionId === 'string' && workerMessagesBySession.has(sessionId)) {
+        return workerMessagesBySession.get(sessionId);
+      }
+      if (typeof sql === 'string' && sql.includes('created_at > ?')) {
+        const clearedAt = params[1] as number;
+        return messagesRef.rows.filter((r) => (r.createdAt as number) > clearedAt);
+      }
+      return messagesRef.rows;
+    },
+    exec: async () => undefined,
+  }),
+}));
+vi.mock('../../localDb/orcaTeamStore.js', () => ({
+  getActiveTeamByLead: getActiveTeamByLeadMock,
+}));
+vi.mock('../../maker-host/claude-transcript-relocation.js', () => ({
+  collectClaudeSdkSessionIds: async () => ({
+    ids: ['sid-a', 'sid-b'],
+    activeId: 'sid-b',
+  }),
+}));
+const dumpCodexThreadStateRowsMock = vi.fn(async (_threadId: string, _storage?: unknown) => ({
+  threads: [{ id: 'thread-1', cwd: '/old/cwd' }],
+  threadDynamicTools: [],
+  threadSpawnEdges: [],
+  rolloutPath: path.join(tmpRoot, 'rollout-1-thread-1.jsonl'),
+}));
+vi.mock('../../maker-host/codex-local-sessions.js', () => ({
+  dumpCodexThreadStateRows: dumpCodexThreadStateRowsMock,
+}));
+const readCodexThreadStorageReadOnlyMock = vi.fn(
+  async (_threadId: string): Promise<{ historyHome: string; sqliteHome: string; rolloutPath?: string } | undefined> =>
+    undefined,
+);
+vi.mock('../../maker-host/codex-thread-storage.js', () => ({
+  readCodexThreadStorageReadOnly: readCodexThreadStorageReadOnlyMock,
+}));
+const configDirCandidatesRef = { dirs: [path.join(tmpRoot, 'claude-home')] };
+const readBoundClaudeConfigDirMock = vi.fn<(_sdkSessionId: string) => string | undefined>();
+vi.mock('../../subscription-accounts/store.js', () => ({
+  readBoundClaudeConfigDir: readBoundClaudeConfigDirMock,
+}));
+vi.mock('../../maker-orchestration/claudeTranscriptAnchors.js', () => ({
+  defaultClaudeConfigDirCandidates: () => configDirCandidatesRef.dirs,
+}));
+const imagePathRef = { path: path.join(tmpRoot, 'img.png') };
+vi.mock('../../imageCacheStore.desktop.js', () => ({
+  resolveSafe: (url: string) => {
+    if (!url.startsWith('xdt-image://')) throw new Error('bad url');
+    return { absPath: imagePathRef.path, mimeType: 'image/png' };
+  },
+}));
+const ownerScopeRef = { keys: [] as string[] };
+vi.mock('../../appSessionState.js', () => ({
+  activeOwnerScopeKey: () => ownerScopeRef.keys.shift() ?? 'owner:a:1',
+}));
+vi.mock('../../videoCacheStore.js', () => ({
+  resolveSafe: () => ({ absPath: path.join(tmpRoot, 'missing-video.mp4'), mimeType: 'video/mp4' }),
+}));
+vi.mock('../../modelCacheStore.js', () => ({
+  resolveSafe: () => {
+    throw new Error('unknown host');
+  },
+}));
+vi.mock('../../logger.js', () => ({
+  createLogger: () => ({ info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() }),
+}));
+
+const { exportSessionShare } = await import('../sessionShareExport.js');
+const { openPayload } = await import('../xdtshareCrypto.js');
+const { validateManifest } = await import('../xdtshareFormat.pure.js');
+
+function baseSession(): Record<string, unknown> {
+  return {
+    id: 'xdt-session-1',
+    title: '测试会话',
+    workingDir,
+    workspaceKind: 'project',
+    model: 'claude-sonnet-4-6',
+    effort: 'high',
+    permissionMode: 'ask',
+    status: 'active',
+    sdkSessionId: 'sid-b',
+    totalTokenUsage: 100,
+    totalCostUsd: 0.1,
+    contextTokens: 10,
+    contextWindow: 200000,
+    fastMode: 0,
+    planModeEnabled: 0,
+    agentKind: 'cc',
+    orcaRole: null,
+    remoteHostId: null,
+    agentDeviceId: null,
+    codexHistoryHasProductPrompt: null,
+    clearedAt: null,
+    userSendAt: 1700000000000,
+    createdAt: 1700000000000,
+    updatedAt: 1700000001000,
+  };
+}
+
+function baseMessages(): Array<Record<string, unknown>> {
+  return [
+    {
+      id: 'm1',
+      clientId: 'c1',
+      role: 'user',
+      content: JSON.stringify([{ type: 'text', text: '看图 xdt-image://xdt-session-1/img.png' }]),
+      toolUseId: null,
+      agentMeta: null,
+      agentKind: 'cc',
+      createdAt: 1700000000100,
+      rewindAt: null,
+    },
+    {
+      id: 'm2',
+      clientId: 'c2',
+      role: 'assistant',
+      content: JSON.stringify([{ type: 'text', text: 'ok' }]),
+      toolUseId: null,
+      agentMeta: '{"sdkSessionId":"sid-b"}',
+      agentKind: 'codex',
+      createdAt: 1700000000200,
+      rewindAt: null,
+    },
+  ];
+}
+
+async function unzipOf(filePath: string, password?: string): Promise<JSZip> {
+  const bytes = await fsp.readFile(filePath);
+  const { zipBytes } = openPayload(bytes, password);
+  return JSZip.loadAsync(zipBytes);
+}
+
+describe('exportSessionShare', () => {
+  beforeEach(async () => {
+    readBoundClaudeConfigDirMock.mockReset();
+    sessionRowRef.row = baseSession();
+    messagesRef.rows = baseMessages();
+    activeTeamRef.row = null;
+    getActiveTeamByLeadMock.mockClear();
+    dumpCodexThreadStateRowsMock.mockClear();
+    imagePathRef.path = path.join(tmpRoot, 'img.png');
+    ownerScopeRef.keys = [];
+    readCodexThreadStorageReadOnlyMock.mockReset();
+    readCodexThreadStorageReadOnlyMock.mockResolvedValue(undefined);
+    workerRowsRef.rows = [];
+    workerSessionsById.clear();
+    workerMessagesBySession.clear();
+    configDirCandidatesRef.dirs = [path.join(tmpRoot, 'claude-home')];
+    const projKey = workingDir.replace(/[^a-zA-Z0-9]/g, '-');
+    await fsp.mkdir(path.join(projectsRoot, projKey), { recursive: true });
+    await fsp.writeFile(path.join(projectsRoot, projKey, 'sid-a.jsonl'), '{"line":1}\n');
+    await fsp.writeFile(path.join(projectsRoot, projKey, 'sid-b.jsonl'), '{"line":2}\n');
+    await fsp.mkdir(workingDir, { recursive: true });
+    await fsp.writeFile(path.join(tmpRoot, 'img.png'), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    await fsp.writeFile(path.join(tmpRoot, 'rollout-1-thread-1.jsonl'), '{"session_meta":{}}\n');
+  });
+
+  afterAll(() => {
+    rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  // Standard regression: export must include histories outside the default CLI home.
+  it.each([false, true])('cc full export: transcripts + media + manifest roundtrip (encrypted, secondary=%s)', async (secondary) => {
+    if (secondary) {
+      readBoundClaudeConfigDirMock.mockReturnValue(path.join(tmpRoot, 'claude-home'));
+      configDirCandidatesRef.dirs = [path.join(tmpRoot, 'empty-default-home')];
+    }
+    const target = path.join(tmpRoot, 'out-full.xdtshare');
+    const outcome = await exportSessionShare({
+      sessionId: 'xdt-session-1',
+      targetPath: target,
+      password: 'pw-测试',
+    });
+    expect(outcome.status).toBe('ok');
+    if (outcome.status !== 'ok') return;
+    expect(outcome.fidelity).toBe('full');
+    expect(outcome.missingTranscripts).toEqual([]);
+
+    const zip = await unzipOf(target, 'pw-测试');
+    const manifest = validateManifest(JSON.parse(await zip.file('manifest.json')!.async('string')));
+    expect(manifest.agentKind).toBe('cc');
+    expect(manifest.sdkSessionIds.sort()).toEqual(['sid-a', 'sid-b']);
+    expect(manifest.activeSdkSessionId).toBe('sid-b');
+    expect(manifest.exportFidelity).toBe('full');
+    expect(manifest.counts.messages).toBe(2);
+    expect(await zip.file('transcripts/claude/sid-a.jsonl')!.async('string')).toBe('{"line":1}\n');
+    expect(await zip.file('transcripts/claude/sid-b.jsonl')!.async('string')).toBe('{"line":2}\n');
+
+    const messagesJsonl = await zip.file('messages.jsonl')!.async('string');
+    expect(messagesJsonl.split('\n')).toHaveLength(2);
+    expect(messagesJsonl.split('\n').map((line) => JSON.parse(line).agentKind)).toEqual([
+      'cc',
+      'codex',
+    ]);
+
+    const mediaMap = JSON.parse(await zip.file('media-map.json')!.async('string')) as {
+      entries: Array<{ url: string; kind: string; zipPath: string | null; imageHost?: string }>;
+    };
+    expect(mediaMap.entries).toHaveLength(1);
+    expect(mediaMap.entries[0].kind).toBe('image');
+    expect(mediaMap.entries[0].imageHost).toBe('xdt-session-1');
+    expect(mediaMap.entries[0].zipPath).toMatch(/^media\/images\//);
+    expect(zip.file(mediaMap.entries[0].zipPath!)).toBeTruthy();
+  });
+
+  it('cc transcript lookup falls back through all config dir candidates', async () => {
+    // 第一个候选目录存在但没有该会话 jsonl,jsonl 落在第二个候选——不应记缺失。
+    const emptyHome = path.join(tmpRoot, 'empty-claude-home');
+    await fsp.mkdir(path.join(emptyHome, 'projects'), { recursive: true });
+    configDirCandidatesRef.dirs = [emptyHome, path.join(tmpRoot, 'claude-home')];
+    const target = path.join(tmpRoot, 'out-fallback.xdtshare');
+    const outcome = await exportSessionShare({ sessionId: 'xdt-session-1', targetPath: target });
+    expect(outcome.status).toBe('ok');
+    if (outcome.status !== 'ok') return;
+    expect(outcome.fidelity).toBe('full');
+    expect(outcome.missingTranscripts).toEqual([]);
+  });
+
+  it.each([false, true])('cc partial: missing fork-chain jsonl downgrades fidelity and reports id (secondary=%s)', async (secondary) => {
+    const projKey = workingDir.replace(/[^a-zA-Z0-9]/g, '-');
+    if (secondary) {
+      // A same-id transcript in the default profile must not replace the bound one.
+      readBoundClaudeConfigDirMock.mockImplementation((id) =>
+        id === 'sid-a' ? path.join(tmpRoot, 'missing-secondary-profile') : undefined);
+    } else {
+      await fsp.rm(path.join(projectsRoot, projKey, 'sid-a.jsonl'));
+    }
+    const target = path.join(tmpRoot, 'out-partial.xdtshare');
+    const outcome = await exportSessionShare({ sessionId: 'xdt-session-1', targetPath: target });
+    expect(outcome.status).toBe('ok');
+    if (outcome.status !== 'ok') return;
+    expect(outcome.fidelity).toBe('partial');
+    expect(outcome.missingTranscripts).toEqual(['sid-a']);
+  });
+
+  it('codex export bundles rollout + state dump', async () => {
+    sessionRowRef.row = { ...baseSession(), agentKind: 'codex', sdkSessionId: 'thread-1' };
+    const target = path.join(tmpRoot, 'out-codex.xdtshare');
+    const outcome = await exportSessionShare({ sessionId: 'xdt-session-1', targetPath: target });
+    expect(outcome.status).toBe('ok');
+    if (outcome.status !== 'ok') return;
+    expect(outcome.fidelity).toBe('full');
+    const zip = await unzipOf(target);
+    expect(zip.file('transcripts/codex/rollout-1-thread-1.jsonl')).toBeTruthy();
+    const state = JSON.parse(await zip.file('codex-state/thread.json')!.async('string'));
+    expect(state.threads[0].id).toBe('thread-1');
+  });
+
+  it('codex export reads multi-account history from the thread location index', async () => {
+    // 多账号线程的历史在 codex-accounts/<owner>/<账号>/ 下,只有 thread-index 知道位置。
+    const storage = {
+      historyHome: path.join(tmpRoot, 'codex-accounts', 'owner', 'openai-a'),
+      sqliteHome: path.join(tmpRoot, 'codex-accounts', 'owner', 'openai-a'),
+      rolloutPath: path.join(tmpRoot, 'codex-accounts', 'owner', 'openai-a', 'sessions', 'rollout.jsonl'),
+    };
+    readCodexThreadStorageReadOnlyMock.mockResolvedValue(storage);
+    sessionRowRef.row = { ...baseSession(), agentKind: 'codex', sdkSessionId: 'thread-1' };
+    const outcome = await exportSessionShare({
+      sessionId: 'xdt-session-1',
+      targetPath: path.join(tmpRoot, 'out-codex-indexed.xdtshare'),
+    });
+    expect(outcome.status).toBe('ok');
+    expect(readCodexThreadStorageReadOnlyMock).toHaveBeenCalledWith('thread-1');
+    expect(dumpCodexThreadStateRowsMock).toHaveBeenCalledWith('thread-1', storage);
+  });
+
+  it('codex export never substitutes legacy history when the location index is unreadable', async () => {
+    // 记录存在却读不出:旧 HOME 可能留着同一线程的过期副本,不得回退去拿。
+    readCodexThreadStorageReadOnlyMock.mockRejectedValue(new Error('Invalid Codex thread location'));
+    sessionRowRef.row = { ...baseSession(), agentKind: 'codex', sdkSessionId: 'thread-1' };
+    const outcome = await exportSessionShare({
+      sessionId: 'xdt-session-1',
+      targetPath: path.join(tmpRoot, 'out-codex-index-error.xdtshare'),
+    });
+    expect(outcome.status).toBe('ok');
+    if (outcome.status !== 'ok') return;
+    expect(dumpCodexThreadStateRowsMock).not.toHaveBeenCalled();
+    expect(outcome.fidelity).toBe('db-only');
+    expect(outcome.missingTranscripts).toEqual(['thread-1']);
+  });
+
+  it('pi export replaces absolute session paths with portable ids', async () => {
+    const piSessionFile = path.join(tmpRoot, 'pi-agent-home', 'sessions', 'source-session.jsonl');
+    await fsp.mkdir(path.dirname(piSessionFile), { recursive: true });
+    await fsp.writeFile(piSessionFile, '{"type":"session"}\n');
+    sessionRowRef.row = {
+      ...baseSession(),
+      agentKind: 'pi',
+      sdkSessionId: piSessionFile,
+    };
+    messagesRef.rows = baseMessages().map((message, index) => ({
+      ...message,
+      agentKind: 'pi',
+      agentMeta: index === 1 ? JSON.stringify({ sdkSessionId: piSessionFile }) : null,
+    }));
+
+    const target = path.join(tmpRoot, 'out-pi.xdtshare');
+    const outcome = await exportSessionShare({ sessionId: 'xdt-session-1', targetPath: target });
+    expect(outcome.status).toBe('ok');
+    if (outcome.status !== 'ok') return;
+    expect(outcome.fidelity).toBe('full');
+
+    const zip = await unzipOf(target);
+    const manifest = validateManifest(JSON.parse(await zip.file('manifest.json')!.async('string')));
+    expect(manifest.agentKind).toBe('pi');
+    expect(manifest.activeSdkSessionId).toMatch(/^pi-[a-f0-9]{32}\.jsonl$/);
+    expect(manifest.activeSdkSessionId).not.toContain(path.sep);
+    expect(manifest.sdkSessionIds).toEqual([manifest.activeSdkSessionId]);
+    const transcriptPath = `transcripts/pi/${manifest.activeSdkSessionId}`;
+    expect(await zip.file(transcriptPath)!.async('string')).toBe('{"type":"session"}\n');
+    expect(zip.file('codex-state/thread.json')).toBeNull();
+
+    const sessionJson = await zip.file('session.json')!.async('string');
+    const messagesJsonl = await zip.file('messages.jsonl')!.async('string');
+    expect(sessionJson).not.toContain(piSessionFile);
+    expect(messagesJsonl).not.toContain(piSessionFile);
+    expect(JSON.parse(messagesJsonl.split('\n')[1]).agentMeta).toContain(
+      manifest.activeSdkSessionId,
+    );
+  });
+
+  it('pi export changes the portable transcript id when the same session file content changes', async () => {
+    const piSessionFile = path.join(tmpRoot, 'pi-agent-home', 'sessions', 'changing-session.jsonl');
+    await fsp.mkdir(path.dirname(piSessionFile), { recursive: true });
+    sessionRowRef.row = { ...baseSession(), agentKind: 'pi', sdkSessionId: piSessionFile };
+    messagesRef.rows = baseMessages().map((message) => ({
+      ...message,
+      agentKind: 'pi',
+      agentMeta: JSON.stringify({ sdkSessionId: piSessionFile }),
+    }));
+
+    await fsp.writeFile(piSessionFile, '{"type":"session","revision":1}\n');
+    const firstTarget = path.join(tmpRoot, 'out-pi-content-v1.xdtshare');
+    await expect(exportSessionShare({ sessionId: 'xdt-session-1', targetPath: firstTarget }))
+      .resolves.toMatchObject({ status: 'ok', fidelity: 'full' });
+    const firstZip = await unzipOf(firstTarget);
+    const firstManifest = validateManifest(JSON.parse(
+      await firstZip.file('manifest.json')!.async('string'),
+    ));
+
+    await fsp.writeFile(piSessionFile, '{"type":"session","revision":2}\n');
+    const secondTarget = path.join(tmpRoot, 'out-pi-content-v2.xdtshare');
+    await expect(exportSessionShare({ sessionId: 'xdt-session-1', targetPath: secondTarget }))
+      .resolves.toMatchObject({ status: 'ok', fidelity: 'full' });
+    const secondZip = await unzipOf(secondTarget);
+    const secondManifest = validateManifest(JSON.parse(
+      await secondZip.file('manifest.json')!.async('string'),
+    ));
+
+    expect(secondManifest.activeSdkSessionId).not.toBe(firstManifest.activeSdkSessionId);
+    expect(await secondZip.file(`transcripts/pi/${secondManifest.activeSdkSessionId}`)!.async('string'))
+      .toContain('"revision":2');
+  });
+
+  it('pi export omits a missing transcript without leaking or hashing its absolute path', async () => {
+    const missingPiSessionFile = path.join(tmpRoot, 'private', 'missing-session.jsonl');
+    sessionRowRef.row = {
+      ...baseSession(),
+      agentKind: 'pi',
+      sdkSessionId: missingPiSessionFile,
+    };
+    messagesRef.rows = baseMessages().map((message) => ({
+      ...message,
+      agentKind: 'pi',
+      agentMeta: JSON.stringify({ sdkSessionId: missingPiSessionFile }),
+    }));
+
+    const target = path.join(tmpRoot, 'out-pi-missing.xdtshare');
+    await expect(exportSessionShare({ sessionId: 'xdt-session-1', targetPath: target }))
+      .resolves.toMatchObject({ status: 'ok', fidelity: 'db-only' });
+    const zip = await unzipOf(target);
+    const manifestText = await zip.file('manifest.json')!.async('string');
+    const sessionText = await zip.file('session.json')!.async('string');
+    const messagesText = await zip.file('messages.jsonl')!.async('string');
+    const manifest = validateManifest(JSON.parse(manifestText));
+
+    expect(manifest.sdkSessionIds).toEqual([]);
+    expect(manifest.activeSdkSessionId).toBeNull();
+    expect(Object.keys(zip.files).filter((name) => name.startsWith('transcripts/pi/'))).toEqual([]);
+    expect(`${manifestText}\n${sessionText}\n${messagesText}`).not.toContain(missingPiSessionFile);
+  });
+
+  describe('external transcripts for a migration', () => {
+    const rollout = `${JSON.stringify({ type: 'session_meta', payload: { id: 'thread-1' } })}\n${'x'.repeat(4096)}\n`;
+    const exportExternal = (name: string, extra: Partial<Parameters<typeof exportSessionShare>[0]> = {}) => {
+      const dir = path.join(tmpRoot, `staged-${name}`);
+      return {
+        dir,
+        outcome: exportSessionShare({
+          sessionId: 'xdt-session-1',
+          targetPath: path.join(tmpRoot, `out-${name}.xdtshare`),
+          migration: true,
+          externalTranscripts: { dir, minBytes: 1024 },
+          ...extra,
+        }),
+      };
+    };
+
+    it('streams large transcripts beside the package and keeps small ones inside', async () => {
+      await fsp.writeFile(path.join(tmpRoot, 'rollout-1-thread-1.jsonl'), rollout);
+      sessionRowRef.row = { ...baseSession(), agentKind: 'codex', sdkSessionId: 'thread-1' };
+      // The limit admits the messages but not the rollout: only in-memory bytes count.
+      const { dir, outcome: pending } = exportExternal('codex-external', { sizeLimitBytes: 4096 });
+      const outcome = await pending;
+      expect(outcome.status).toBe('ok');
+      if (outcome.status !== 'ok') return;
+      expect(outcome.fidelity).toBe('full');
+      const zipPath = 'transcripts/codex/rollout-1-thread-1.jsonl';
+      expect(outcome.externalTranscripts).toEqual([
+        {
+          path: zipPath,
+          file: expect.stringMatching(/^transcript-0-[a-f0-9]{8}\.jsonl$/),
+          bytes: Buffer.byteLength(rollout),
+          sha256: createHash('sha256').update(rollout).digest('hex'),
+        },
+      ]);
+      const staged = await fsp.readFile(path.join(dir, outcome.externalTranscripts![0].file), 'utf8');
+      expect(staged).toBe(rollout);
+      const zip = await unzipOf(path.join(tmpRoot, 'out-codex-external.xdtshare'));
+      expect(zip.file(zipPath)).toBeNull();
+      const manifest = validateManifest(JSON.parse(await zip.file('manifest.json')!.async('string')));
+      expect(manifest.transcripts).toEqual([{ sdkSessionId: 'thread-1', path: zipPath }]);
+      expect(manifest.entries.some((entry) => entry.path === zipPath)).toBe(false);
+      expect(outcome.unpackedBytes).toBeLessThan(4096);
+
+      // Claude transcripts under the threshold stay in the zip as before.
+      sessionRowRef.row = baseSession();
+      const small = exportExternal('cc-small');
+      const smallOutcome = await small.outcome;
+      expect(smallOutcome.status === 'ok' && smallOutcome.externalTranscripts).toEqual([]);
+      const smallZip = await unzipOf(path.join(tmpRoot, 'out-cc-small.xdtshare'));
+      expect(smallZip.file('transcripts/claude/sid-a.jsonl')).toBeTruthy();
+    });
+
+    it('derives the Pi portable id from the streamed bytes', async () => {
+      const piSessionFile = path.join(tmpRoot, 'pi-agent-home', 'sessions', 'large.jsonl');
+      const content = `${'{"type":"message"}\n'.repeat(200)}`;
+      await fsp.mkdir(path.dirname(piSessionFile), { recursive: true });
+      await fsp.writeFile(piSessionFile, content);
+      sessionRowRef.row = { ...baseSession(), agentKind: 'pi', sdkSessionId: piSessionFile };
+      messagesRef.rows = baseMessages().map((message) => ({ ...message, agentKind: 'pi' }));
+      const { outcome: pending } = exportExternal('pi-external');
+      const outcome = await pending;
+      expect(outcome.status).toBe('ok');
+      if (outcome.status !== 'ok') return;
+      const portableId = `pi-${createHash('sha256').update(content).digest('hex').slice(0, 32)}.jsonl`;
+      expect(outcome.externalTranscripts?.map((t) => t.path)).toEqual([`transcripts/pi/${portableId}`]);
+      const zip = await unzipOf(path.join(tmpRoot, 'out-pi-external.xdtshare'));
+      const manifest = validateManifest(JSON.parse(await zip.file('manifest.json')!.async('string')));
+      expect(manifest.activeSdkSessionId).toBe(portableId);
+    });
+
+    it('ignores the option outside a migration and reports where an oversize package went', async () => {
+      await fsp.writeFile(path.join(tmpRoot, 'rollout-1-thread-1.jsonl'), rollout);
+      sessionRowRef.row = { ...baseSession(), agentKind: 'codex', sdkSessionId: 'thread-1' };
+      const { dir, outcome } = exportExternal('not-migration', { migration: false, sizeLimitBytes: 4096 });
+      expect(await outcome).toMatchObject({
+        status: 'oversize',
+        limitBytes: 4096,
+        transcriptBytes: Buffer.byteLength(rollout),
+        externalTranscriptBytes: 0,
+      });
+      await expect(fsp.stat(dir)).rejects.toThrow();
+    });
+
+    // Permission bits do not restrict Windows or root.
+    it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+      'fails instead of reporting missing context when the copy cannot be written',
+      async () => {
+        await fsp.writeFile(path.join(tmpRoot, 'rollout-1-thread-1.jsonl'), rollout);
+        sessionRowRef.row = { ...baseSession(), agentKind: 'codex', sdkSessionId: 'thread-1' };
+        const dir = path.join(tmpRoot, 'staged-readonly');
+        await fsp.mkdir(dir, { recursive: true });
+        await fsp.chmod(dir, 0o500);
+        try {
+          await expect(
+            exportSessionShare({
+              sessionId: 'xdt-session-1',
+              targetPath: path.join(tmpRoot, 'out-readonly.xdtshare'),
+              migration: true,
+              externalTranscripts: { dir, minBytes: 1024 },
+            }),
+          ).rejects.toThrow();
+        } finally {
+          await fsp.chmod(dir, 0o700);
+        }
+      },
+    );
+  });
+
+  it('oversize returns structured outcome without writing file', async () => {
+    const target = path.join(tmpRoot, 'out-oversize.xdtshare');
+    const outcome = await exportSessionShare({
+      sessionId: 'xdt-session-1',
+      targetPath: target,
+      sizeLimitBytes: 1,
+    });
+    expect(outcome.status).toBe('oversize');
+    await expect(fsp.stat(target)).rejects.toThrow();
+  });
+
+  it('loose media provenance: only managed-root paths bundled, arbitrary paths blocked in any role', async () => {
+    const pastedDoc = path.join(tmpRoot, 'pasted-doc.pdf');
+    const plantedDoc = path.join(tmpRoot, 'planted-secret.txt');
+    const managedAudio = path.join(tmpRoot, 'cc-agent', 'lizi-mivo-audios', 'gen.mp3');
+    await fsp.writeFile(pastedDoc, Buffer.from('pasted doc'));
+    await fsp.writeFile(plantedDoc, Buffer.from('secret'));
+    await fsp.mkdir(path.dirname(managedAudio), { recursive: true });
+    await fsp.writeFile(managedAudio, Buffer.from('audio'));
+    const pastedUrl = `xdt-file://local/?path=${encodeURIComponent(pastedDoc)}`;
+    const plantedUrl = `xdt-file://local/?path=${encodeURIComponent(plantedDoc)}`;
+    const managedUrl = `xdt-audio://local/?path=${encodeURIComponent(managedAudio)}`;
+    const absentUrl = `xdt-file://local/?path=${encodeURIComponent(path.join(tmpRoot, 'never-existed.pdf'))}`;
+    messagesRef.rows = [
+      { ...baseMessages()[0], content: JSON.stringify([{ type: 'text', text: `粘贴的 ${pastedUrl}` }]) },
+      {
+        ...baseMessages()[1],
+        content: JSON.stringify([
+          { type: 'text', text: `工具输出 ${plantedUrl} 与生成音频 ${managedUrl} 示例 ${absentUrl}` },
+        ]),
+      },
+    ];
+    const target = path.join(tmpRoot, 'out-loose.xdtshare');
+    const outcome = await exportSessionShare({ sessionId: 'xdt-session-1', targetPath: target });
+    expect(outcome.status).toBe('ok');
+    const zip = await unzipOf(target);
+    const mediaMap = JSON.parse(await zip.file('media-map.json')!.async('string')) as {
+      entries: Array<{ url: string; zipPath: string | null }>;
+    };
+    const byUrl = new Map(mediaMap.entries.map((e) => [e.url, e.zipPath]));
+    // user 文本里的 loose URL 只可能是粘贴/导入内容(真实附件在 files[]),不豁免
+    expect(byUrl.get(pastedUrl)).toBeNull();
+    expect(byUrl.get(plantedUrl)).toBeNull(); // assistant 输出的任意路径:拒绝
+    expect(byUrl.get(managedUrl)).toMatch(/^media\/loose\//); // 受管媒体区:放行
+    expect(byUrl.get(absentUrl)).toBeNull();
+    if (outcome.status !== 'ok') return;
+    expect(outcome.mediaMissing).toBe(3);
+    // 源机器上真实存在却被拦下的两份才算丢失;本就不存在的示例地址不算。
+    expect(outcome.mediaDropped).toBe(2);
+  });
+
+  it('cleared session: pre-clear messages and their fork transcripts stay out of the bundle', async () => {
+    // m1(pre-clear,引用 sid-a fork)在 clearedAt 之前,m2(post-clear,sid-b)之后。
+    sessionRowRef.row = { ...baseSession(), clearedAt: 1700000000150 };
+    messagesRef.rows = [
+      { ...baseMessages()[0], agentMeta: '{"sdkSessionId":"sid-a"}' },
+      baseMessages()[1],
+    ];
+    const target = path.join(tmpRoot, 'out-cleared.xdtshare');
+    const outcome = await exportSessionShare({ sessionId: 'xdt-session-1', targetPath: target });
+    expect(outcome.status).toBe('ok');
+    if (outcome.status !== 'ok') return;
+    expect(outcome.fidelity).toBe('full'); // post-clear 链完整即 full,不因排除旧 fork 降档
+    const zip = await unzipOf(target);
+    const manifest = validateManifest(JSON.parse(await zip.file('manifest.json')!.async('string')));
+    expect(manifest.sdkSessionIds).toEqual(['sid-b']);
+    expect(zip.file('transcripts/claude/sid-a.jsonl')).toBeNull(); // 旧 fork 不落包
+    expect(zip.file('transcripts/claude/sid-b.jsonl')).toBeTruthy();
+    const messagesJsonl = await zip.file('messages.jsonl')!.async('string');
+    expect(messagesJsonl.split('\n')).toHaveLength(1); // 只有 post-clear 消息
+    expect(messagesJsonl).not.toContain('sid-a');
+  });
+
+  it('missing media file is recorded as missing, export still succeeds', async () => {
+    await fsp.rm(path.join(tmpRoot, 'img.png'));
+    const target = path.join(tmpRoot, 'out-missing-media.xdtshare');
+    const outcome = await exportSessionShare({ sessionId: 'xdt-session-1', targetPath: target });
+    expect(outcome.status).toBe('ok');
+    if (outcome.status !== 'ok') return;
+    expect(outcome.mediaMissing).toBe(1);
+    // 源端本就缺失:复制不会让它更缺,迁移不应据此拦截。
+    expect(outcome.mediaDropped).toBe(0);
+    const zip = await unzipOf(target);
+    const mediaMap = JSON.parse(await zip.file('media-map.json')!.async('string'));
+    expect(mediaMap.entries[0].zipPath).toBeNull();
+  });
+
+  it.skipIf(process.platform === 'win32')(
+    'media whose state cannot be read counts as dropped, not as already missing',
+    async () => {
+      const lockedDir = path.join(tmpRoot, 'locked');
+      await fsp.mkdir(lockedDir, { recursive: true });
+      await fsp.writeFile(path.join(lockedDir, 'img.png'), Buffer.from([0x89, 0x50]));
+      imagePathRef.path = path.join(lockedDir, 'img.png');
+      await fsp.chmod(lockedDir, 0o000);
+      try {
+        const outcome = await exportSessionShare({
+          sessionId: 'xdt-session-1',
+          targetPath: path.join(tmpRoot, 'out-locked-media.xdtshare'),
+        });
+        expect(outcome.status).toBe('ok');
+        if (outcome.status !== 'ok') return;
+        expect(outcome.mediaMissing).toBe(1);
+        expect(outcome.mediaDropped).toBe(1);
+      } finally {
+        await fsp.chmod(lockedDir, 0o755);
+      }
+    },
+  );
+
+  it('aborts without writing when the account changes during export', async () => {
+    ownerScopeRef.keys = ['owner:a:1', 'owner:b:2'];
+    const target = path.join(tmpRoot, 'out-owner-changed.xdtshare');
+    await expect(exportSessionShare({ sessionId: 'xdt-session-1', targetPath: target })).rejects.toThrow(
+      'account changed during export',
+    );
+    await expect(fsp.stat(target)).rejects.toThrow();
+  });
+
+  // Regression: remote suppliers used to reject export altogether. Existing local-history
+  // cases cannot detect accidentally bundling a stale local transcript with the same native id.
+  // Production entry: exportSessionShare; minimal input: a remote agent + persisted messages.
+  // Unit tier: mocked DB/stores and private temporary files, no remote connection required.
+  // Standalone file: 2.27s on Windows (27 passed, 2 existing platform skips).
+  it.each(['cc', 'codex', 'pi'] as const)(
+    'exports a remote %s supplier task as message history without local native history',
+    async (agentKind) => {
+      const sdkSessionId = agentKind === 'pi'
+        ? path.join(tmpRoot, 'rollout-1-thread-1.jsonl')
+        : agentKind === 'codex' ? 'thread-1' : 'sid-b';
+      sessionRowRef.row = { ...baseSession(), agentKind, sdkSessionId, agentDeviceId: 'remote-device' };
+      messagesRef.rows[1].agentMeta = JSON.stringify({ sdkSessionId, usage: { inputTokens: 7 } });
+      const target = path.join(tmpRoot, `remote-${agentKind}.cshare`);
+      const outcome = await exportSessionShare({ sessionId: 'xdt-session-1', targetPath: target });
+
+      expect(outcome.status).toBe('ok');
+      if (outcome.status !== 'ok') return;
+      expect(outcome.fidelity).toBe('db-only');
+      const zip = await unzipOf(target);
+      const manifest = validateManifest(JSON.parse(await zip.file('manifest.json')!.async('string')));
+      expect(manifest.exportFidelity).toBe('db-only');
+      expect(manifest.counts).toEqual({ messages: 2, media: 1 });
+      expect(manifest.sdkSessionIds).toEqual([]);
+      expect(manifest.activeSdkSessionId).toBeNull();
+      expect(manifest.transcripts).toEqual([]);
+      expect(Object.keys(zip.files).some(name => name.startsWith('transcripts/') || name.startsWith('codex-state/'))).toBe(false);
+      const snapshot = JSON.parse(await zip.file('session.json')!.async('string'));
+      expect(snapshot.sdkSessionId).toBeNull();
+      expect(snapshot).not.toHaveProperty('agentDeviceId');
+      const messages = (await zip.file('messages.jsonl')!.async('string')).split('\n').map(line => JSON.parse(line));
+      expect(messages.map(message => message.content)).toEqual(messagesRef.rows.map(message => message.content));
+      expect(JSON.parse(messages[1].agentMeta)).toEqual({ usage: { inputTokens: 7 } });
+    },
+  );
+
+  it('detaches parked native sessions in remote history while keeping the visible switch record', async () => {
+    sessionRowRef.row = { ...baseSession(), agentKind: 'codex', agentDeviceId: 'remote-device' };
+    const switchContent = {
+      fromAgentKind: 'cc', toAgentKind: 'codex', fromModel: 'claude-sonnet-4-6',
+      fromAgentDeviceId: null, fromSdkSessionId: 'sid-a', handoff: 'Continue the saved requirements.',
+    };
+    messagesRef.rows.push({
+      ...messagesRef.rows[1], id: 'switch-1', clientId: 'switch-client', role: 'agent_switch',
+      content: JSON.stringify(switchContent), agentMeta: null, createdAt: 1700000000300,
+    });
+    const target = path.join(tmpRoot, 'remote-parked-session.cshare');
+    const outcome = await exportSessionShare({ sessionId: 'xdt-session-1', targetPath: target });
+    expect(outcome.status).toBe('ok');
+    const zip = await unzipOf(target);
+    const messages = (await zip.file('messages.jsonl')!.async('string')).split('\n').map(line => JSON.parse(line));
+    const boundary = messages.find(message => message.role === 'agent_switch');
+    // Import keeps this content. A null binding prevents findParkedEngineSession and
+    // historical forks from resuming the source task's unbundled native session.
+    expect(JSON.parse(boundary.content)).toEqual({ ...switchContent, fromSdkSessionId: null });
+    expect(messages.slice(0, 2).map(message => message.content)).toEqual(baseMessages().map(message => message.content));
+  });
+
+  it('rejects SSH / remote full migration / orca worker / deleted / empty sessions', async () => {
+    sessionRowRef.row = { ...baseSession(), remoteHostId: 'host-1' };
+    await expect(
+      exportSessionShare({ sessionId: 'xdt-session-1', targetPath: path.join(tmpRoot, 'x1') }),
+    ).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+
+    sessionRowRef.row = { ...baseSession(), agentDeviceId: 'remote-device' };
+    await expect(
+      exportSessionShare({ sessionId: 'xdt-session-1', targetPath: path.join(tmpRoot, 'remote-migration'), migration: true }),
+    ).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+
+    // Worker 子会话拒绝直接导出(入口应是所属 lead)
+    sessionRowRef.row = { ...baseSession(), orcaRole: 'worker' };
+    await expect(
+      exportSessionShare({ sessionId: 'xdt-session-1', targetPath: path.join(tmpRoot, 'x2') }),
+    ).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+
+    sessionRowRef.row = { ...baseSession(), status: 'deleted' };
+    await expect(
+      exportSessionShare({ sessionId: 'xdt-session-1', targetPath: path.join(tmpRoot, 'x3') }),
+    ).rejects.toMatchObject({ code: 'NOT_FOUND' });
+
+    sessionRowRef.row = baseSession();
+    messagesRef.rows = [];
+    await expect(
+      exportSessionShare({ sessionId: 'xdt-session-1', targetPath: path.join(tmpRoot, 'x4') }),
+    ).rejects.toMatchObject({ code: 'SHARE_EXPORT_FAILED' });
+  });
+
+  it('orca lead without active team exports as a plain bundle', async () => {
+    sessionRowRef.row = { ...baseSession(), orcaRole: 'lead' };
+    const target = path.join(tmpRoot, 'out-stale-lead.xdtshare');
+    const outcome = await exportSessionShare({ sessionId: 'xdt-session-1', targetPath: target });
+    expect(outcome.status).toBe('ok');
+    if (outcome.status !== 'ok') return;
+    expect(outcome.orcaWorkers).toBe(0);
+    const zip = await unzipOf(target);
+    const manifest = validateManifest(JSON.parse(await zip.file('manifest.json')!.async('string')));
+    expect(manifest.formatVersion).toBe(1);
+    expect(manifest.minReaderVersion).toBe(1);
+    expect(manifest.orca).toBeUndefined();
+  });
+
+  it('marks a local lead with a remote supplier worker as partial instead of bundling stale worker history', async () => {
+    sessionRowRef.row = { ...baseSession(), orcaRole: 'lead' };
+    activeTeamRef.row = { id: 'team-1', status: 'active' };
+    workerRowsRef.rows = [{ sessionId: 'worker-remote', status: 'done', label: null, role: 'developer', focused: 0 }];
+    workerSessionsById.set('worker-remote', {
+      ...baseSession(), id: 'worker-remote', orcaRole: 'worker', agentDeviceId: 'remote-device',
+    });
+    const workerMessages = baseMessages();
+    workerMessages[1] = {
+      ...workerMessages[1], role: 'agent_switch',
+      content: JSON.stringify({ fromAgentKind: 'cc', fromSdkSessionId: 'sid-a' }),
+    };
+    workerMessagesBySession.set('worker-remote', workerMessages);
+    const target = path.join(tmpRoot, 'remote-worker.cshare');
+    const outcome = await exportSessionShare({ sessionId: 'xdt-session-1', targetPath: target });
+    expect(outcome.status).toBe('ok');
+    if (outcome.status !== 'ok') return;
+    expect(outcome.fidelity).toBe('partial');
+    const zip = await unzipOf(target);
+    const manifest = validateManifest(JSON.parse(await zip.file('manifest.json')!.async('string')));
+    expect(manifest.orca!.workers[0].counts.messages).toBe(2);
+    expect(manifest.orca!.workers[0].activeSdkSessionId).toBeNull();
+    const exportedWorkerMessages = (await zip.file('orca/workers/0/messages.jsonl')!.async('string'))
+      .split('\n').map(line => JSON.parse(line));
+    expect(JSON.parse(exportedWorkerMessages[1].content)).toEqual({ fromAgentKind: 'cc', fromSdkSessionId: null });
+    expect(Object.keys(zip.files).some(name => name.startsWith('orca/workers/0/transcripts/'))).toBe(false);
+    expect(zip.file('transcripts/claude/sid-b.jsonl')).toBeTruthy();
+  });
+
+  it.each([false, true])(
+    'orca lead export preserves the team graph (migration=%s)',
+    async (migration) => {
+      sessionRowRef.row = { ...baseSession(), orcaRole: 'lead' };
+      activeTeamRef.row = { id: 'team-1', status: 'active' };
+      workerRowsRef.rows = [
+        { sessionId: 'worker-s-1', status: 'done', label: 'dev-1', role: 'developer', focused: 1 },
+        // 已归档 Worker 不在当前协同列表中,导出也应排除,避免导入后复活。
+        {
+          sessionId: 'worker-s-archived',
+          status: 'done',
+          label: 'dev-2',
+          role: 'reviewer',
+          focused: 0,
+        },
+      ];
+      workerSessionsById.set('worker-s-1', {
+        ...baseSession(),
+        id: 'worker-s-1',
+        title: 'Worker 1',
+        agentKind: 'codex',
+        orcaRole: 'worker',
+        sdkSessionId: 'thread-1',
+      });
+      workerSessionsById.set('worker-s-archived', {
+        ...baseSession(),
+        id: 'worker-s-archived',
+        status: 'archived',
+        orcaRole: 'worker',
+      });
+      workerMessagesBySession.set('worker-s-1', [
+        {
+          id: 'wm1',
+          clientId: 'wc1',
+          role: 'user',
+          content: JSON.stringify([{ type: 'text', text: '派活' }]),
+          toolUseId: null,
+          agentMeta: null,
+          agentKind: 'codex',
+          createdAt: 1700000000300,
+          rewindAt: null,
+        },
+      ]);
+      workerMessagesBySession.set('worker-s-archived', []);
+
+      const target = path.join(tmpRoot, 'out-orca.xdtshare');
+      const outcome = await exportSessionShare({
+        sessionId: 'xdt-session-1',
+        targetPath: target,
+        migration,
+      });
+      expect(outcome.status).toBe('ok');
+      if (outcome.status !== 'ok') return;
+      expect(getActiveTeamByLeadMock).toHaveBeenCalledWith('xdt-session-1');
+      expect(outcome.orcaWorkers).toBe(migration ? 2 : 1);
+      expect(outcome.fidelity).toBe('full');
+
+      const zip = await unzipOf(target);
+      const manifest = validateManifest(
+        JSON.parse(await zip.file('manifest.json')!.async('string')),
+      );
+      expect(manifest.formatVersion).toBe(2);
+      expect(manifest.minReaderVersion).toBe(2);
+      expect(manifest.agentKind).toBe('cc'); // 顶层仍描述 lead
+      expect(manifest.orca).toBeDefined();
+      expect(manifest.orca!.teamStatus).toBe('active');
+      expect(manifest.orca!.workers).toHaveLength(migration ? 2 : 1);
+      const worker = manifest.orca!.workers[0];
+      expect(worker.index).toBe(0);
+      expect(worker.agentKind).toBe('codex');
+      expect(worker.role).toBe('developer');
+      expect(worker.label).toBe('dev-1');
+      expect(worker.status).toBe('done');
+      expect(worker.focused).toBe(true);
+      expect(worker.activeSdkSessionId).toBe('thread-1');
+      expect(worker.counts.messages).toBe(1);
+      expect(worker.transcripts).toEqual([
+        {
+          sdkSessionId: 'thread-1',
+          path: 'orca/workers/0/transcripts/codex/rollout-1-thread-1.jsonl',
+        },
+      ]);
+
+      // Worker 数据落在前缀目录下,lead 顶层结构保持不变
+      expect(zip.file('orca/workers/0/session.json')).toBeTruthy();
+      expect(zip.file('orca/workers/0/messages.jsonl')).toBeTruthy();
+      expect(zip.file('orca/workers/0/transcripts/codex/rollout-1-thread-1.jsonl')).toBeTruthy();
+      expect(zip.file('orca/workers/0/codex-state/thread.json')).toBeTruthy();
+      expect(zip.file('session.json')).toBeTruthy();
+      expect(zip.file('transcripts/claude/sid-b.jsonl')).toBeTruthy();
+      const workerSnapshot = JSON.parse(
+        await zip.file('orca/workers/0/session.json')!.async('string'),
+      ) as Record<string, unknown>;
+      expect(workerSnapshot.agentKind).toBe('codex');
+      if (migration) {
+        expect(workerSnapshot.migrationSourceId).toBe('worker-s-1');
+        expect(
+          JSON.parse(await zip.file('orca/workers/1/session.json')!.async('string')),
+        ).toMatchObject({ migrationSourceId: 'worker-s-archived', status: 'archived' });
+      } else expect(workerSnapshot).not.toHaveProperty('migrationSourceId');
+    },
+  );
+
+  it('orca lead export fails closed when an active team Worker session is missing or deleted', async () => {
+    sessionRowRef.row = { ...baseSession(), orcaRole: 'lead' };
+    activeTeamRef.row = { id: 'team-broken', status: 'active' };
+    workerRowsRef.rows = [
+      { sessionId: 'worker-missing', status: 'error', label: 'broken', role: 'reviewer', focused: 0 },
+    ];
+
+    await expect(
+      exportSessionShare({
+        sessionId: 'xdt-session-1',
+        targetPath: path.join(tmpRoot, 'out-orca-broken.xdtshare'),
+      }),
+    ).rejects.toMatchObject({ code: 'SHARE_EXPORT_FAILED' });
+  });
+});

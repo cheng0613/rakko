@@ -1,0 +1,527 @@
+import { describe, expect, it, vi } from 'vitest';
+import type { InteractionDecision, InteractionRequest, InteractionResolver } from '@cindy/maker-core';
+
+import {
+  beginInteractionRoute,
+  allowHostPagePermission,
+  getActiveInteractionRoute,
+  requestHostInteraction,
+  installDesktopInteractionHandler,
+  installInteractionLifecycleObserver,
+  noteInteractionRouteSteer,
+  type InteractionHandler,
+} from '../interactionRouter';
+import { beginUnattendedTurn } from '../../mcp-integrations/unattendedTurn';
+import { takeUnattendedPlanReviewDeclines } from '../../mcp-integrations/unattendedTurn';
+
+function permission(requestId: string): InteractionRequest {
+  return {
+    kind: 'permission',
+    requestId,
+    toolName: 'Read',
+    input: {},
+  } as InteractionRequest;
+}
+
+function ask(requestId: string): InteractionRequest {
+  return {
+    kind: 'ask_user_question',
+    requestId,
+    questions: [{ question: 'Which?', options: [] }],
+  } as InteractionRequest;
+}
+
+function makeSession() {
+  let listener: InteractionResolver | null = null;
+  const setInteractionListener = vi.fn((next: InteractionResolver | null) => {
+    listener = next;
+  });
+  return {
+    session: { id: 'session-1', setInteractionListener },
+    setInteractionListener,
+    dispatch: (request: InteractionRequest, signal?: AbortSignal) => {
+      if (!listener) throw new Error('listener not installed');
+      return listener(request, signal);
+    },
+  };
+}
+
+describe('session interaction router', () => {
+  // Regression: IM turn cleanup consumed async questions before a person could answer.
+  // Unit: real router + presentation callback; channel completion must not settle the App card.
+  it.each(['delivered', 'failed'] as const)('keeps an async question answerable after Telegram ends (%s notice)', async (delivery) => {
+    const host = makeSession();
+    let answer!: (decision: InteractionDecision) => void;
+    const desktop = vi.fn<InteractionHandler>(() => new Promise(resolve => { answer = resolve; }));
+    const channel = vi.fn<InteractionHandler>();
+    const onCancel = vi.fn();
+    const onStateChange = vi.fn();
+    const messages: InteractionRequest[] = [];
+    installDesktopInteractionHandler(host.session, desktop);
+    const lease = beginInteractionRoute(host.session, {
+      route: { sessionId: host.session.id, turnId: 'telegram-turn', origin: { kind: 'hook', source: 'telegram' },
+        interactionSurface: 'channel-card', timeoutMs: 1, onStateChange,
+        presentQuestion: async request => {
+          messages.push(request);
+          if (delivery === 'failed') throw new Error('offline');
+        },
+      }, handle: channel, onCancel,
+    });
+    const question: InteractionRequest = { kind: 'ask_user_question', requestId: 'async-1', delivery: 'async',
+      questions: [{ header: '格式', question: '输出哪种格式？', options: [{ label: '表格', description: '方便对照' }, { label: '文字' }] }] };
+    let settled = false;
+    const result = host.dispatch(question).then(value => { settled = true; return value; });
+    expect(messages).toEqual([question]);
+    expect(channel).not.toHaveBeenCalled();
+    expect(desktop).toHaveBeenCalledWith(question);
+    lease.release('hook_turn_terminal');
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(onCancel).not.toHaveBeenCalled();
+    expect(onStateChange).not.toHaveBeenCalled();
+    answer({ kind: 'ask_user_question', answers: { '输出哪种格式？': '文字' } });
+    await expect(result).resolves.toMatchObject({ answers: { '输出哪种格式？': '文字' } });
+  });
+
+  // Blocking questions share the Telegram presentation, but retain turn cancellation and App pause admission.
+  it.each(['answer', 'release', 'timeout', 'abort'] as const)('keeps blocking question lifetime and App cleanup on %s', async ending => {
+    vi.useFakeTimers();
+    try {
+      const host = makeSession();
+      let resolve!: (decision: InteractionDecision) => void;
+      let controls!: import('../interactionRouter').QuestionControls;
+      let deferred!: InteractionDecision;
+      const desktop = vi.fn<InteractionHandler>(() => new Promise(r => { resolve = r; }));
+      const cancel = vi.fn((_id: string, decision: InteractionDecision) => resolve(decision));
+      const decide = vi.fn((_id: string, decision: InteractionDecision) => { deferred = decision; });
+      const channel = vi.fn<InteractionHandler>();
+      const state = vi.fn();
+      installDesktopInteractionHandler(host.session, desktop, cancel, decide);
+      const lease = beginInteractionRoute(host.session, {
+        route: { sessionId: host.session.id, turnId: 'blocking', origin: { kind: 'hook', source: 'telegram' },
+          interactionSurface: 'channel-card', questionTimeoutMs: 50, onStateChange: state,
+          presentQuestion: async (_question, next) => { controls = next; },
+        }, handle: channel,
+      });
+      const abort = new AbortController();
+      const pending = host.dispatch(ask('blocking-1'), abort.signal);
+      let settled = false;
+      void pending.then(() => { settled = true; });
+      expect(channel).not.toHaveBeenCalled();
+      expect(state).toHaveBeenCalledWith('waiting');
+      expect(settled).toBe(false);
+      if (ending === 'answer') {
+        controls.answer({ kind: 'ask_user_question', answers: { Which: 'PDF' } });
+        await Promise.resolve();
+        expect(settled).toBe(false); // The App execution-pause gate has not released this answer.
+        expect(decide).toHaveBeenCalledOnce();
+        resolve(deferred);
+        await expect(pending).resolves.toMatchObject({ answers: { Which: 'PDF' } });
+        expect(state).toHaveBeenLastCalledWith('resolved');
+      } else {
+        if (ending === 'release') lease.release();
+        if (ending === 'abort') abort.abort();
+        if (ending === 'timeout') await vi.advanceTimersByTimeAsync(51);
+        await expect(pending).resolves.toMatchObject({ answers: {} });
+        expect(cancel).toHaveBeenCalledOnce();
+        controls.answer({ kind: 'ask_user_question', answers: { Which: 'late' } });
+        expect(decide).not.toHaveBeenCalled();
+        expect(state).toHaveBeenLastCalledWith('cancelled');
+      }
+      lease.release();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('resolves questions and plan reviews for an unattended scheduled turn instead of opening a card', async () => {
+    const host = makeSession();
+    const desktop = vi.fn<InteractionHandler>(async (): Promise<InteractionDecision> => ({
+      kind: 'permission', behavior: 'allow',
+    }));
+    installDesktopInteractionHandler(host.session, desktop);
+    const release = beginUnattendedTurn(host.session.id);
+    try {
+      await expect(requestHostInteraction(host.session, ask('ask-1'), new AbortController().signal))
+        .resolves.toEqual({ kind: 'ask_user_question', answers: {}, dismissed: true });
+      await expect(requestHostInteraction(
+        host.session,
+        { kind: 'plan_review', requestId: 'plan-1', plan: 'do it' } as InteractionRequest,
+        new AbortController().signal,
+      )).resolves.toEqual({
+        kind: 'plan_review', behavior: 'deny', dismissed: true, reason: 'unattended_scheduled_run',
+      });
+      // 拒绝要能被 run 结果引用，否则 plan 模式的定时任务看起来就像“什么也没做”。
+      expect(takeUnattendedPlanReviewDeclines(host.session.id)).toBe(1);
+      expect(takeUnattendedPlanReviewDeclines(host.session.id)).toBe(0);
+      expect(desktop).not.toHaveBeenCalled();
+      // Permissions keep their own card and timeout semantics.
+      await expect(requestHostInteraction(host.session, permission('perm-1'), new AbortController().signal))
+        .resolves.toMatchObject({ kind: 'permission', behavior: 'allow' });
+      expect(desktop).toHaveBeenCalledOnce();
+    } finally {
+      release();
+    }
+  });
+
+  it('routes Host download permissions through the active channel without replacing the listener', async () => {
+    const host = makeSession();
+    const desktop = vi.fn<InteractionHandler>((_request, shared) => shared!.result);
+    const remote = vi.fn(async (): Promise<InteractionDecision> => ({ kind: 'permission', behavior: 'allow' }));
+    installDesktopInteractionHandler(host.session, desktop);
+    const lease = beginInteractionRoute(host.session, {
+      route: { sessionId: host.session.id, turnId: 'turn-1', origin: { kind: 'im', channel: 'feishu' }, interactionSurface: 'channel-card' },
+      handle: remote,
+    });
+    try {
+      await expect(requestHostInteraction(host.session, permission('download-1'), new AbortController().signal))
+        .resolves.toMatchObject({ behavior: 'allow' });
+      expect(remote).toHaveBeenCalledOnce();
+      expect(desktop).toHaveBeenCalledOnce();
+      expect(host.setInteractionListener).toHaveBeenCalledOnce();
+    } finally { lease.release(); }
+  });
+
+  it('exposes the live route and its owner evidence for owner-only Host actions', async () => {
+    const host = makeSession();
+    installDesktopInteractionHandler(host.session, vi.fn<InteractionHandler>((_request, shared) => shared!.result));
+    expect(getActiveInteractionRoute(host.session)).toBeNull();
+    const lease = beginInteractionRoute(host.session, {
+      route: {
+        sessionId: host.session.id, turnId: 'turn-owner', origin: { kind: 'im', channel: 'telegram' },
+        interactionSurface: 'channel-card', requesterAuthority: 'owner',
+      },
+      handle: vi.fn(async (): Promise<InteractionDecision> => ({ kind: 'permission', behavior: 'deny' })),
+    });
+    expect(getActiveInteractionRoute(host.session)).toMatchObject({
+      origin: { kind: 'im', channel: 'telegram' }, requesterAuthority: 'owner',
+    });
+    lease.release();
+    expect(getActiveInteractionRoute(host.session)).toBeNull();
+  });
+
+  it('stops vouching for the IM sender once other input is steered into the turn', () => {
+    const host = makeSession();
+    installDesktopInteractionHandler(host.session, vi.fn<InteractionHandler>((_request, shared) => shared!.result));
+    noteInteractionRouteSteer(host.session);
+    const lease = beginInteractionRoute(host.session, {
+      route: {
+        sessionId: host.session.id, turnId: 'turn-steered', origin: { kind: 'im', channel: 'telegram' },
+        interactionSurface: 'channel-card', requesterAuthority: 'owner',
+      },
+      handle: vi.fn(async (): Promise<InteractionDecision> => ({ kind: 'permission', behavior: 'deny' })),
+    });
+    try {
+      // A steer before this route began does not touch it.
+      expect(getActiveInteractionRoute(host.session)?.requesterAuthority).toBe('owner');
+      noteInteractionRouteSteer(host.session);
+      expect(getActiveInteractionRoute(host.session)).toMatchObject({
+        origin: { kind: 'im', channel: 'telegram' }, requesterAuthority: 'unknown',
+      });
+      expect(lease.route.requesterAuthority).toBe('owner');
+    } finally { lease.release(); }
+    const next = beginInteractionRoute(host.session, {
+      route: {
+        sessionId: host.session.id, turnId: 'turn-next', origin: { kind: 'im', channel: 'telegram' },
+        interactionSurface: 'channel-card', requesterAuthority: 'owner',
+      },
+      handle: vi.fn(async (): Promise<InteractionDecision> => ({ kind: 'permission', behavior: 'deny' })),
+    });
+    try {
+      expect(getActiveInteractionRoute(host.session)?.requesterAuthority).toBe('owner');
+    } finally { next.release(); }
+  });
+
+  it('lets the phone/Desktop or the IM card answer an app update card; the first answer wins', async () => {
+    const host = makeSession();
+    let desktopShared: Parameters<InteractionHandler>[1];
+    const desktop = vi.fn<InteractionHandler>((_request, shared) => {
+      desktopShared = shared;
+      return shared!.result;
+    });
+    const channel = vi.fn<InteractionHandler>((_request, shared) => shared!.result);
+    installDesktopInteractionHandler(host.session, desktop);
+    const lease = beginInteractionRoute(host.session, {
+      route: {
+        sessionId: host.session.id, turnId: 'turn-update', origin: { kind: 'im', channel: 'telegram' },
+        interactionSurface: 'channel-card', requesterAuthority: 'owner',
+      },
+      handle: channel,
+    });
+    try {
+      const request = { ...permission('app-update-1'), toolName: 'cindy.app.update', input: { from: '1', to: '2' } } as InteractionRequest;
+      const pending = requestHostInteraction(host.session, request, new AbortController().signal);
+      await vi.waitFor(() => { expect(channel).toHaveBeenCalledOnce(); });
+      // Same-account phone answers through the Desktop pending entry; a late IM click cannot override it.
+      desktopShared!.decide({ kind: 'permission', behavior: 'allow' });
+      const [, channelShared] = channel.mock.calls[0]!;
+      expect(channelShared!.decide({ kind: 'permission', behavior: 'deny' })).toBe(false);
+      await expect(pending).resolves.toMatchObject({ behavior: 'allow' });
+      expect(desktop).toHaveBeenCalledOnce();
+    } finally { lease.release(); }
+  });
+
+  it('cancels the ordinary pending card when a Host permission is aborted', async () => {
+    const host = makeSession();
+    const controller = new AbortController();
+    const cancel = vi.fn();
+    installDesktopInteractionHandler(host.session, () => new Promise(() => {}), cancel);
+    const pending = requestHostInteraction(host.session, permission('download-2'), controller.signal);
+    controller.abort();
+    await expect(pending).resolves.toMatchObject({ behavior: 'deny' });
+    expect(cancel).toHaveBeenCalledWith('download-2', expect.objectContaining({ behavior: 'deny' }));
+  });
+
+  it('owns one listener and falls back to the Desktop handler', async () => {
+    const harness = makeSession();
+    const desktop = vi.fn(async (): Promise<InteractionDecision> => ({
+      kind: 'permission',
+      behavior: 'allow',
+    }));
+
+    installDesktopInteractionHandler(harness.session, desktop);
+    installDesktopInteractionHandler(harness.session, desktop);
+
+    await expect(harness.dispatch(permission('desktop-1'))).resolves.toMatchObject({
+      behavior: 'allow',
+    });
+    expect(harness.setInteractionListener).toHaveBeenCalledTimes(1);
+    expect(desktop).toHaveBeenCalledTimes(1);
+  });
+
+  it('routes only the admitted turn to its channel surface', async () => {
+    const harness = makeSession();
+    const desktop = vi.fn<InteractionHandler>(async (_request, shared) => shared ? shared.result : ({
+      kind: 'permission',
+      behavior: 'deny',
+      reason: 'desktop',
+    }));
+    const channel = vi.fn(async (): Promise<InteractionDecision> => ({
+      kind: 'permission',
+      behavior: 'allow',
+    }));
+    installDesktopInteractionHandler(harness.session, desktop);
+
+    const lease = beginInteractionRoute(harness.session, {
+      route: {
+        sessionId: 'session-1',
+        turnId: 'feishu-turn-1',
+        origin: { kind: 'im', channel: 'feishu' },
+        interactionSurface: 'channel-card',
+      },
+      handle: channel,
+    });
+
+    await expect(harness.dispatch(permission('channel-1'))).resolves.toMatchObject({
+      behavior: 'allow',
+    });
+    lease.release();
+    await expect(harness.dispatch(permission('desktop-2'))).resolves.toMatchObject({
+      reason: 'desktop',
+    });
+    expect(channel).toHaveBeenCalledTimes(1);
+    expect(desktop).toHaveBeenCalledTimes(2);
+    expect(harness.setInteractionListener).toHaveBeenCalledTimes(1);
+  });
+
+  it('routes an admitted personal WeChat turn to Desktop without a channel handler', async () => {
+    const harness = makeSession();
+    const desktop = vi.fn(async (): Promise<InteractionDecision> => ({
+      kind: 'permission',
+      behavior: 'allow',
+    }));
+    installDesktopInteractionHandler(harness.session, desktop);
+
+    const lease = beginInteractionRoute(harness.session, {
+      route: {
+        sessionId: 'session-1',
+        turnId: 'wechat-task-1',
+        origin: { kind: 'im', channel: 'wechat', taskId: 'wechat-task-1' },
+        interactionSurface: 'desktop',
+      },
+    });
+
+    await expect(harness.dispatch(permission('wechat-1'))).resolves.toMatchObject({
+      behavior: 'allow',
+    });
+    expect(desktop).toHaveBeenCalledOnce();
+    lease.release();
+  });
+
+  it('fails a Desktop-routed confirmation closed when its turn timeout expires', async () => {
+    vi.useFakeTimers();
+    try {
+      const harness = makeSession();
+      installDesktopInteractionHandler(
+        harness.session,
+        async () => new Promise<InteractionDecision>(() => {}),
+      );
+      const states: string[] = [];
+      const lease = beginInteractionRoute(harness.session, {
+        route: {
+          sessionId: 'session-1',
+          turnId: 'wechat-task-timeout',
+          origin: {
+            kind: 'im',
+            channel: 'wechat',
+            taskId: 'wechat-task-timeout',
+          },
+          interactionSurface: 'desktop',
+          timeoutMs: 100,
+          onStateChange: (state) => states.push(state),
+        },
+      });
+
+      const decision = harness.dispatch(permission('wechat-timeout'));
+      await vi.advanceTimersByTimeAsync(100);
+
+      await expect(decision).resolves.toMatchObject({
+        kind: 'permission',
+        behavior: 'deny',
+        reason: 'interaction_timeout',
+      });
+      expect(states).toEqual(['waiting', 'cancelled']);
+      lease.release();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('cancels pending requests with a kind-correct safe decision on release', async () => {
+    const harness = makeSession();
+    let keepPending!: () => void;
+    const never = new Promise<void>((resolve) => {
+      keepPending = resolve;
+    });
+    const onCancel = vi.fn();
+    const states: string[] = [];
+    const lease = beginInteractionRoute(harness.session, {
+      route: {
+        sessionId: 'session-1',
+        turnId: 'slack-turn-1',
+        origin: { kind: 'im', channel: 'slack' },
+        interactionSurface: 'channel-card',
+        onStateChange: (state) => states.push(state),
+      },
+      handle: async () => {
+        await never;
+        return { kind: 'ask_user_question', answers: { Which: 'late' } };
+      },
+      onCancel,
+    });
+
+    const decision = harness.dispatch(ask('ask-1'));
+    await vi.waitFor(() => expect(states).toEqual(['waiting']));
+    lease.release('turn_terminal');
+
+    await expect(decision).resolves.toEqual({
+      kind: 'ask_user_question',
+      answers: {},
+    });
+    expect(onCancel).toHaveBeenCalledWith('ask-1', {
+      kind: 'ask_user_question',
+      answers: {},
+    });
+    expect(states).toEqual(['waiting', 'cancelled']);
+    keepPending();
+  });
+
+  it('notifies lifecycle observer on resolve, timeout, release, and handler throw', async () => {
+    vi.useFakeTimers();
+    try {
+      const harness = makeSession();
+      const starts: string[] = [];
+      const ends: string[] = [];
+      installInteractionLifecycleObserver(harness.session, {
+        onStart: (request) => starts.push(request.requestId),
+        onEnd: (request) => ends.push(request.requestId),
+      });
+      installDesktopInteractionHandler(harness.session, async (request) => {
+        if (request.requestId === 'throw') throw new Error('boom');
+        if (request.requestId === 'release' || request.requestId === 'timeout') {
+          return new Promise<InteractionDecision>(() => {});
+        }
+        return { kind: 'permission', behavior: 'allow' };
+      });
+
+      await expect(harness.dispatch(permission('resolve'))).resolves.toMatchObject({ behavior: 'allow' });
+      await expect(harness.dispatch(permission('throw'))).resolves.toMatchObject({
+        reason: 'interaction_handler_failed',
+      });
+      const timeoutLease = beginInteractionRoute(harness.session, {
+        route: {
+          sessionId: 'session-1',
+          turnId: 'timeout-observer',
+          origin: { kind: 'im', channel: 'wechat' },
+          interactionSurface: 'desktop',
+          timeoutMs: 50,
+        },
+      });
+      const timeoutPromise = harness.dispatch(permission('timeout'));
+      await vi.advanceTimersByTimeAsync(50);
+      await expect(timeoutPromise).resolves.toMatchObject({ reason: 'interaction_timeout' });
+      timeoutLease.release();
+      const releaseLease = beginInteractionRoute(harness.session, {
+        route: {
+          sessionId: 'session-1',
+          turnId: 'release-observer',
+          origin: { kind: 'im', channel: 'wechat' },
+          interactionSurface: 'desktop',
+        },
+      });
+      const releasePromise = harness.dispatch(permission('release'));
+      await vi.waitFor(() => expect(starts).toContain('release'));
+      releaseLease.release('turn_terminal');
+      await expect(releasePromise).resolves.toMatchObject({ reason: 'turn_terminal' });
+      expect(starts).toEqual(['resolve', 'throw', 'timeout', 'release']);
+      expect(ends).toEqual(['resolve', 'throw', 'timeout', 'release']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('rejects overlapping routes before provider dispatch', () => {
+    const harness = makeSession();
+    const handle = vi.fn(async (): Promise<InteractionDecision> => ({
+      kind: 'permission',
+      behavior: 'allow',
+    }));
+    const first = beginInteractionRoute(harness.session, {
+      route: {
+        sessionId: 'session-1',
+        turnId: 'turn-1',
+        origin: { kind: 'hook', source: 'slack' },
+        interactionSurface: 'channel-card',
+      },
+      handle,
+    });
+
+    expect(() =>
+      beginInteractionRoute(harness.session, {
+        route: {
+          sessionId: 'session-1',
+          turnId: 'turn-2',
+          origin: { kind: 'im', channel: 'discord' },
+          interactionSurface: 'channel-card',
+        },
+        handle,
+      }),
+    ).toThrow(/already active/);
+
+    first.release();
+  });
+});
+
+// unit: a committed mode change must answer the existing page request, not cancel
+// and start a second request. Minimum input: one model request and one page request.
+it('Full Access answers only the page request through the existing Desktop resolver', async () => {
+  const host = makeSession();
+  const resolvers = new Map<string, (decision: InteractionDecision) => void>();
+  const resolve = vi.fn((id: string, decision: InteractionDecision) => resolvers.get(id)?.(decision));
+  installDesktopInteractionHandler(host.session, request => new Promise(r => resolvers.set(request.requestId, r)), undefined, resolve);
+  const signal = new AbortController();
+  const model = requestHostInteraction(host.session, permission('model'), signal.signal);
+  const page = requestHostInteraction(host.session, { ...permission('page'), metadata: { mcpApp: { clientId: 'card' } } } as InteractionRequest, signal.signal);
+  allowHostPagePermission(host.session, 'model'); expect(resolve).not.toHaveBeenCalled();
+  allowHostPagePermission(host.session, 'page');
+  expect(await page).toEqual({ kind: 'permission', behavior: 'allow' });
+  signal.abort(); await model;
+});

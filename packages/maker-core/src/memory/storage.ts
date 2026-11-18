@@ -1,0 +1,822 @@
+/**
+ * MemoryStorage — Maker Memory 的文件系统层 (CRUD + frontmatter + MEMORY.md 派生)。
+ *
+ * 责任边界:
+ *  - 文件 IO + frontmatter 解析 + 路径 sanitize + size 校验
+ *  - **MEMORY.md 索引由本层自动重建** (write/delete 时同步触发), LLM 永远不直接改 MEMORY.md
+ *    → 跟 Claude Code auto-memory "让 LLM 手写索引" 的反 pattern 区分; 解决 "分片改了
+ *    但索引没同步" 的常见 bug。
+ *  - 不管 SQLite/FTS5 (那是 fts.ts 的事), 不管 BaseAgent / MCP (那是上层的事)。
+ *  - 不管 sanitizeWorkdir → directory name 的映射, 调用方传已经准备好的目录绝对路径。
+ *
+ * 写入路径:
+ *  write() → schema 校验 → 撞名/size 检查 → 写 .md 文件 → rebuildIndex() → 返 WriteResult
+ *  失败抛 MemoryError (硬错误: schema/撞名/路径非法), 软警告通过 WriteResult.warning 字段
+ *  返给调用方 (size 接近上限, 提示 LLM consolidate)。
+ *
+ * 时序:
+ *  同一宿主进程内按目录串行写入与删除，界面版本检查和伙伴工具写入共享互斥。
+ *  不宣称保护外部编辑器或其它进程直接修改文件。
+ */
+
+import { createHash, randomBytes } from 'node:crypto';
+import { promises as fs } from 'node:fs';
+import * as path from 'node:path';
+import matter from 'gray-matter';
+
+import {
+  CURATED_MEMORY_TYPES,
+  DEFAULT_MEMORY_CONFIG,
+  isMemoryType,
+  MemoryError,
+  type MemoryConfig,
+  type MemoryFrontmatter,
+  type MemoryRecord,
+  type MemoryType,
+  type WriteOptions,
+  type WriteResult,
+  type WriteWarningDetail,
+} from './types.js';
+
+const INDEX_FILENAME = 'MEMORY.md';
+const META_FILENAME = 'meta.json';
+const SHARD_EXT = '.md';
+const SLUG_REGEX = /^[a-z0-9_-]+$/;
+
+// Multiple store instances for the same directory must share the mutation queue.
+const mutationQueues = new Map<string, Promise<unknown>>();
+
+/*
+ * Windows refuses to replace a file that an antivirus scanner, the search indexer, a sync client
+ * or another rename briefly holds (EPERM / EACCES / EBUSY). The lock clears within milliseconds,
+ * so a short backoff turns it into a successful write instead of a failed memory save.
+ */
+const BRIEF_LOCK_CODES = new Set(['EPERM', 'EACCES', 'EBUSY']);
+const BRIEF_LOCK_BACKOFF_MS = [10, 20, 40, 80, 160];
+
+async function renameRetryingBriefLocks(from: string, to: string, beforeReplace?: () => void): Promise<void> {
+  for (let attempt = 0; ; attempt += 1) {
+    // Rechecked before every attempt: the owner may switch accounts during a backoff, and a
+    // replacement made after that cannot be undone by the checks that run after the write.
+    beforeReplace?.();
+    try {
+      await fs.rename(from, to);
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException)?.code;
+      const delay = BRIEF_LOCK_BACKOFF_MS[attempt];
+      if (delay === undefined || !code || !BRIEF_LOCK_CODES.has(code)) throw error;
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+}
+
+/**
+ * Writes `content` to `target` without following a link there: a fresh temp file (never an
+ * existing path) is renamed over it. A memory folder can sit inside a project its tasks edit
+ * (a teammate's project), so a link planted in it must not redirect the host's writes.
+ */
+async function writeFileNoFollow(target: string, content: string, beforeReplace?: () => void): Promise<void> {
+  const tmp = `${target}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+  await fs.writeFile(tmp, content, { encoding: 'utf8', flag: 'wx' });
+  try {
+    await renameRetryingBriefLocks(tmp, target, beforeReplace);
+  } catch (error) {
+    await fs.unlink(tmp).catch(() => {});
+    throw error;
+  }
+}
+
+/**
+ * 把 workdir 绝对路径转成 sanitize 后的目录名 (Claude Code 风格)。
+ *  E:\AIWork\xdt-maker  → 'E--AIWork-xdt-maker'
+ *  /Users/sam/proj     → 'Users-sam-proj'
+ *
+ * 用法是 host 算好后传给 MakerMemoryStore: <userData>/maker-memory/<sanitized>/。
+ * 不在 storage 里直接拼路径, 保持 storage 的 dir 是 "已就绪的目录" 这一职责单一。
+ */
+export function sanitizeWorkdir(absPath: string): string {
+  // 替换路径分隔符 + 冒号 (Windows 盘符) 为 '-'; 去除前导 '-' 但保留 'E--' 这种
+  // 双 dash (盘符自带 ':' → '-' + '\' → '-')。
+  return absPath
+    .replace(/[\\/]/g, '-')
+    .replace(/:/g, '-')
+    .replace(/^-+/, ''); // 去除最前面的 leading '-' (Unix 路径 / 开头转完是 '-Users-...')
+}
+
+/**
+ * Maker Memory 的 store 定位键(scope key)。本地会话直接用 workdir 绝对路径
+ * (保持既有存储目录不迁移);SSH remote 会话用 `ssh:<host 段>:<workdir>` 复合键 —
+ * 远端路径是远端机器上的字符串,直接当 key 会跟本地同名路径共用一个 store
+ * (两台机器各有 /home/me/proj 时记忆互串)。host 段经 encodeURIComponent 编码:
+ * 编码后不含 `:`,前缀后的首个 `:` 即边界,(hostId, workdir) → key 是单射 —
+ * 裸拼接时 ('/x:/repo','prod') 与 ('/repo','prod:/x') 会撞成同一个 key
+ * (review R5 P2);常规 alias 编码前后相同,键仍可读。数据仍存控制端本机,
+ * 目录名经 memoryScopeDirName 派生。所有 getStore 调用方 (agent 启动注入 /
+ * MCP withStore) 必须统一取键,不得各自拼接——**统一入口是 async 的
+ * resolveMemoryScopeKey (scope-resolver.ts)**: 它在本地会话上额外做 git
+ * linked-worktree 归一化 (#2379), 本函数保持同步原契约不变。
+ */
+export function buildMemoryScopeKey(workingDir: string, remoteHostId?: string | null): string {
+  return remoteHostId ? `ssh:${encodeURIComponent(remoteHostId)}:${workingDir}` : workingDir;
+}
+
+/**
+ * Cindy Bot 的长期记忆作用域。
+ *
+ * Bot 可以在多个项目、route 和远端 Host 上工作；用 workingDir 分区会让同一个 Bot
+ * 的记忆被切碎，也会让两个 Bot 在同一项目里互相污染。Profile runtime 因此把
+ * Bot id 映射成独立且稳定的 scope key，所有 harness prompt 与 cindy_memory MCP
+ * 都使用同一个 key。
+ */
+export function buildBotMemoryScopeKey(botId: string): string {
+  if (!botId.trim()) throw new Error('buildBotMemoryScopeKey: botId required');
+  return `bot:${encodeURIComponent(botId.trim())}`;
+}
+
+/**
+ * Reverse a Bot memory scope without teaching the generic memory manager about
+ * Desktop's Bot Home layout. Invalid/non-Bot keys return null and therefore
+ * remain ordinary Maker Memory scopes.
+ */
+export function parseBotMemoryScopeKey(scopeKey: string): string | null {
+  if (!scopeKey.startsWith('bot:')) return null;
+  const encoded = scopeKey.slice('bot:'.length);
+  if (!encoded) return null;
+  try {
+    const botId = decodeURIComponent(encoded).trim();
+    return botId || null;
+  } catch {
+    return null;
+  }
+}
+
+/** buildMemoryScopeKey 的远端键前缀。本地键恒为绝对路径, 不会以它开头。 */
+export const SSH_SCOPE_KEY_PREFIX = 'ssh:';
+const BOT_SCOPE_KEY_PREFIX = 'bot:';
+
+/**
+ * scope key → 落盘目录名。本地键沿用 sanitizeWorkdir(既有目录不迁移);远端
+ * 键不能走有损的 sanitizeWorkdir — `ssh:prod:/repo` 与本地路径 `/ssh/prod:/repo`
+ * 会 sanitize 成同一个目录名, 隔离承诺被撞破 (review R4 P2)。远端目录名 =
+ * `ssh-<host 可读片段>-<sha256(完整 key) 前 16 hex>`:key 是 (hostId, 路径)
+ * 对的单射 (见 buildMemoryScopeKey), hash 因此保证目录唯一性, 且对特殊字符/
+ * 超长路径免疫 (定长, Windows MAX_PATH 安全);host 片段 (编码形态, 不含 `:`)
+ * 只为肉眼可辨识。
+ */
+export function memoryScopeDirName(scopeKey: string): string {
+  if (scopeKey.startsWith(BOT_SCOPE_KEY_PREFIX)) {
+    const botSegment = scopeKey.slice(BOT_SCOPE_KEY_PREFIX.length);
+    const digest = createHash('sha256').update(scopeKey, 'utf8').digest('hex').slice(0, 16);
+    return `bot-${sanitizeWorkdir(botSegment).slice(0, 24)}-${digest}`;
+  }
+  if (!scopeKey.startsWith(SSH_SCOPE_KEY_PREFIX)) return sanitizeWorkdir(scopeKey);
+  const hostSegment = scopeKey.slice(SSH_SCOPE_KEY_PREFIX.length).split(':', 1)[0] ?? '';
+  const digest = createHash('sha256').update(scopeKey, 'utf8').digest('hex').slice(0, 16);
+  return `ssh-${sanitizeWorkdir(hostSegment).slice(0, 24)}-${digest}`;
+}
+
+/** 调用方的 name 允许直接粘贴 MEMORY.md 索引里的文件名 */
+function normalizeShardName(raw: string): string {
+  return raw.trim().replace(/\.md$/i, '');
+}
+
+/**
+ * 逻辑地址: MEMORY.md 文件名 / 带 type 前缀的 slug / 纯 slug 归一成同一个 key。
+ * 存量双前缀分片 (`feedback_feedback_foo.md`) 的 slug 是 `feedback_foo`, 三种写法
+ * 必须落到它 — 只按正则猜一个 slug 会定位到不存在的文件。
+ */
+function addressKey(type: MemoryType, raw: string): string {
+  return normalizeShardName(raw).replace(new RegExp(`^(?:${type}[_-])+`), '');
+}
+
+/** filename = `<type>_<slug>.md`; slug 误带 `<type>_` / `<type>-` 前缀会被拒绝 (见 validateNoTypePrefix) */
+export function buildFilename(type: MemoryType, slug: string): string {
+  validateNoTypePrefix(type, slug);
+  return `${type}_${slug}${SHARD_EXT}`;
+}
+
+/**
+ * 拒绝新建分片时 slug 上误带的 `<type>_` / `<type>-` 前缀 — memory_write 的调用方
+ * (LLM) 常把 type 写进 name, 造成 `feedback_feedback_foo.md` 双前缀分片 (#1652 附带
+ * bug, #205 审计亦命中)。
+ * **存量分片先按逻辑地址解析 (见 resolveFilename)**: 命中已有分片就写到它, 不剥离、
+ * 也不新建; 只有没有存量分片时才拒绝, 避免再增生双前缀。
+ */
+function validateNoTypePrefix(type: MemoryType, slug: string): void {
+  // 提示里的示例必须自己也能过本校验, 否则调用方照着重试还是 invalid-slug (#10274 review P1)
+  const example = `brief-${type}`;
+  if (slug === type) {
+    throw new MemoryError(
+      'invalid-slug',
+      `slug 不能等于 type 名 "${type}", 请传纯 slug (如 "${example}")`,
+    );
+  }
+  if (slug.startsWith(`${type}_`) || slug.startsWith(`${type}-`)) {
+    const stripped = addressKey(type, slug);
+    const suggestion = SLUG_REGEX.test(stripped) && stripped !== type ? stripped : example;
+    throw new MemoryError(
+      'invalid-slug',
+      `slug "${slug}" 已带 type 前缀 "${type}${slug[type.length]}", 请传纯 slug (如 "${suggestion}")`,
+    );
+  }
+}
+
+/** 解析 filename 反推 type + slug, 不匹配返 null */
+export function parseFilename(filename: string): { type: MemoryType; slug: string } | null {
+  if (!filename.endsWith(SHARD_EXT)) return null;
+  if (filename === INDEX_FILENAME) return null;
+  const stem = filename.slice(0, -SHARD_EXT.length);
+  const idx = stem.indexOf('_');
+  if (idx <= 0) return null;
+  const typeStr = stem.slice(0, idx);
+  const slug = stem.slice(idx + 1);
+  if (!isMemoryType(typeStr)) return null;
+  if (!SLUG_REGEX.test(slug)) return null;
+  return { type: typeStr, slug };
+}
+
+export function validateSlug(slug: string, maxLen: number): void {
+  if (!SLUG_REGEX.test(slug)) {
+    throw new MemoryError('invalid-slug', `slug 只允许 [a-z0-9_-], 收到 "${slug}"`);
+  }
+  if (slug.length > maxLen) {
+    throw new MemoryError('invalid-slug', `slug 长度 > ${maxLen}: "${slug}"`);
+  }
+}
+
+export interface MemoryStorageMeta {
+  /** workdir 绝对路径 (调用方记录, storage 不解析) */
+  absPath: string;
+  /** 首次创建时间 (ISO) */
+  createdAt: string;
+  /** 最近一次写/读时间 (ISO) — manager 决定是否更新 */
+  lastUsedAt: string;
+}
+
+export class MemoryStorage {
+  private indexCache: string | null = null;
+  /**
+   * 派生索引 (MEMORY.md) 失效标记 (review #2388 Codex 23rd P1/P2): shard
+   * write/delete 已落盘但其后的 rebuildIndex 被 owner 边界中止时置位 —
+   * 文件与索引不一致; 下次安全打开 (init) 时 repairIndexIfDirty 惰性修复,
+   * 防止同 owner 后续 session 把 stale 索引读进 system prompt。
+   */
+  private derivedIndexDirty = false;
+
+  constructor(
+    /** 已就绪的目录绝对路径, e.g. <userData>/maker-memory/<sanitized-workdir>/ */
+    public readonly dir: string,
+    public readonly config: MemoryConfig = DEFAULT_MEMORY_CONFIG,
+    /**
+     * 文件系统写入前守卫 (review #2388 Codex 8th P1): write 内部在真正写盘前
+     * 有 await (tryReadRaw 读现有文件判 mode), 边界可在此窗口发生 — 必须在该
+     * await 之后、fs.writeFile 之前复核 owner scope, 否则直接调用方 (如 Pi
+     * compaction 经 manager.write, withStore 后置检查之外) 会把写入落到旧
+     * owner 根后报成功。由 store 透传 manager 注入的 scopeCheck。
+     */
+    private readonly beforeFileWrite?: () => void,
+  ) {}
+
+  /**
+   * mkdir -p + 写 meta.json (如缺失). 幂等。
+   * 同目录的多个 store 可能同时首次打开 (并发 getStore), meta.json 写入走同一互斥队列,
+   * 不让两次替换同一文件的 rename 重叠 (Windows 上重叠的 rename 报 EPERM)。
+   */
+  async init(absWorkdir: string): Promise<void> {
+    return this.mutate(() => this.initLocked(absWorkdir));
+  }
+
+  private async initLocked(absWorkdir: string): Promise<void> {
+    await fs.mkdir(this.dir, { recursive: true });
+    const metaPath = path.join(this.dir, META_FILENAME);
+    if (await fs.access(metaPath).then(() => true, () => false)) return;
+    // 首次打开副作用也 fail-closed (review #2388 Codex 16th P1): 异步初始化
+    // 期间边界发生, 不得在旧 owner 下创建 meta.json。
+    this.beforeFileWrite?.();
+    const meta: MemoryStorageMeta = {
+      absPath: absWorkdir,
+      createdAt: new Date().toISOString(),
+      lastUsedAt: new Date().toISOString(),
+    };
+    await writeFileNoFollow(metaPath, JSON.stringify(meta, null, 2), this.beforeFileWrite);
+  }
+
+  /** Keep metadata, derived indexes and FTS initialization in the mutation queue.
+   * The supplied initializer already owns that queue: never enqueue it again. */
+  async serializeInitialization(run: (initializeStorage: (absWorkdir: string) => Promise<void>) => Promise<void>): Promise<void> {
+    return this.mutate(() => run(async (absWorkdir) => {
+      await this.initLocked(absWorkdir);
+      await this.rebuildIndexLocked();
+    }));
+  }
+
+  /**
+   * 列出所有 memory 分片 (含 frontmatter + body)。MEMORY.md / meta.json 自动跳过。
+   * 损坏文件 (frontmatter 缺失 / type 非法) 跳过 + 不抛错 — 不让单个坏文件拖垮全量列表。
+   */
+  async list(): Promise<MemoryRecord[]> {
+    let entries: string[];
+    try {
+      entries = await fs.readdir(this.dir);
+    } catch (e) {
+      if (isENOENT(e)) return [];
+      throw new MemoryError('io-error', `readdir failed: ${(e as Error).message}`);
+    }
+    const records: MemoryRecord[] = [];
+    for (const entry of entries) {
+      if (entry === INDEX_FILENAME || entry === META_FILENAME) continue;
+      if (!entry.endsWith(SHARD_EXT)) continue;
+      const parsed = parseFilename(entry);
+      if (!parsed) continue;
+      try {
+        const rec = await this.readRecord(entry);
+        if (rec) records.push(rec);
+      } catch {
+        // 单个坏文件跳过, 由 review 工具后续清理
+      }
+    }
+    // 按 type 分组, 同 type 内按 slug 升序 → MEMORY.md 索引可读性
+    records.sort((a, b) => {
+      if (a.frontmatter.type !== b.frontmatter.type) {
+        return a.frontmatter.type.localeCompare(b.frontmatter.type);
+      }
+      return a.slug.localeCompare(b.slug);
+    });
+    return records;
+  }
+
+  /** 读单条; 不存在抛 not-found; 损坏抛 invalid-frontmatter */
+  async read(filename: string): Promise<MemoryRecord> {
+    this.assertSafeFilename(filename);
+    const rec = await this.readRecord(filename);
+    if (!rec) throw new MemoryError('not-found', `memory not found: ${filename}`);
+    return rec;
+  }
+
+  /**
+   * 写入. mode 语义:
+   *  - 'create' (默认): 撞名抛 already-exists
+   *  - 'update'       : 覆盖, 不存在抛 not-found
+   *  - 'append'       : 追加 body 到现有末尾, 不存在抛 not-found
+   *
+   * 写完自动重建 MEMORY.md。返 WriteResult.warning:
+   *  - 'shard-size-exceeded' : 写完后 body 超 maxShardBytes (软上限)
+   *  - 'index-size-exceeded' : 重建后 MEMORY.md 超 maxIndexBytes (软上限)
+   * 软警告 = 写入仍成功; warningDetail 附当前字节/软上限/硬上限,
+   * 调用方据此判断超了多少再决定不动 / 微剪 / consolidate。
+   */
+  async write(opts: WriteOptions): Promise<WriteResult> {
+    const normalized: WriteOptions = { ...opts, name: normalizeShardName(opts.name) };
+    this.validateOpts(normalized);
+    return this.mutate(async () => {
+      const filename = await this.resolveFilename(normalized.type, opts.name);
+      return this.writeFile(normalized, filename);
+    });
+  }
+
+  /**
+   * 把调用方的 name 解析成落盘文件名, 三种写法指向同一分片:
+   *  - `project-x` / `project_x` / `project_x.md` (索引原样) 都命中 `project_project-x.md`
+   *  - 没有同 key 的存量分片时才按规范文件名新建 (并拒绝带 type 前缀的新 slug)
+   * 同 key 命中多个存量分片时报 ambiguous-address, 不猜; 传完整文件名可指定其中一个。
+   * 带 `.md` 的完整文件名是显式目标: 原样落盘 (已存在就写它, 不存在就建它), 不重定向到别名。
+   */
+  async resolveFilename(type: MemoryType, rawName: string): Promise<string> {
+    if (!isMemoryType(type)) {
+      throw new MemoryError('invalid-type', `type 必须是 user/feedback/project/reference, 收到 "${type}"`);
+    }
+    // 后缀大小写统一成 .md: parseFilename 只认小写, 否则 .MD 会绕过内嵌 type 检查
+    const supplied = rawName.trim().replace(/\.md$/i, '.md');
+    // 完整文件名 = 显式目标: 云端恢复存量分片时必须能原样重建 (含旧的双前缀名)
+    const explicit = supplied.endsWith('.md') ? parseFilename(supplied) : null;
+    if (explicit && explicit.type !== type) {
+      throw new MemoryError(
+        'invalid-type',
+        `文件名 "${supplied}" 属于 type "${explicit.type}", 与传入的 type "${type}" 不符`,
+      );
+    }
+    const name = supplied.replace(/\.md$/, '');
+    // 只剥一次 .md 后的名字不能带第二个后缀 (note.md.md), 长度按去掉 type 前缀的 slug 算
+    if (!SLUG_REGEX.test(name)) {
+      throw new MemoryError('invalid-slug', `slug 只允许 [a-z0-9_-], 收到 "${name}"`);
+    }
+    const key = addressKey(type, name);
+    validateSlug(key, this.config.maxSlugLen);
+    // 只读文件名, 不解析正文: 地址由 filename 决定 (#10274 review)
+    const matches = (await fs.readdir(this.dir))
+      .filter((filename) => parseFilename(filename)?.type === type)
+      .filter((filename) => addressKey(type, filename) === key);
+    // 显式文件名就是目标: 已存在写它, 不存在按原名新建 — 云端恢复旧双前缀分片靠这条。
+    // 不重定向到同 key 的别名, 否则 create 会撞 already-exists, 恢复永久失败 (#10274 review)
+    if (explicit) return supplied;
+    if (matches.length > 1) {
+      throw new MemoryError(
+        'ambiguous-address',
+        `多个分片都指向 "${key}": ${matches.join(', ')}; ` +
+          '请传完整文件名（含 .md），或先重命名其中一个',
+      );
+    }
+    if (matches.length === 1) return matches[0];
+    return buildFilename(type, name);
+  }
+
+  /** Edit a known file in place, including legacy names rejected for new shards. */
+  async update(
+    filename: string,
+    expectedUpdatedAt: string,
+    changes: Pick<WriteOptions, 'title' | 'description' | 'body'>,
+  ): Promise<MemoryRecord> {
+    return this.mutate(async () => {
+      const current = await this.checkVersion(filename, expectedUpdatedAt);
+      await this.writeFile({
+        ...changes, type: current.frontmatter.type, name: current.slug, mode: 'update',
+      }, filename);
+      // Return the revision this edit wrote, never a subsequent tool write.
+      return this.read(filename);
+    });
+  }
+
+  private async mutate<T>(run: () => Promise<T>): Promise<T> {
+    const key = path.resolve(this.dir);
+    const previous = mutationQueues.get(key) ?? Promise.resolve();
+    const next = previous.catch(() => {}).then(run);
+    mutationQueues.set(key, next);
+    try {
+      return await next;
+    } finally {
+      if (mutationQueues.get(key) === next) mutationQueues.delete(key);
+    }
+  }
+
+  private async checkVersion(filename: string, expected: string): Promise<MemoryRecord> {
+    const current = await this.read(filename);
+    if (current.frontmatter.updatedAt !== expected) {
+      throw new MemoryError('version-conflict', 'Memory changed since it was opened');
+    }
+    return current;
+  }
+
+  private async writeFile(opts: WriteOptions, filename: string): Promise<WriteResult> {
+    this.validateOpts(opts);
+    const fullPath = path.join(this.dir, filename);
+
+    let nextBody = opts.body;
+    let preserveBody = opts.preserveBody === true;
+    let nextFrontmatter: MemoryFrontmatter;
+    const mode = opts.mode ?? 'create';
+
+    const existing = await this.tryReadRaw(fullPath);
+    if (mode === 'create') {
+      if (existing) {
+        throw new MemoryError(
+          'already-exists',
+          `${filename} 已存在; 用 mode:'update' 覆盖或 mode:'append' 追加`,
+        );
+      }
+      nextFrontmatter = {
+        title: opts.title,
+        description: opts.description,
+        type: opts.type,
+        updatedAt: new Date().toISOString(),
+      };
+    } else {
+      if (!existing) {
+        throw new MemoryError('not-found', `${filename} 不存在; 用 mode:'create' 新建`);
+      }
+      const parsed = parseRawShard(existing, filename);
+      // Editing an imported shard must not silently downgrade its exact-body
+      // format; import retries still need to detect whitespace-only edits.
+      preserveBody ||= parsed.frontmatter.bodyLength !== undefined;
+      if (mode === 'append') {
+        nextBody = `${parsed.body.trimEnd()}\n\n${opts.body}`;
+      }
+      nextFrontmatter = {
+        title: opts.title || parsed.frontmatter.title,
+        description: opts.description || parsed.frontmatter.description,
+        type: opts.type,
+        // A second write in the same millisecond must still invalidate old editors.
+        updatedAt: new Date(Math.max(Date.now(), (Date.parse(parsed.frontmatter.updatedAt) || 0) + 1)).toISOString(),
+      };
+    }
+
+    // size 硬上限校验 (写之前)
+    if (Buffer.byteLength(nextBody, 'utf8') > this.config.hardShardBytes) {
+      throw new MemoryError(
+        'shard-too-large',
+        `body ${Buffer.byteLength(nextBody, 'utf8')} bytes > 硬上限 ${this.config.hardShardBytes}`,
+      );
+    }
+
+    if (preserveBody) nextFrontmatter.bodyLength = nextBody.length;
+    const fileText = matter.stringify({ content: nextBody }, nextFrontmatter);
+    // tryReadRaw 的 await 窗口后、真正写盘前复核 owner scope (review #2388
+    // Codex 8th P1): 边界不得把 shard 写入旧 owner 根。
+    this.beforeFileWrite?.();
+    await writeFileNoFollow(fullPath, fileText, this.beforeFileWrite);
+    // shard write 后、索引重建前复核 (review #2388 Codex 12th P1): writeFile
+    // await 期间边界可能发生, 不得继续在旧 owner 下 rebuildIndex / 返回成功。
+    // not-ready 时文件已落盘但 MEMORY.md 未更新 → 标记派生索引 dirty (Codex 23rd)。
+    this.guardAfterMutation();
+    await this.rebuildIndexLocked();
+    // rebuildIndex 自身多次 await 后、返回前复核 (review #2388 Codex 13th P1)。
+    this.beforeFileWrite?.();
+
+    const result: WriteResult = { ok: true, filename };
+    const detail = this.computeWarning(nextBody);
+    if (detail) {
+      result.warning = detail.kind;
+      result.warningDetail = detail;
+    }
+    return result;
+  }
+
+  async delete(filename: string, expectedUpdatedAt?: string): Promise<void> {
+    return this.mutate(async () => {
+      if (expectedUpdatedAt !== undefined) await this.checkVersion(filename, expectedUpdatedAt);
+      await this.deleteFile(filename);
+    });
+  }
+
+  private async deleteFile(filename: string): Promise<void> {
+    this.assertSafeFilename(filename);
+    const fullPath = path.join(this.dir, filename);
+    // 删除前复核 (review #2388 Codex 14th P1): 单次预检只保护 delete 开始瞬间,
+    // 边界在 fs.unlink / rebuildIndex 之间发生仍会删旧 owner 文件并重建索引。
+    this.beforeFileWrite?.();
+    try {
+      await fs.unlink(fullPath);
+    } catch (e) {
+      if (isENOENT(e)) throw new MemoryError('not-found', `${filename} 不存在`);
+      throw new MemoryError('io-error', `unlink failed: ${(e as Error).message}`);
+    }
+    // unlink 后复核 — await 窗口后边界可能发生, 不得继续在旧 owner 下重建索引。
+    // not-ready 时文件已删但 MEMORY.md 仍列出 → 标记派生索引 dirty (Codex 23rd)。
+    this.guardAfterMutation();
+    await this.rebuildIndexLocked();
+    // rebuildIndex 内部多次 await 后、返回前复核。
+    this.beforeFileWrite?.();
+  }
+
+  /**
+   * 变更后复核辅助 (review #2388 Codex 23rd P1/P2): shard 已落盘但其后
+   * rebuildIndex 被 owner 边界中止 → 文件与 MEMORY.md 不一致, 标记派生索引
+   * dirty; 下次安全打开 (init) 时 repairIndexIfDirty 惰性重建, 防止同 owner
+   * 后续 session 把 stale 索引读进 system prompt。
+   */
+  private guardAfterMutation(): void {
+    try {
+      this.beforeFileWrite?.();
+    } catch (e) {
+      if (e instanceof MemoryError && e.code === 'not-ready') {
+        this.derivedIndexDirty = true;
+        this.indexCache = null;
+      }
+      throw e;
+    }
+  }
+
+  private markIndexDirty(): void {
+    this.derivedIndexDirty = true;
+    this.indexCache = null;
+  }
+
+  /** 派生索引 (MEMORY.md) 是否因中止的写/删而失效 */
+  isIndexDirty(): boolean {
+    return this.derivedIndexDirty;
+  }
+
+  /** 惰性修复: 上次变更被边界中止 → 重建 MEMORY.md 恢复一致 (幂等) */
+  async repairIndexIfDirty(): Promise<void> {
+    if (!this.derivedIndexDirty) return;
+    await this.rebuildIndex();
+    this.derivedIndexDirty = false;
+  }
+
+  /** 当前 MEMORY.md 内容 (索引文本, 给 system prompt 拼). 不存在返空串 */
+  async getIndex(): Promise<string> {
+    if (this.indexCache !== null) return this.indexCache;
+    try {
+      this.indexCache = await fs.readFile(path.join(this.dir, INDEX_FILENAME), 'utf8');
+      return this.indexCache;
+    } catch (e) {
+      if (isENOENT(e)) {
+        this.indexCache = '';
+        return '';
+      }
+      throw new MemoryError('io-error', `read index failed: ${(e as Error).message}`);
+    }
+  }
+
+  /**
+   * 重建 MEMORY.md (从所有分片 frontmatter 派生). 调用方一般不直接用 — write/delete 自动触发。
+   * 索引格式:
+   *   # Memory Index
+   *
+   *   ## user
+   *   - [user_xxx.md] 用户偏好 — 一行 hook description
+   *   ...
+   *
+   *   ## feedback
+   *   ...
+   *
+   * 在同目录互斥队列内执行 (store 打开时的重建可能与另一个 store 的打开或写入并发);
+   * 已持有队列的写/删内部改用 rebuildIndexLocked。
+   */
+  async rebuildIndex(): Promise<void> {
+    return this.mutate(() => this.rebuildIndexLocked());
+  }
+
+  private async rebuildIndexLocked(): Promise<void> {
+    try {
+      await this.rebuildIndexInner();
+    } catch (e) {
+      // 重建被 owner 边界中止 → 索引未更新, 标记 dirty (review #2388 Codex 23rd)
+      if (e instanceof MemoryError && e.code === 'not-ready') {
+        this.markIndexDirty();
+      }
+      throw e;
+    }
+  }
+
+  private async rebuildIndexInner(): Promise<void> {
+    const records = await this.list();
+    const grouped = new Map<MemoryType, MemoryRecord[]>();
+    for (const rec of records) {
+      const arr = grouped.get(rec.frontmatter.type) ?? [];
+      arr.push(rec);
+      grouped.set(rec.frontmatter.type, arr);
+    }
+    const lines: string[] = ['# Memory Index', ''];
+    if (records.length === 0) {
+      lines.push('_(empty — no memories saved yet for this workdir)_', '');
+    } else {
+      // 固定顺序 user → feedback → project → reference。**只列 curated 类型** ——
+      // `digest`(系统内部,如 pi 压缩摘要)故意排除:进 FTS 可 memory_search,但不进
+      // MEMORY.md、不进 system prompt(见 types.ts MEMORY_TYPES 注释)。新增 curated
+      // 类型时改 CURATED_MEMORY_TYPES;不要把 digest 加进来。
+      for (const type of CURATED_MEMORY_TYPES) {
+        const items = grouped.get(type);
+        if (!items || items.length === 0) continue;
+        lines.push(`## ${type}`);
+        for (const r of items) {
+          lines.push(`- [${r.filename}] ${r.frontmatter.title} — ${r.frontmatter.description}`);
+        }
+        lines.push('');
+      }
+    }
+    const content = lines.join('\n');
+    // 索引写盘前复核 (review #2388 Codex 13th P1): rebuildIndex 自身有多次
+    // awaited shard reads, 边界不得在旧 owner 下重写 MEMORY.md。
+    this.beforeFileWrite?.();
+    await writeFileNoFollow(path.join(this.dir, INDEX_FILENAME), content, this.beforeFileWrite);
+    this.indexCache = content;
+  }
+
+  /** 当前索引字节数 (UI / warning 用) */
+  async getIndexSize(): Promise<number> {
+    const content = await this.getIndex();
+    return Buffer.byteLength(content, 'utf8');
+  }
+
+  // ── 内部 helper ────────────────────────────────────────────────────────────
+
+  private validateOpts(opts: WriteOptions): void {
+    if (!isMemoryType(opts.type)) {
+      throw new MemoryError('invalid-type', `type 必须是 user/feedback/project/reference, 收到 "${opts.type}"`);
+    }
+    // name 可以是索引里的完整文件名, 长度与字符集按逻辑 slug 校验
+    validateSlug(addressKey(opts.type, opts.name), this.config.maxSlugLen);
+    if (!opts.title || opts.title.length === 0) {
+      throw new MemoryError('invalid-frontmatter', 'title 必填');
+    }
+    if (opts.title.length > this.config.maxTitleLen) {
+      throw new MemoryError('title-too-long', `title 长度 > ${this.config.maxTitleLen}`);
+    }
+    if (!opts.description || opts.description.length === 0) {
+      throw new MemoryError('invalid-frontmatter', 'description 必填');
+    }
+    if (opts.description.length > this.config.maxDescriptionLen) {
+      throw new MemoryError(
+        'description-too-long',
+        `description 长度 > ${this.config.maxDescriptionLen}`,
+      );
+    }
+    if (/\r|\n/.test(opts.description)) {
+      throw new MemoryError('description-has-newline', 'description 必须是一行 (无换行)');
+    }
+    if (!opts.body || opts.body.length === 0) {
+      throw new MemoryError('invalid-frontmatter', 'body 必填');
+    }
+  }
+
+  private assertSafeFilename(filename: string): void {
+    if (filename.includes('..') || filename.includes('/') || filename.includes('\\')) {
+      throw new MemoryError('path-traversal', `非法文件名: "${filename}"`);
+    }
+    const parsed = parseFilename(filename);
+    if (!parsed) {
+      throw new MemoryError('invalid-filename', `不符合 <type>_<slug>.md 格式: "${filename}"`);
+    }
+  }
+
+  private async readRecord(filename: string): Promise<MemoryRecord | null> {
+    const parsed = parseFilename(filename);
+    if (!parsed) return null;
+    const fullPath = path.join(this.dir, filename);
+    const raw = await this.tryReadRaw(fullPath);
+    if (!raw) return null;
+    const shard = parseRawShard(raw, filename);
+    if (!shard) return null;
+    return {
+      filename,
+      slug: parsed.slug,
+      frontmatter: shard.frontmatter,
+      body: shard.body,
+      sizeBytes: Buffer.byteLength(raw, 'utf8'),
+    };
+  }
+
+  private async tryReadRaw(fullPath: string): Promise<string | null> {
+    try {
+      // A link is not a memory: reading through it would bring in a file from elsewhere.
+      if ((await fs.lstat(fullPath)).isSymbolicLink()) return null;
+      return await fs.readFile(fullPath, 'utf8');
+    } catch (e) {
+      if (isENOENT(e)) return null;
+      throw new MemoryError('io-error', `read failed: ${(e as Error).message}`);
+    }
+  }
+
+  /**
+   * 重算某分片的软警告 (含索引侧)。分片侧读盘; 索引侧走 indexCache —
+   * 本实例的 write/delete 都会刷新缓存, 因此反映的是**本实例视角**的最新状态;
+   * 若 MEMORY.md 被其他实例/进程改写, 索引侧评估可能滞后。
+   * consolidate 删源后索引已变小, 写入时点的警告可能失真 — 收尾用本方法重算。
+   */
+  async assessWarning(filename: string): Promise<WriteWarningDetail | undefined> {
+    const rec = await this.read(filename);
+    await this.getIndex(); // 确保 indexCache 就绪 (新实例上也能评估索引侧)
+    return this.computeWarning(rec.body);
+  }
+
+  private computeWarning(body: string): WriteWarningDetail | undefined {
+    const bodyBytes = Buffer.byteLength(body, 'utf8');
+    if (bodyBytes > this.config.maxShardBytes) {
+      return {
+        kind: 'shard-size-exceeded',
+        sizeBytes: bodyBytes,
+        softLimitBytes: this.config.maxShardBytes,
+        hardLimitBytes: this.config.hardShardBytes,
+      };
+    }
+    // 索引刚被 rebuildIndex 写过, 直接读 cache
+    const indexBytes =
+      this.indexCache !== null ? Buffer.byteLength(this.indexCache, 'utf8') : 0;
+    if (indexBytes > this.config.maxIndexBytes) {
+      return {
+        kind: 'index-size-exceeded',
+        sizeBytes: indexBytes,
+        softLimitBytes: this.config.maxIndexBytes,
+      };
+    }
+    return undefined;
+  }
+}
+
+// ── 模块级工具 ─────────────────────────────────────────────────────────────
+
+interface ParsedShard {
+  frontmatter: MemoryFrontmatter;
+  body: string;
+}
+
+function parseRawShard(raw: string, filenameForErr: string): ParsedShard {
+  const parsed = matter(raw);
+  const data = parsed.data as Partial<MemoryFrontmatter>;
+  if (!data.title || !data.description || !isMemoryType(data.type)) {
+    throw new MemoryError(
+      'invalid-frontmatter',
+      `${filenameForErr} frontmatter 缺字段或 type 非法`,
+    );
+  }
+  return {
+    frontmatter: {
+      title: data.title,
+      description: data.description,
+      type: data.type,
+      updatedAt: typeof data.updatedAt === 'string' ? data.updatedAt : new Date().toISOString(),
+      ...(Number.isSafeInteger(data.bodyLength) && data.bodyLength! >= 0 ? { bodyLength: data.bodyLength } : {}),
+    },
+    // gray-matter appends one newline. Remove only that exact serialization
+    // suffix; an external edit must never be truncated to a stale length.
+    body: Number.isSafeInteger(data.bodyLength) && data.bodyLength! >= 0
+      ? (parsed.content.length === data.bodyLength! + 1 && parsed.content.endsWith('\n')
+        ? parsed.content.slice(0, -1) : parsed.content)
+      : parsed.content.trim(),
+  };
+}
+
+function isENOENT(e: unknown): boolean {
+  return typeof e === 'object' && e !== null && (e as { code?: string }).code === 'ENOENT';
+}

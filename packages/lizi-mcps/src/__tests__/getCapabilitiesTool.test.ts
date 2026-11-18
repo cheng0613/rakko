@@ -1,0 +1,230 @@
+import { describe, expect, it, vi } from 'vitest';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { RICH_ANSWER_GUIDE } from '@cindy/maker-shared/rich-answer-guide';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+
+import { createXdtHelperMcpServer } from '../lizi_xdtHelperMcpServer.js';
+import { CAPABILITIES, findCapability, listCapabilityIndex } from '../xdt-helper/capabilities.js';
+import type { LiziMcpLogger } from '../types.js';
+
+/**
+ * get_capabilities 的行为契约测试。
+ *
+ * 此前只有 toolErrorTelemetry.test.ts 覆盖了它的 schema / 遥测,没有任何测试校验
+ * 「能力索引与按 key 查询」这条真正被模型走的路径 —— 新增或改名 capability 时,
+ * 索引缺项、detail 为空、UNKNOWN_KEY 的 available 列表过期都不会被发现。
+ */
+
+const sessionCtx = {
+  agentKind: 'claude-code' as const,
+  workingDir: '/tmp',
+  sessionId: 'sess-capabilities',
+};
+
+function makeLogger(): LiziMcpLogger {
+  return { trace: vi.fn(), debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+}
+
+async function connect(server: McpServer) {
+  const [clientTx, serverTx] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: 'capabilities-test-client', version: '0.0.0' });
+  await Promise.all([server.connect(serverTx), client.connect(clientTx)]);
+  return {
+    client,
+    cleanup: async () => {
+      await client.close();
+      await server.close();
+    },
+  };
+}
+
+/** call_tool 的返回体是 JSON 文本块,取出来解析。 */
+function parsePayload(result: unknown): Record<string, unknown> {
+  const content = (result as { content?: Array<{ type: string; text?: string }> }).content;
+  const first = content?.[0];
+  if (!first || first.type !== 'text' || !first.text) {
+    throw new Error('tool result has no text content');
+  }
+  return JSON.parse(first.text) as Record<string, unknown>;
+}
+
+describe('capabilities data source', () => {
+  it('每条 capability 的 key / title / oneLiner / detail 都非空', () => {
+    expect(CAPABILITIES.length).toBeGreaterThan(0);
+    for (const entry of CAPABILITIES) {
+      expect(entry.key.trim()).not.toBe('');
+      expect(entry.title.trim()).not.toBe('');
+      expect(entry.oneLiner.trim()).not.toBe('');
+      expect(entry.detail.trim()).not.toBe('');
+    }
+  });
+
+  it('key 不重复', () => {
+    const keys = CAPABILITIES.map((c) => c.key);
+    expect(new Set(keys).size).toBe(keys.length);
+  });
+
+  it('listCapabilityIndex 只暴露索引字段,不带 detail', () => {
+    for (const item of listCapabilityIndex()) {
+      expect(Object.keys(item).sort()).toEqual(['key', 'oneLiner', 'title']);
+    }
+  });
+
+  it('about-cindy 覆盖产品身份与源码仓库', () => {
+    const entry = findCapability('about-cindy');
+    expect(entry).toBeDefined();
+    expect(entry!.detail).toContain('https://github.com/makecindy/cindy');
+    // 执行位置不能被写死成客户端:SSH 远程工作区下 agent 进程在远端主机。
+    expect(entry!.detail).toContain('SSH 远程工作区');
+    // 官网是区域敏感的:两个都要给,只给国际版会把大陆用户导错。
+    expect(entry!.detail).toContain('https://cindy.cn');
+    expect(entry!.detail).toContain('https://cindy.app');
+  });
+
+  // 2026-10-31 沙箱实测:Computer Use 关着时 cindy_computer 整个不注册,模型只会说"没有工具";
+  // 这条让它知道能力存在、去哪开、开完怎么接上,并且不许用 shell 模拟按键代替。
+  it('computer-use 说明未开启时的判断方法、设置入口深链与开启后的接续', () => {
+    const entry = findCapability('computer-use');
+    expect(entry).toBeDefined();
+    expect(entry!.detail).toContain('get_settings_link');
+    expect(entry!.detail).toContain('mcp__cindy_computer__');
+    expect(entry!.detail).toContain('osascript');
+    expect(entry!.detail).toContain('新建任务');
+  });
+
+  it('issue-tracker 不套固定问卷,并说明自动附加环境含 Harness / 模型 ID', () => {
+    const entry = findCapability('issue-tracker');
+    expect(entry).toBeDefined();
+    expect(entry!.detail).toContain('不套固定问卷');
+    expect(entry!.detail).toContain('Harness / 模型 ID');
+    expect(entry!.detail).toContain('提交时的任务环境');
+    expect(entry!.detail).toContain('不要声称截图已附');
+    expect(entry!.detail).toContain('不写源码级方案');
+    expect(entry!.detail).toContain('不一定是出问题的那个');
+    expect(entry!.detail).toContain('实际故障环境按需写进正文');
+  });
+
+  it('session-handoff 写明 send_to_session 发给已有任务时 target_session_id 必传, 省略即静默新建 (#4884)', () => {
+    const entry = findCapability('session-handoff');
+    expect(entry).toBeDefined();
+    expect(entry!.detail).toContain('target_session_id 必传');
+    expect(entry!.detail).toContain('list_sessions');
+    expect(entry!.detail).toContain('wake_kind=created');
+    // jump 撞忙已改为入队,旧的「本工具不排队」说法会误导 skill 自己 retry/backoff。
+    expect(entry!.detail).not.toContain('本工具不排队');
+    expect(entry!.detail).toContain('wake_kind=queued');
+  });
+
+  it('collab-mode 明确 Pi 可作本地 Lead 和 Worker，且不扩大到 SSH 远程 Pi', () => {
+    const entry = findCapability('collab-mode');
+
+    expect(entry).toBeDefined();
+    expect(entry!.detail).toContain('Claude Code / Codex / Pi 本地项目或对话 session');
+    expect(entry!.detail).toContain('也都可以作为 Worker');
+    expect(entry!.detail).toContain('SSH 远程 Lead 与 Worker 当前只支持 Claude Code / Codex');
+  });
+});
+
+describe('get_capabilities tool', () => {
+  // Pi uses this route for advanced syntax beyond its resident basic protocol.
+  // Verify the real public envelope returns the complete protocol.
+  it('serves the complete rich answer protocol through call_tool for Pi', async () => {
+    const h = await connect(createXdtHelperMcpServer({ logger: makeLogger() }, { ...sessionCtx, agentKind: 'pi' }));
+    try {
+      const payload = parsePayload(await h.client.callTool({ name: 'call_tool', arguments: {
+        name: 'get_capabilities', args: { key: 'rich-answers' },
+      } }));
+      expect(payload).toMatchObject({ ok: true, capability: { key: 'rich-answers', detail: RICH_ANSWER_GUIDE } });
+    } finally { await h.cleanup(); }
+  });
+  // Unit protocol regression: the public MCP schema must forward the page/filter
+  // rather than silently stripping them and returning the same oversized page.
+  it('forwards runtime tool search and pagination through the actual MCP entry', async () => {
+    const read = vi.fn(async (_ctx: unknown, query: unknown) => ({ ok: true, query, tools: [{ name: 'matching_tool' }] }));
+    const h = await connect(createXdtHelperMcpServer({ logger: makeLogger(), runtimeCapabilities: read }, sessionCtx));
+    try {
+      const result = parsePayload(await h.client.callTool({ name: 'call_tool', arguments: {
+        name: 'get_capabilities', args: { scope: 'runtime', server: 'codex_apps', toolQuery: 'github', offset: 50 },
+      } }));
+      expect(result).toMatchObject({ ok: true, query: { server: 'codex_apps', toolQuery: 'github', offset: 50 }, tools: [{ name: 'matching_tool' }] });
+    } finally { await h.cleanup(); }
+  });
+
+  // 帮助文档原先只接给设置页帮助助手,Agent 被问「归档的任务在哪」时只能编造入口。
+  it('scope=help 先返回目录再按 key 返回整篇;宿主未注入时明确不可用', async () => {
+    const productHelpDocs = [{ id: 'sidebar', title: 'Sidebar', summary: 'Find sessions.', content: 'Status — active / archived / all.' }];
+    const call = async (server: McpServer, args: Record<string, unknown>) => {
+      const h = await connect(server);
+      try {
+        return parsePayload(await h.client.callTool({ name: 'call_tool', arguments: { name: 'get_capabilities', args } }));
+      } finally { await h.cleanup(); }
+    };
+    const make = () => createXdtHelperMcpServer({ logger: makeLogger(), productHelpDocs }, sessionCtx);
+
+    expect(await call(make(), { scope: 'help' })).toMatchObject({ ok: true, docs: [{ key: 'sidebar', title: 'Sidebar', summary: 'Find sessions.' }] });
+    expect(await call(make(), { scope: 'help', key: 'sidebar' })).toMatchObject({ ok: true, doc: { key: 'sidebar', content: 'Status — active / archived / all.' } });
+    expect(await call(make(), { scope: 'help', key: 'nope' })).toMatchObject({ ok: false, errorCode: 'UNKNOWN_KEY', data: { available: ['sidebar'] } });
+    expect(await call(createXdtHelperMcpServer({ logger: makeLogger() }, sessionCtx), { scope: 'help' })).toMatchObject({ ok: false, errorCode: 'HELP_UNAVAILABLE' });
+  });
+
+  it('不传 key 时返回包含 about-cindy 的索引', async () => {
+    const h = await connect(createXdtHelperMcpServer({ logger: makeLogger() }, sessionCtx));
+    try {
+      const payload = parsePayload(
+        await h.client.callTool({
+          name: 'call_tool',
+          arguments: { name: 'get_capabilities', args: {} },
+        }),
+      );
+
+      expect(payload.ok).toBe(true);
+      const caps = payload.capabilities as Array<{ key: string; detail?: unknown }>;
+      expect(caps.map((c) => c.key)).toContain('about-cindy');
+      // 索引不应该带 detail —— 否则渐进式发现省 token 的意义就没了。
+      expect(caps.every((c) => c.detail === undefined)).toBe(true);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it('传 key=about-cindy 时返回 ok 与非空 detail', async () => {
+    const h = await connect(createXdtHelperMcpServer({ logger: makeLogger() }, sessionCtx));
+    try {
+      const payload = parsePayload(
+        await h.client.callTool({
+          name: 'call_tool',
+          arguments: { name: 'get_capabilities', args: { key: 'about-cindy' } },
+        }),
+      );
+
+      expect(payload.ok).toBe(true);
+      const capability = payload.capability as { key: string; detail: string };
+      expect(capability.key).toBe('about-cindy');
+      expect(capability.detail.trim().length).toBeGreaterThan(0);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it('未知 key 返回 UNKNOWN_KEY,且 available 列表与当前清单同步', async () => {
+    const h = await connect(createXdtHelperMcpServer({ logger: makeLogger() }, sessionCtx));
+    try {
+      const payload = parsePayload(
+        await h.client.callTool({
+          name: 'call_tool',
+          arguments: { name: 'get_capabilities', args: { key: 'no-such-capability' } },
+        }),
+      );
+
+      expect(payload.ok).toBe(false);
+      expect(payload.errorCode).toBe('UNKNOWN_KEY');
+      const data = payload.data as { requested: string; available: string[] };
+      expect(data.requested).toBe('no-such-capability');
+      expect(data.available).toContain('about-cindy');
+      expect(data.available).toEqual(CAPABILITIES.map((c) => c.key));
+    } finally {
+      await h.cleanup();
+    }
+  });
+});

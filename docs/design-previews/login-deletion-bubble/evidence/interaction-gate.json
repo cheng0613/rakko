@@ -1,0 +1,1210 @@
+{
+ "gate": "interaction",
+ "pass": true,
+ "total": 240,
+ "passed": 240,
+ "failures": 0,
+ "generatedAt": "2026-10-31T04:30:44.405Z",
+ "results": [
+  {
+   "id": "overlay:desk",
+   "pass": true,
+   "detail": "elementFromPoint(气泡中心)命中气泡"
+  },
+  {
+   "id": "dismiss:desk",
+   "pass": true,
+   "detail": "点击「我知道了」气泡消失"
+  },
+  {
+   "id": "no-push:desk",
+   "pass": true,
+   "detail": "气泡消失后面板示意 rect 逐 px 不变(不占布局流)"
+  },
+  {
+   "id": "overlay:phone",
+   "pass": true,
+   "detail": "elementFromPoint(气泡中心)命中气泡"
+  },
+  {
+   "id": "dismiss:phone",
+   "pass": true,
+   "detail": "点击「我知道了」气泡消失"
+  },
+  {
+   "id": "no-push:phone",
+   "pass": true,
+   "detail": "气泡消失后面板示意 rect 逐 px 不变(不占布局流)"
+  },
+  {
+   "id": "overlay:pad-landscape",
+   "pass": true,
+   "detail": "elementFromPoint(气泡中心)命中气泡"
+  },
+  {
+   "id": "dismiss:pad-landscape",
+   "pass": true,
+   "detail": "点击「我知道了」气泡消失"
+  },
+  {
+   "id": "no-push:pad-landscape",
+   "pass": true,
+   "detail": "气泡消失后面板示意 rect 逐 px 不变(不占布局流)"
+  },
+  {
+   "id": "overlay:pad-portrait",
+   "pass": true,
+   "detail": "elementFromPoint(气泡中心)命中气泡"
+  },
+  {
+   "id": "dismiss:pad-portrait",
+   "pass": true,
+   "detail": "点击「我知道了」气泡消失"
+  },
+  {
+   "id": "no-push:pad-portrait",
+   "pass": true,
+   "detail": "气泡消失后面板示意 rect 逐 px 不变(不占布局流)"
+  },
+  {
+   "id": "gap-link:desk:completed",
+   "pass": true,
+   "detail": "正文↔我知道了=11.0(期望 11.0 = 22×0.5000)"
+  },
+  {
+   "id": "gap-bottom:desk:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.0(期望 10.0 = padding 20×0.5000,含 1px 描边容差)"
+  },
+  {
+   "id": "copy-center:desk:completed",
+   "pass": true,
+   "detail": "text-align=center"
+  },
+  {
+   "id": "hit-area:desk:completed",
+   "pass": true,
+   "detail": "命中区 60×23(期望高 22.5 = (23+2×11)×0.5000)"
+  },
+  {
+   "id": "gap-link:desk:stress",
+   "pass": true,
+   "detail": "正文↔我知道了=11.0(期望 11.0 = 22×0.5000)"
+  },
+  {
+   "id": "gap-bottom:desk:stress",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.0(期望 10.0 = padding 20×0.5000,含 1px 描边容差)"
+  },
+  {
+   "id": "copy-center:desk:stress",
+   "pass": true,
+   "detail": "text-align=center"
+  },
+  {
+   "id": "hit-area:desk:stress",
+   "pass": true,
+   "detail": "命中区 60×23(期望高 22.5 = (23+2×11)×0.5000)"
+  },
+  {
+   "id": "stress-grows:desk",
+   "pass": true,
+   "detail": "压力态撑高 94 > completed 71 + 17.3"
+  },
+  {
+   "id": "gap-link:phone:completed",
+   "pass": true,
+   "detail": "正文↔我知道了=11.4(期望 11.4 = 22×0.5200)"
+  },
+  {
+   "id": "gap-bottom:phone:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.4(期望 10.4 = padding 20×0.5200,含 1px 描边容差)"
+  },
+  {
+   "id": "copy-center:phone:completed",
+   "pass": true,
+   "detail": "text-align=center"
+  },
+  {
+   "id": "hit-area:phone:completed",
+   "pass": true,
+   "detail": "命中区 82×33.8(期望高 33.8,边界内取最大;整个登录 stage 同缩放)"
+  },
+  {
+   "id": "gap-link:phone:stress",
+   "pass": true,
+   "detail": "正文↔我知道了=11.4(期望 11.4 = 22×0.5200)"
+  },
+  {
+   "id": "gap-bottom:phone:stress",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.4(期望 10.4 = padding 20×0.5200,含 1px 描边容差)"
+  },
+  {
+   "id": "copy-center:phone:stress",
+   "pass": true,
+   "detail": "text-align=center"
+  },
+  {
+   "id": "hit-area:phone:stress",
+   "pass": true,
+   "detail": "命中区 82×33.8(期望高 33.8,边界内取最大;整个登录 stage 同缩放)"
+  },
+  {
+   "id": "stress-grows:phone",
+   "pass": true,
+   "detail": "压力态撑高 97 > completed 73 + 17.9"
+  },
+  {
+   "id": "locale-layout:desk:light:zh-CN:pending",
+   "pass": true,
+   "detail": "title=\"账号正在等待注销\" copy=36字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:light:zh-CN:processing",
+   "pass": true,
+   "detail": "title=\"账号正在注销\" copy=22字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:light:zh-CN:completed",
+   "pass": true,
+   "detail": "title=\"账号已注销\" copy=14字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:desk:light:zh-CN:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.0(期望 10.0)"
+  },
+  {
+   "id": "locale-layout:desk:light:zh-TW:pending",
+   "pass": true,
+   "detail": "title=\"帳號正在等待刪除\" copy=38字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:light:zh-TW:processing",
+   "pass": true,
+   "detail": "title=\"帳號正在刪除\" copy=22字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:light:zh-TW:completed",
+   "pass": true,
+   "detail": "title=\"帳號已刪除\" copy=14字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:desk:light:zh-TW:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.0(期望 10.0)"
+  },
+  {
+   "id": "locale-layout:desk:light:en:pending",
+   "pass": true,
+   "detail": "title=\"Account scheduled for deletion\" copy=89字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:light:en:processing",
+   "pass": true,
+   "detail": "title=\"Account deletion in progress\" copy=70字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:light:en:completed",
+   "pass": true,
+   "detail": "title=\"Account deleted\" copy=44字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:desk:light:en:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.0(期望 10.0)"
+  },
+  {
+   "id": "locale-layout:desk:light:ja:pending",
+   "pass": true,
+   "detail": "title=\"アカウントは削除待ちです\" copy=48字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:light:ja:processing",
+   "pass": true,
+   "detail": "title=\"アカウントを削除しています\" copy=34字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:light:ja:completed",
+   "pass": true,
+   "detail": "title=\"アカウントを削除しました\" copy=24字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:desk:light:ja:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.0(期望 10.0)"
+  },
+  {
+   "id": "locale-layout:desk:light:ko:pending",
+   "pass": true,
+   "detail": "title=\"계정 삭제 대기 중\" copy=54字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:light:ko:processing",
+   "pass": true,
+   "detail": "title=\"계정 삭제 진행 중\" copy=34字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:light:ko:completed",
+   "pass": true,
+   "detail": "title=\"계정 삭제 완료\" copy=22字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:desk:light:ko:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.0(期望 10.0)"
+  },
+  {
+   "id": "locale-layout:desk:light:es:pending",
+   "pass": true,
+   "detail": "title=\"Eliminación de cuenta programada\" copy=118字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:light:es:processing",
+   "pass": true,
+   "detail": "title=\"Eliminación de cuenta en curso\" copy=88字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:light:es:completed",
+   "pass": true,
+   "detail": "title=\"Cuenta eliminada\" copy=50字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:desk:light:es:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.0(期望 10.0)"
+  },
+  {
+   "id": "locale-layout:desk:light:fr:pending",
+   "pass": true,
+   "detail": "title=\"Suppression du compte programmée\" copy=98字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:light:fr:processing",
+   "pass": true,
+   "detail": "title=\"Suppression du compte en cours\" copy=95字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:light:fr:completed",
+   "pass": true,
+   "detail": "title=\"Compte supprimé\" copy=47字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:desk:light:fr:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.0(期望 10.0)"
+  },
+  {
+   "id": "locale-layout:desk:light:de:pending",
+   "pass": true,
+   "detail": "title=\"Kontolöschung vorgemerkt\" copy=103字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:light:de:processing",
+   "pass": true,
+   "detail": "title=\"Kontolöschung läuft\" copy=68字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:light:de:completed",
+   "pass": true,
+   "detail": "title=\"Konto gelöscht\" copy=39字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:desk:light:de:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.0(期望 10.0)"
+  },
+  {
+   "id": "locale-layout:desk:light:pt-PT:pending",
+   "pass": true,
+   "detail": "title=\"Eliminação da conta agendada\" copy=108字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:light:pt-PT:processing",
+   "pass": true,
+   "detail": "title=\"Eliminação da conta em curso\" copy=80字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:light:pt-PT:completed",
+   "pass": true,
+   "detail": "title=\"Conta eliminada\" copy=43字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:desk:light:pt-PT:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.0(期望 10.0)"
+  },
+  {
+   "id": "locale-layout:desk:light:pt-BR:pending",
+   "pass": true,
+   "detail": "title=\"Exclusão da conta agendada\" copy=96字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:light:pt-BR:processing",
+   "pass": true,
+   "detail": "title=\"Exclusão da conta em andamento\" copy=78字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:light:pt-BR:completed",
+   "pass": true,
+   "detail": "title=\"Conta excluída\" copy=41字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:desk:light:pt-BR:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.0(期望 10.0)"
+  },
+  {
+   "id": "locale-layout:desk:light:zh-Hant-x-lzh:pending",
+   "pass": true,
+   "detail": "title=\"名籍待刪\" copy=35字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:light:zh-Hant-x-lzh:processing",
+   "pass": true,
+   "detail": "title=\"名籍方刪\" copy=21字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:light:zh-Hant-x-lzh:completed",
+   "pass": true,
+   "detail": "title=\"名籍已刪\" copy=14字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:desk:light:zh-Hant-x-lzh:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.0(期望 10.0)"
+  },
+  {
+   "id": "locale-layout:desk:light:zh-Hans-x-lzh:pending",
+   "pass": true,
+   "detail": "title=\"名籍待删\" copy=35字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:light:zh-Hans-x-lzh:processing",
+   "pass": true,
+   "detail": "title=\"名籍方删\" copy=21字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:light:zh-Hans-x-lzh:completed",
+   "pass": true,
+   "detail": "title=\"名籍已删\" copy=14字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:desk:light:zh-Hans-x-lzh:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.0(期望 10.0)"
+  },
+  {
+   "id": "locale-layout:desk:dark:zh-CN:pending",
+   "pass": true,
+   "detail": "title=\"账号正在等待注销\" copy=36字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:dark:zh-CN:processing",
+   "pass": true,
+   "detail": "title=\"账号正在注销\" copy=22字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:dark:zh-CN:completed",
+   "pass": true,
+   "detail": "title=\"账号已注销\" copy=14字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:desk:dark:zh-CN:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.0(期望 10.0)"
+  },
+  {
+   "id": "locale-layout:desk:dark:zh-TW:pending",
+   "pass": true,
+   "detail": "title=\"帳號正在等待刪除\" copy=38字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:dark:zh-TW:processing",
+   "pass": true,
+   "detail": "title=\"帳號正在刪除\" copy=22字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:dark:zh-TW:completed",
+   "pass": true,
+   "detail": "title=\"帳號已刪除\" copy=14字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:desk:dark:zh-TW:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.0(期望 10.0)"
+  },
+  {
+   "id": "locale-layout:desk:dark:en:pending",
+   "pass": true,
+   "detail": "title=\"Account scheduled for deletion\" copy=89字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:dark:en:processing",
+   "pass": true,
+   "detail": "title=\"Account deletion in progress\" copy=70字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:dark:en:completed",
+   "pass": true,
+   "detail": "title=\"Account deleted\" copy=44字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:desk:dark:en:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.0(期望 10.0)"
+  },
+  {
+   "id": "locale-layout:desk:dark:ja:pending",
+   "pass": true,
+   "detail": "title=\"アカウントは削除待ちです\" copy=48字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:dark:ja:processing",
+   "pass": true,
+   "detail": "title=\"アカウントを削除しています\" copy=34字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:dark:ja:completed",
+   "pass": true,
+   "detail": "title=\"アカウントを削除しました\" copy=24字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:desk:dark:ja:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.0(期望 10.0)"
+  },
+  {
+   "id": "locale-layout:desk:dark:ko:pending",
+   "pass": true,
+   "detail": "title=\"계정 삭제 대기 중\" copy=54字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:dark:ko:processing",
+   "pass": true,
+   "detail": "title=\"계정 삭제 진행 중\" copy=34字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:dark:ko:completed",
+   "pass": true,
+   "detail": "title=\"계정 삭제 완료\" copy=22字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:desk:dark:ko:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.0(期望 10.0)"
+  },
+  {
+   "id": "locale-layout:desk:dark:es:pending",
+   "pass": true,
+   "detail": "title=\"Eliminación de cuenta programada\" copy=118字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:dark:es:processing",
+   "pass": true,
+   "detail": "title=\"Eliminación de cuenta en curso\" copy=88字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:dark:es:completed",
+   "pass": true,
+   "detail": "title=\"Cuenta eliminada\" copy=50字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:desk:dark:es:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.0(期望 10.0)"
+  },
+  {
+   "id": "locale-layout:desk:dark:fr:pending",
+   "pass": true,
+   "detail": "title=\"Suppression du compte programmée\" copy=98字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:dark:fr:processing",
+   "pass": true,
+   "detail": "title=\"Suppression du compte en cours\" copy=95字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:dark:fr:completed",
+   "pass": true,
+   "detail": "title=\"Compte supprimé\" copy=47字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:desk:dark:fr:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.0(期望 10.0)"
+  },
+  {
+   "id": "locale-layout:desk:dark:de:pending",
+   "pass": true,
+   "detail": "title=\"Kontolöschung vorgemerkt\" copy=103字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:dark:de:processing",
+   "pass": true,
+   "detail": "title=\"Kontolöschung läuft\" copy=68字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:dark:de:completed",
+   "pass": true,
+   "detail": "title=\"Konto gelöscht\" copy=39字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:desk:dark:de:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.0(期望 10.0)"
+  },
+  {
+   "id": "locale-layout:desk:dark:pt-PT:pending",
+   "pass": true,
+   "detail": "title=\"Eliminação da conta agendada\" copy=108字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:dark:pt-PT:processing",
+   "pass": true,
+   "detail": "title=\"Eliminação da conta em curso\" copy=80字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:dark:pt-PT:completed",
+   "pass": true,
+   "detail": "title=\"Conta eliminada\" copy=43字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:desk:dark:pt-PT:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.0(期望 10.0)"
+  },
+  {
+   "id": "locale-layout:desk:dark:pt-BR:pending",
+   "pass": true,
+   "detail": "title=\"Exclusão da conta agendada\" copy=96字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:dark:pt-BR:processing",
+   "pass": true,
+   "detail": "title=\"Exclusão da conta em andamento\" copy=78字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:dark:pt-BR:completed",
+   "pass": true,
+   "detail": "title=\"Conta excluída\" copy=41字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:desk:dark:pt-BR:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.0(期望 10.0)"
+  },
+  {
+   "id": "locale-layout:desk:dark:zh-Hant-x-lzh:pending",
+   "pass": true,
+   "detail": "title=\"名籍待刪\" copy=35字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:dark:zh-Hant-x-lzh:processing",
+   "pass": true,
+   "detail": "title=\"名籍方刪\" copy=21字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:dark:zh-Hant-x-lzh:completed",
+   "pass": true,
+   "detail": "title=\"名籍已刪\" copy=14字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:desk:dark:zh-Hant-x-lzh:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.0(期望 10.0)"
+  },
+  {
+   "id": "locale-layout:desk:dark:zh-Hans-x-lzh:pending",
+   "pass": true,
+   "detail": "title=\"名籍待删\" copy=35字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:dark:zh-Hans-x-lzh:processing",
+   "pass": true,
+   "detail": "title=\"名籍方删\" copy=21字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:desk:dark:zh-Hans-x-lzh:completed",
+   "pass": true,
+   "detail": "title=\"名籍已删\" copy=14字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:desk:dark:zh-Hans-x-lzh:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.0(期望 10.0)"
+  },
+  {
+   "id": "locale-layout:phone:light:zh-CN:pending",
+   "pass": true,
+   "detail": "title=\"账号正在等待注销\" copy=33字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:light:zh-CN:processing",
+   "pass": true,
+   "detail": "title=\"账号正在注销\" copy=26字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:light:zh-CN:completed",
+   "pass": true,
+   "detail": "title=\"账号已注销\" copy=14字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:phone:light:zh-CN:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.4(期望 10.4)"
+  },
+  {
+   "id": "locale-layout:phone:light:zh-TW:pending",
+   "pass": true,
+   "detail": "title=\"帳號正在等待刪除\" copy=33字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:light:zh-TW:processing",
+   "pass": true,
+   "detail": "title=\"帳號正在刪除\" copy=26字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:light:zh-TW:completed",
+   "pass": true,
+   "detail": "title=\"帳號已刪除\" copy=14字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:phone:light:zh-TW:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.4(期望 10.4)"
+  },
+  {
+   "id": "locale-layout:phone:light:en:pending",
+   "pass": true,
+   "detail": "title=\"Account scheduled for deletion\" copy=84字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:light:en:processing",
+   "pass": true,
+   "detail": "title=\"Account deletion in progress\" copy=104字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:light:en:completed",
+   "pass": true,
+   "detail": "title=\"Account deleted\" copy=44字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:phone:light:en:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.4(期望 10.4)"
+  },
+  {
+   "id": "locale-layout:phone:light:ja:pending",
+   "pass": true,
+   "detail": "title=\"アカウントは削除待機中です\" copy=51字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:light:ja:processing",
+   "pass": true,
+   "detail": "title=\"アカウントを削除処理中です\" copy=42字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:light:ja:completed",
+   "pass": true,
+   "detail": "title=\"アカウントを削除しました\" copy=24字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:phone:light:ja:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.4(期望 10.4)"
+  },
+  {
+   "id": "locale-layout:phone:light:ko:pending",
+   "pass": true,
+   "detail": "title=\"계정이 삭제 대기 중입니다\" copy=58字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:light:ko:processing",
+   "pass": true,
+   "detail": "title=\"계정을 삭제하는 중입니다\" copy=46字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:light:ko:completed",
+   "pass": true,
+   "detail": "title=\"계정이 삭제되었습니다\" copy=22字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:phone:light:ko:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.4(期望 10.4)"
+  },
+  {
+   "id": "locale-layout:phone:light:es:pending",
+   "pass": true,
+   "detail": "title=\"Cuenta programada para eliminación\" copy=108字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:light:es:processing",
+   "pass": true,
+   "detail": "title=\"Eliminación de cuenta en curso\" copy=117字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:light:es:completed",
+   "pass": true,
+   "detail": "title=\"Cuenta eliminada\" copy=50字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:phone:light:es:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.4(期望 10.4)"
+  },
+  {
+   "id": "locale-layout:phone:light:fr:pending",
+   "pass": true,
+   "detail": "title=\"Suppression du compte programmée\" copy=108字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:light:fr:processing",
+   "pass": true,
+   "detail": "title=\"Suppression du compte en cours\" copy=115字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:light:fr:completed",
+   "pass": true,
+   "detail": "title=\"Compte supprimé\" copy=47字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:phone:light:fr:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.4(期望 10.4)"
+  },
+  {
+   "id": "locale-layout:phone:light:de:pending",
+   "pass": true,
+   "detail": "title=\"Kontolöschung vorgemerkt\" copy=103字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:light:de:processing",
+   "pass": true,
+   "detail": "title=\"Kontolöschung läuft\" copy=104字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:light:de:completed",
+   "pass": true,
+   "detail": "title=\"Konto gelöscht\" copy=39字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:phone:light:de:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.4(期望 10.4)"
+  },
+  {
+   "id": "locale-layout:phone:light:pt-PT:pending",
+   "pass": true,
+   "detail": "title=\"Eliminação da conta agendada\" copy=96字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:light:pt-PT:processing",
+   "pass": true,
+   "detail": "title=\"Eliminação da conta em curso\" copy=110字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:light:pt-PT:completed",
+   "pass": true,
+   "detail": "title=\"Conta eliminada\" copy=44字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:phone:light:pt-PT:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.4(期望 10.4)"
+  },
+  {
+   "id": "locale-layout:phone:light:pt-BR:pending",
+   "pass": true,
+   "detail": "title=\"Exclusão da conta agendada\" copy=95字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:light:pt-BR:processing",
+   "pass": true,
+   "detail": "title=\"Exclusão da conta em andamento\" copy=110字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:light:pt-BR:completed",
+   "pass": true,
+   "detail": "title=\"Conta excluída\" copy=41字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:phone:light:pt-BR:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.4(期望 10.4)"
+  },
+  {
+   "id": "locale-layout:phone:light:zh-Hant-x-lzh:pending",
+   "pass": true,
+   "detail": "title=\"名籍待刪\" copy=37字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:light:zh-Hant-x-lzh:processing",
+   "pass": true,
+   "detail": "title=\"名籍刪除中\" copy=23字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:light:zh-Hant-x-lzh:completed",
+   "pass": true,
+   "detail": "title=\"名籍已刪\" copy=13字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:phone:light:zh-Hant-x-lzh:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.4(期望 10.4)"
+  },
+  {
+   "id": "locale-layout:phone:light:zh-Hans-x-lzh:pending",
+   "pass": true,
+   "detail": "title=\"名籍待删\" copy=37字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:light:zh-Hans-x-lzh:processing",
+   "pass": true,
+   "detail": "title=\"名籍删除中\" copy=23字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:light:zh-Hans-x-lzh:completed",
+   "pass": true,
+   "detail": "title=\"名籍已删\" copy=13字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:phone:light:zh-Hans-x-lzh:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.4(期望 10.4)"
+  },
+  {
+   "id": "locale-layout:phone:dark:zh-CN:pending",
+   "pass": true,
+   "detail": "title=\"账号正在等待注销\" copy=33字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:dark:zh-CN:processing",
+   "pass": true,
+   "detail": "title=\"账号正在注销\" copy=26字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:dark:zh-CN:completed",
+   "pass": true,
+   "detail": "title=\"账号已注销\" copy=14字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:phone:dark:zh-CN:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.4(期望 10.4)"
+  },
+  {
+   "id": "locale-layout:phone:dark:zh-TW:pending",
+   "pass": true,
+   "detail": "title=\"帳號正在等待刪除\" copy=33字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:dark:zh-TW:processing",
+   "pass": true,
+   "detail": "title=\"帳號正在刪除\" copy=26字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:dark:zh-TW:completed",
+   "pass": true,
+   "detail": "title=\"帳號已刪除\" copy=14字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:phone:dark:zh-TW:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.4(期望 10.4)"
+  },
+  {
+   "id": "locale-layout:phone:dark:en:pending",
+   "pass": true,
+   "detail": "title=\"Account scheduled for deletion\" copy=84字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:dark:en:processing",
+   "pass": true,
+   "detail": "title=\"Account deletion in progress\" copy=104字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:dark:en:completed",
+   "pass": true,
+   "detail": "title=\"Account deleted\" copy=44字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:phone:dark:en:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.4(期望 10.4)"
+  },
+  {
+   "id": "locale-layout:phone:dark:ja:pending",
+   "pass": true,
+   "detail": "title=\"アカウントは削除待機中です\" copy=51字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:dark:ja:processing",
+   "pass": true,
+   "detail": "title=\"アカウントを削除処理中です\" copy=42字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:dark:ja:completed",
+   "pass": true,
+   "detail": "title=\"アカウントを削除しました\" copy=24字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:phone:dark:ja:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.4(期望 10.4)"
+  },
+  {
+   "id": "locale-layout:phone:dark:ko:pending",
+   "pass": true,
+   "detail": "title=\"계정이 삭제 대기 중입니다\" copy=58字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:dark:ko:processing",
+   "pass": true,
+   "detail": "title=\"계정을 삭제하는 중입니다\" copy=46字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:dark:ko:completed",
+   "pass": true,
+   "detail": "title=\"계정이 삭제되었습니다\" copy=22字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:phone:dark:ko:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.4(期望 10.4)"
+  },
+  {
+   "id": "locale-layout:phone:dark:es:pending",
+   "pass": true,
+   "detail": "title=\"Cuenta programada para eliminación\" copy=108字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:dark:es:processing",
+   "pass": true,
+   "detail": "title=\"Eliminación de cuenta en curso\" copy=117字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:dark:es:completed",
+   "pass": true,
+   "detail": "title=\"Cuenta eliminada\" copy=50字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:phone:dark:es:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.4(期望 10.4)"
+  },
+  {
+   "id": "locale-layout:phone:dark:fr:pending",
+   "pass": true,
+   "detail": "title=\"Suppression du compte programmée\" copy=108字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:dark:fr:processing",
+   "pass": true,
+   "detail": "title=\"Suppression du compte en cours\" copy=115字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:dark:fr:completed",
+   "pass": true,
+   "detail": "title=\"Compte supprimé\" copy=47字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:phone:dark:fr:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.4(期望 10.4)"
+  },
+  {
+   "id": "locale-layout:phone:dark:de:pending",
+   "pass": true,
+   "detail": "title=\"Kontolöschung vorgemerkt\" copy=103字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:dark:de:processing",
+   "pass": true,
+   "detail": "title=\"Kontolöschung läuft\" copy=104字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:dark:de:completed",
+   "pass": true,
+   "detail": "title=\"Konto gelöscht\" copy=39字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:phone:dark:de:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.4(期望 10.4)"
+  },
+  {
+   "id": "locale-layout:phone:dark:pt-PT:pending",
+   "pass": true,
+   "detail": "title=\"Eliminação da conta agendada\" copy=96字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:dark:pt-PT:processing",
+   "pass": true,
+   "detail": "title=\"Eliminação da conta em curso\" copy=110字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:dark:pt-PT:completed",
+   "pass": true,
+   "detail": "title=\"Conta eliminada\" copy=44字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:phone:dark:pt-PT:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.4(期望 10.4)"
+  },
+  {
+   "id": "locale-layout:phone:dark:pt-BR:pending",
+   "pass": true,
+   "detail": "title=\"Exclusão da conta agendada\" copy=95字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:dark:pt-BR:processing",
+   "pass": true,
+   "detail": "title=\"Exclusão da conta em andamento\" copy=110字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:dark:pt-BR:completed",
+   "pass": true,
+   "detail": "title=\"Conta excluída\" copy=41字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:phone:dark:pt-BR:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.4(期望 10.4)"
+  },
+  {
+   "id": "locale-layout:phone:dark:zh-Hant-x-lzh:pending",
+   "pass": true,
+   "detail": "title=\"名籍待刪\" copy=37字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:dark:zh-Hant-x-lzh:processing",
+   "pass": true,
+   "detail": "title=\"名籍刪除中\" copy=23字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:dark:zh-Hant-x-lzh:completed",
+   "pass": true,
+   "detail": "title=\"名籍已刪\" copy=13字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:phone:dark:zh-Hant-x-lzh:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.4(期望 10.4)"
+  },
+  {
+   "id": "locale-layout:phone:dark:zh-Hans-x-lzh:pending",
+   "pass": true,
+   "detail": "title=\"名籍待删\" copy=37字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:dark:zh-Hans-x-lzh:processing",
+   "pass": true,
+   "detail": "title=\"名籍删除中\" copy=23字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-layout:phone:dark:zh-Hans-x-lzh:completed",
+   "pass": true,
+   "detail": "title=\"名籍已删\" copy=13字 noClip=true centerWrap=true"
+  },
+  {
+   "id": "locale-bottom-gap:phone:dark:zh-Hans-x-lzh:completed",
+   "pass": true,
+   "detail": "我知道了↔气泡底=11.4(期望 10.4)"
+  },
+  {
+   "id": "desk-clamp:800",
+   "pass": true,
+   "detail": "宽=335.0(期望 335.0=min(670×0.5, 800-24))"
+  },
+  {
+   "id": "desk-top:800",
+   "pass": true,
+   "detail": "top=36.0(恒定 72×0.5=36.0)"
+  },
+  {
+   "id": "desk-center:800",
+   "pass": true,
+   "detail": "left=232.5(水平居中)"
+  },
+  {
+   "id": "desk-clamp:717",
+   "pass": true,
+   "detail": "宽=335.0(期望 335.0=min(670×0.5, 717-24))"
+  },
+  {
+   "id": "desk-top:717",
+   "pass": true,
+   "detail": "top=36.0(恒定 72×0.5=36.0)"
+  },
+  {
+   "id": "desk-center:717",
+   "pass": true,
+   "detail": "left=191.0(水平居中)"
+  },
+  {
+   "id": "desk-clamp:600",
+   "pass": true,
+   "detail": "宽=335.0(期望 335.0=min(670×0.5, 600-24))"
+  },
+  {
+   "id": "desk-top:600",
+   "pass": true,
+   "detail": "top=36.0(恒定 72×0.5=36.0)"
+  },
+  {
+   "id": "desk-center:600",
+   "pass": true,
+   "detail": "left=132.5(水平居中)"
+  },
+  {
+   "id": "phone-clamp:390",
+   "pass": true,
+   "detail": "宽=348.4(期望 348.4 = 670×0.5200)"
+  },
+  {
+   "id": "phone-margin:390",
+   "pass": true,
+   "detail": "左边距=20.8(期望 20.8 = 设计 40×0.5200)"
+  },
+  {
+   "id": "phone-center:390",
+   "pass": true,
+   "detail": "left=20.8(水平居中)"
+  },
+  {
+   "id": "phone-clamp:374",
+   "pass": true,
+   "detail": "宽=334.1(期望 334.1 = 670×0.4987)"
+  },
+  {
+   "id": "phone-margin:374",
+   "pass": true,
+   "detail": "左边距=19.9(期望 19.9 = 设计 40×0.4987)"
+  },
+  {
+   "id": "phone-center:374",
+   "pass": true,
+   "detail": "left=19.9(水平居中)"
+  },
+  {
+   "id": "phone-clamp:335",
+   "pass": true,
+   "detail": "宽=299.3(期望 299.3 = 670×0.4467)"
+  },
+  {
+   "id": "phone-margin:335",
+   "pass": true,
+   "detail": "左边距=17.9(期望 17.9 = 设计 40×0.4467)"
+  },
+  {
+   "id": "phone-center:335",
+   "pass": true,
+   "detail": "left=17.9(水平居中)"
+  }
+ ]
+}

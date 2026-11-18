@@ -1,0 +1,2182 @@
+import { createDrizzleProxy } from '../../localDb/client/drizzleProxy';
+import type { DbTransport } from '../../localDb/client/DbTransport';
+/**
+ * scheduler storage DB-tier smoke。
+ *
+ * 这里覆盖 DrizzleScheduleStorage 的 public CRUD 路径，需要 better-sqlite3，
+ * 因此由 test-workspaces 的 db tier 运行，不放进 fast unit tier。
+ */
+
+import type { Schedule, ScheduleRun } from '@cindy/maker-scheduler';
+import Database from 'better-sqlite3';
+import { sql } from 'drizzle-orm';
+import { drizzle } from 'drizzle-orm/better-sqlite3';
+import { describe, expect, it } from 'vitest';
+import * as schema from '../../localDb/schema';
+import { createDbClient } from '../../localDb/client/DbClient';
+import type { DbClient } from '../../localDb/client/DbClient';
+import { clearCurrentDbClient, setCurrentDbClient } from '../../localDb/client/current';
+import { recordScheduleRunCostDirect } from '../runCostLedger';
+import { DrizzleScheduleStorage, type SchedulerDrizzleDb } from '../storage.desktop';
+
+function actualMoneyFromLegacyUsd(amountUsd: number) {
+  return {
+    amount: expect.closeTo(amountUsd, 10),
+    currency: 'USD' as const,
+    approximate: false,
+    kind: 'actual-cost' as const,
+  };
+}
+
+function estimatedMoneyFromLegacyUsd(amountUsd: number) {
+  return {
+    amount: expect.closeTo(amountUsd, 10),
+    currency: 'USD' as const,
+    approximate: true,
+    kind: 'value-estimate' as const,
+    estimateReasons: ['subscription-value'] as const,
+  };
+}
+
+const ZERO_ACTUAL_MONEY = {
+  amount: 0,
+  currency: 'USD' as const,
+  approximate: false,
+  kind: 'actual-cost' as const,
+};
+
+const ZERO_ESTIMATED_MONEY = {
+  amount: 0,
+  currency: 'USD' as const,
+  approximate: true,
+  kind: 'value-estimate' as const,
+  estimateReasons: ['subscription-value'] as const,
+};
+
+function baseSchedule(overrides: Partial<Schedule> = {}): Schedule {
+  return {
+    id: 'sch-1',
+    name: 'daily standup',
+    prompt: '/standup',
+    jobType: 'prompt',
+    jobConfig: undefined,
+    source: 'user',
+    projectConfigId: undefined,
+    kind: 'cron',
+    cronExpr: '0 9 * * 1-5',
+    timezone: 'Asia/Shanghai',
+    recurring: true,
+    manual: false,
+    intervalMs: undefined,
+    agentKind: 'claude-code',
+    executionMode: 'agent',
+    scriptConfig: undefined,
+    fastMode: false,
+    workspaceKind: 'project',
+    useWorktree: false,
+    persistentSession: false,
+    silentWhenIdle: false,
+    notify: { desktop: true, feishu: false },
+    status: 'active',
+    createdAt: 1_700_000_000_000,
+    updatedAt: 1_700_000_000_000,
+    lastFinishedAt: undefined,
+    nextFireAt: 1_700_000_060_000,
+    ...overrides,
+  };
+}
+
+// 这段 SQL 是 ../../localDb/schema.ts 中 scheduler 相关表的最小投影；
+// 修改 schedules / schedule_runs 或这些方法会读取的 sessions 列时，需要同步这里。
+// 按语句拆成数组:直连 harness 一次 exec,drizzleProxy 回归用例经 client.exec
+// 逐条下发(worker 'exec' op 单语句)。
+const SCHEDULER_DDL = [
+  `
+    CREATE TABLE sessions (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      source TEXT NOT NULL DEFAULT 'desktop',
+      status TEXT NOT NULL DEFAULT 'active',
+      workspace_kind TEXT NOT NULL DEFAULT 'project',
+      working_dir TEXT,
+      user_send_at INTEGER,
+      active_turn_started_at INTEGER,
+      last_turn_ended_at INTEGER,
+      cleared_at INTEGER,
+      created_at INTEGER NOT NULL DEFAULT 0,
+      updated_at INTEGER NOT NULL DEFAULT 0,
+      total_cost_usd REAL,
+      total_cost_amount REAL NOT NULL DEFAULT 0,
+      total_cost_currency TEXT,
+      total_cost_is_approximate INTEGER NOT NULL DEFAULT 0
+    )
+  `,
+  `
+    CREATE TABLE messages (
+      id TEXT PRIMARY KEY,
+      client_id TEXT NOT NULL,
+      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      role TEXT NOT NULL,
+      content TEXT NOT NULL,
+      tool_use_id TEXT,
+      agent_meta TEXT,
+      created_at INTEGER NOT NULL,
+      rewind_at INTEGER
+    )
+  `,
+  `
+    CREATE TABLE schedules (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      prompt TEXT NOT NULL,
+      job_type TEXT NOT NULL DEFAULT 'prompt',
+      job_config TEXT,
+      execution_mode TEXT NOT NULL DEFAULT 'agent',
+      script_config TEXT,
+      webhook_trigger TEXT,
+      source TEXT DEFAULT 'user',
+      project_config_id TEXT,
+      legacy_session_fallback INTEGER NOT NULL DEFAULT 0,
+      kind TEXT NOT NULL DEFAULT 'cron',
+      cron_expr TEXT NOT NULL,
+      timezone TEXT NOT NULL,
+      recurring INTEGER NOT NULL DEFAULT 1,
+      manual INTEGER NOT NULL DEFAULT 0,
+      interval_ms INTEGER,
+      agent_kind TEXT NOT NULL,
+      model_agent_kind TEXT,
+      model_agent_device_id TEXT,
+      model TEXT,
+      provider_id TEXT,
+      agent_device_id TEXT,
+      effort TEXT,
+      fast_mode INTEGER NOT NULL DEFAULT 0,
+      working_dir TEXT,
+      workspace_kind TEXT NOT NULL DEFAULT 'project',
+      use_worktree INTEGER NOT NULL DEFAULT 0,
+      target_session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+      persistent_session INTEGER NOT NULL DEFAULT 0,
+      silent_when_idle INTEGER NOT NULL DEFAULT 0,
+      pre_run_hook_command TEXT,
+      pre_run_hook_timeout_ms INTEGER,
+      pre_run_plugin_id TEXT,
+      pre_run_plugin_on_failure TEXT,
+      skip_log_session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+      notify_desktop INTEGER NOT NULL DEFAULT 1,
+      notify_feishu INTEGER NOT NULL DEFAULT 0,
+      notify_wecom_group INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'active',
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      last_fired_at INTEGER,
+      last_finished_at INTEGER,
+      next_fire_at INTEGER,
+      expire_at INTEGER
+    )
+  `,
+  'CREATE INDEX idx_schedules_active_next ON schedules(status, next_fire_at)',
+  'CREATE INDEX idx_schedules_target_session ON schedules(target_session_id)',
+  `
+    CREATE TABLE schedule_runs (
+      id TEXT PRIMARY KEY,
+      schedule_id TEXT NOT NULL REFERENCES schedules(id) ON DELETE CASCADE,
+      session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+      fired_at INTEGER NOT NULL,
+      finished_at INTEGER,
+      status TEXT NOT NULL,
+      error_msg TEXT,
+      cost_usd REAL NOT NULL DEFAULT 0,
+      estimated_value_usd REAL NOT NULL DEFAULT 0,
+      cost_amount REAL NOT NULL DEFAULT 0,
+      estimated_value_amount REAL NOT NULL DEFAULT 0,
+      cost_currency TEXT,
+      cost_is_approximate INTEGER NOT NULL DEFAULT 0,
+      cost_attribution TEXT NOT NULL DEFAULT 'legacy',
+      result_text TEXT,
+      pre_run_hook_result TEXT,
+      trigger_source TEXT,
+      read_at INTEGER,
+      heartbeat_at INTEGER
+    )
+  `,
+  'CREATE INDEX idx_schedule_runs_schedule ON schedule_runs(schedule_id, fired_at)',
+  `CREATE INDEX idx_schedule_runs_unread_terminal ON schedule_runs(schedule_id, status, fired_at)
+    WHERE read_at IS NULL AND status IN ('success', 'failed', 'aborted', 'interrupted')`,
+  `
+    CREATE TABLE schedule_session_latest_runs (
+      session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+      run_id TEXT NOT NULL UNIQUE REFERENCES schedule_runs(id) ON DELETE CASCADE,
+      fired_at INTEGER NOT NULL
+    )
+  `,
+  `
+    CREATE TRIGGER schedule_session_latest_run_insert
+    AFTER INSERT ON schedule_runs
+    WHEN NEW.session_id IS NOT NULL
+    BEGIN
+      INSERT INTO schedule_session_latest_runs (session_id, run_id, fired_at)
+      VALUES (NEW.session_id, NEW.id, NEW.fired_at)
+      ON CONFLICT(session_id) DO UPDATE SET
+        run_id = excluded.run_id,
+        fired_at = excluded.fired_at
+      WHERE excluded.fired_at > schedule_session_latest_runs.fired_at
+        OR (excluded.fired_at = schedule_session_latest_runs.fired_at
+          AND excluded.run_id > schedule_session_latest_runs.run_id);
+    END
+  `,
+  `
+    CREATE TRIGGER schedule_session_latest_run_delete
+    AFTER DELETE ON schedule_runs
+    WHEN OLD.session_id IS NOT NULL
+    BEGIN
+      DELETE FROM schedule_session_latest_runs
+      WHERE session_id = OLD.session_id AND run_id = OLD.id;
+      INSERT INTO schedule_session_latest_runs (session_id, run_id, fired_at)
+      SELECT OLD.session_id, id, fired_at
+      FROM schedule_runs
+      WHERE session_id = OLD.session_id
+      ORDER BY fired_at DESC, id DESC
+      LIMIT 1
+      ON CONFLICT(session_id) DO UPDATE SET
+        run_id = excluded.run_id,
+        fired_at = excluded.fired_at;
+    END
+  `,
+  `
+    CREATE TRIGGER schedule_session_latest_run_update
+    AFTER UPDATE OF session_id, fired_at ON schedule_runs
+    BEGIN
+      DELETE FROM schedule_session_latest_runs
+      WHERE session_id = OLD.session_id AND run_id = OLD.id;
+      INSERT INTO schedule_session_latest_runs (session_id, run_id, fired_at)
+      SELECT OLD.session_id, id, fired_at
+      FROM schedule_runs
+      WHERE OLD.session_id IS NOT NULL AND session_id = OLD.session_id
+      ORDER BY fired_at DESC, id DESC
+      LIMIT 1
+      ON CONFLICT(session_id) DO UPDATE SET
+        run_id = excluded.run_id,
+        fired_at = excluded.fired_at;
+      INSERT INTO schedule_session_latest_runs (session_id, run_id, fired_at)
+      SELECT NEW.session_id, NEW.id, NEW.fired_at
+      WHERE NEW.session_id IS NOT NULL
+      ON CONFLICT(session_id) DO UPDATE SET
+        run_id = excluded.run_id,
+        fired_at = excluded.fired_at
+      WHERE excluded.fired_at > schedule_session_latest_runs.fired_at
+        OR (excluded.fired_at = schedule_session_latest_runs.fired_at
+          AND excluded.run_id > schedule_session_latest_runs.run_id);
+    END
+  `,
+];
+
+function createStorageHarness(queries?: { query: string; params: unknown[] }[]) {
+  const sqlite = new Database(':memory:');
+  sqlite.pragma('foreign_keys = ON');
+  for (const statement of SCHEDULER_DDL) sqlite.exec(statement);
+
+  const db = drizzle(sqlite, {
+    schema,
+    logger: queries ? { logQuery: (query, params) => queries.push({ query, params }) } : undefined,
+  }) as SchedulerDrizzleDb;
+  return {
+    close: () => sqlite.close(),
+    sqlite,
+    db,
+    storage: new DrizzleScheduleStorage(() => db),
+  };
+}
+
+// DB-tier regression for app-exit recovery: claim the original run exactly once,
+// and respect user takeover/stop and the current task owner. The old storage had no
+// recovery claim; a successful continuation could never repair its failed run.
+it.each(['eligible', 'paused', 'archived', 'finished', 'manual-continue', 'running-owner', 'newer-other-task', 'script'])('claims only resumable interrupted runs: %s', async (mode) => {
+  const h = createStorageHarness();
+  try {
+    h.sqlite.prepare(`INSERT INTO sessions (id, title, active_turn_started_at, last_turn_ended_at, status)
+      VALUES ('task', 'task', 20, ?, ?)`).run(mode === 'finished' ? 30 : 0, mode === 'archived' ? 'archived' : 'active');
+    await h.storage.insert(baseSchedule({ status: mode === 'paused' ? 'paused' : 'active',
+      executionMode: mode === 'script' ? 'script' : 'agent' }));
+    await h.storage.insertRun({ id: 'interrupted', scheduleId: 'sch-1', sessionId: 'task',
+      firedAt: 10, finishedAt: 25, status: 'interrupted', errorMsg: 'app restarted' });
+    const origin = mode === 'manual-continue' ? {} : { origin: { kind: 'scheduler', scheduleId: 'sch-1', runId: 'interrupted' } };
+    h.sqlite.prepare(`INSERT INTO messages (id, client_id, session_id, role, content, agent_meta, created_at)
+      VALUES ('input', 'input', 'task', 'user', 'continue', ?, 15)`).run(JSON.stringify(origin));
+    if (mode === 'running-owner' || mode === 'newer-other-task') await h.storage.insertRun({
+      id: 'newer', scheduleId: 'sch-1', sessionId: mode === 'running-owner' ? 'task' : undefined,
+      firedAt: 40, status: 'running',
+    });
+    expect(await h.storage.claimInterruptedRun('another-task', 49)).toBeNull();
+    const claimed = await h.storage.claimInterruptedRun('task', 50);
+    if (mode === 'eligible' || mode === 'newer-other-task') {
+      expect(claimed).toMatchObject({ id: 'interrupted', sessionId: 'task', firedAt: 10, status: 'running', heartbeatAt: 50 });
+      expect(claimed?.errorMsg).toBeUndefined();
+      expect(await h.storage.claimInterruptedRun('task', 51)).toBeNull();
+    } else expect(claimed).toBeNull();
+  } finally { h.close(); }
+});
+
+it.each(['api', 'subscription', 'tool-only'])('includes media in both run history and schedule totals for %s runs', async (mode) => {
+  const harness = createStorageHarness();
+  try {
+    harness.sqlite.prepare(`INSERT INTO sessions (id, title, created_at, updated_at)
+      VALUES ('sess-media', 'media task', 1, 1)`).run();
+    await harness.storage.insert(baseSchedule({ targetSessionId: 'sess-media' }));
+    await harness.storage.insertRun({ id: 'run-media', scheduleId: 'sch-1', sessionId: 'sess-media',
+      firedAt: 10, status: 'success', costAttribution: 'exact' });
+    const origin = { kind: 'scheduler', scheduleId: 'sch-1', runId: 'run-media' };
+    const insert = harness.sqlite.prepare(`INSERT INTO messages
+      (id, client_id, session_id, role, content, agent_meta, created_at)
+      VALUES (?, ?, 'sess-media', ?, '{}', ?, ?)`);
+    insert.run('user-media', 'user-media', 'user', JSON.stringify({ origin,
+      mediaCosts: [{ amount: 0.75, currency: 'USD', approximate: false, kind: 'actual-cost' }],
+    }), 10);
+    if (mode !== 'tool-only') {
+      insert.run('answer-media', 'answer-media', 'assistant', JSON.stringify({ origin,
+        turnCostUsd: 0.25, turnCostIsEstimate: mode === 'subscription',
+        // Display totals must not be counted a second time by scheduler billing.
+        userTurnCostUsd: 1,
+      }), 11);
+    }
+    const actual = mode === 'api' ? 1 : 0.75;
+    const estimated = mode === 'subscription' ? 0.25 : 0;
+    for (let read = 0; read < 2; read++) {
+      expect(await harness.storage.listRuns('sch-1')).toMatchObject([{
+        costMoney: { amount: actual }, estimatedValueMoney: { amount: estimated }, costAttribution: 'exact',
+      }]);
+      expect(await harness.storage.listCostSummaries()).toMatchObject([{
+        scheduleId: 'sch-1', totalMoney: { amount: actual },
+        totalEstimatedValueMoney: { amount: estimated },
+      }]);
+    }
+  } finally { harness.close(); }
+});
+
+function enableLegacySessionFallback(
+  harness: ReturnType<typeof createStorageHarness>,
+  scheduleId: string,
+): void {
+  harness.db.run(sql`
+    UPDATE schedules
+    SET legacy_session_fallback = 1
+    WHERE id = ${scheduleId}
+  `);
+}
+
+describe('DrizzleScheduleStorage (in-memory)', () => {
+  // Automation speed-menu regression: the UI fixture checks visibility and
+  // submitted values, but its JSON save boundary cannot prove SQLite retains
+  // Ultrafast rather than coercing it to a boolean. DB tier, real public CRUD.
+  // Windows standalone: 11.47s total, 412ms tests; the existing storage/schema
+  // imports account for 10.76s collection (loaded once, no per-case reset).
+  it('round-trips edited Fast and Ultrafast speeds through scheduler storage', async () => {
+    const harness = createStorageHarness();
+    try {
+      await harness.storage.insert(baseSchedule({ agentKind: 'codex', model: 'gpt-6.1-sol' }));
+      for (const fastMode of [true, 'ultrafast', false] as const) {
+        await harness.storage.update('sch-1', { fastMode });
+        const reopened = new DrizzleScheduleStorage(() => harness.db);
+        expect(await reopened.get('sch-1')).toMatchObject({ fastMode });
+      }
+    } finally {
+      harness.close();
+    }
+  });
+
+  // discussion_r4419060204: public UPDATE must reject an old completion after
+  // another writer changes its nullable/non-null trigger watermark. DB tier.
+  it.each([undefined, 100])('guards recovery schedule writes against a changed watermark (%s)', async (lastFiredAt) => {
+    const harness = createStorageHarness();
+    try {
+      const original = await harness.storage.insert(baseSchedule({ lastFiredAt }));
+      const newer = await harness.storage.update(original.id, { lastFiredAt: 200, nextFireAt: 400 });
+      expect(await harness.storage.update(original.id, {
+        lastFiredAt: 50, nextFireAt: undefined, status: 'expired',
+      }, original)).toBeNull();
+      expect(await harness.storage.get(original.id)).toEqual(newer);
+      expect(await harness.storage.update(original.id, {}, original)).toBeNull();
+      expect(await harness.storage.update(original.id, { lastFinishedAt: 300 }, newer!))
+        .toMatchObject({ lastFiredAt: 200, nextFireAt: 400, status: 'active', lastFinishedAt: 300 });
+      // discussion_r4419409168: a late older completion (including CAS fallback)
+      // must not regress the latest completion, even through an ordinary update.
+      expect(await harness.storage.update(original.id, { lastFinishedAt: 250 }))
+        .toMatchObject({ lastFinishedAt: 300 });
+      expect(await harness.storage.update(original.id, { lastFinishedAt: 350 }))
+        .toMatchObject({ lastFinishedAt: 350 });
+    } finally { harness.close(); }
+  });
+
+  it('round-trips schedule and run CRUD through SQLite', async () => {
+    const harness = createStorageHarness();
+    const schedule = baseSchedule({
+      id: 'sch-storage',
+      name: 'storage smoke',
+      nextFireAt: 1_700_000_120_000,
+      // providerId 钉到非原生来源,断言往返保真(insert → get 都带回 'anthropic')。
+      providerId: 'anthropic',
+    });
+    const run: ScheduleRun = {
+      id: 'run-storage',
+      scheduleId: schedule.id,
+      firedAt: 1_700_000_100_000,
+      status: 'running',
+    };
+
+    try {
+      const inserted = await harness.storage.insert(schedule);
+      expect(inserted).toEqual(schedule);
+
+      expect(await harness.storage.get(schedule.id)).toEqual(schedule);
+      expect((await harness.storage.listActive()).map((item) => item.id)).toEqual([schedule.id]);
+
+      const updated = await harness.storage.update(schedule.id, {
+        nextFireAt: undefined,
+        status: 'paused',
+        updatedAt: 1_700_000_200_000,
+      });
+      expect(updated?.status).toBe('paused');
+      expect(updated?.nextFireAt).toBeUndefined();
+      expect(await harness.storage.listActive()).toEqual([]);
+
+      await expect(harness.storage.insertRun(run)).resolves.toEqual({
+        ...run,
+        costUsd: 0,
+        estimatedValueUsd: 0,
+        costMoney: ZERO_ACTUAL_MONEY,
+        estimatedValueMoney: ZERO_ESTIMATED_MONEY,
+        costAttribution: 'exact',
+      });
+      const completed = await harness.storage.updateRun(run.id, {
+        finishedAt: 1_700_000_110_000,
+        resultText: 'done',
+        status: 'success',
+      });
+      expect(completed).toMatchObject({
+        id: run.id,
+        resultText: 'done',
+        status: 'success',
+      });
+      expect((await harness.storage.listRuns(schedule.id)).map((item) => item.id)).toEqual([
+        run.id,
+      ]);
+
+      await expect(harness.storage.deleteRun(run.id)).resolves.toMatchObject({
+        id: run.id,
+      });
+      await harness.storage.delete(schedule.id);
+      await expect(harness.storage.get(schedule.id)).resolves.toBeNull();
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('returns one latest session mapping plus bounded running and unread rows', async () => {
+    const harness = createStorageHarness();
+    const schedule = baseSchedule({ id: 'sch-sidebar-index' });
+    try {
+      harness.db.run(sql`
+        INSERT INTO sessions (id, title, source, workspace_kind, created_at, updated_at)
+        VALUES ('sess-sidebar-index', 'Persistent schedule session', 'desktop', 'dialogue', 1, 1)
+      `);
+      await harness.storage.insert(schedule);
+      await harness.storage.insertRun({
+        id: 'run-old-read',
+        scheduleId: schedule.id,
+        sessionId: 'sess-sidebar-index',
+        firedAt: 10,
+        finishedAt: 11,
+        status: 'success',
+        readAt: 11,
+      });
+      await harness.storage.insertRun({
+        id: 'run-old-running',
+        scheduleId: schedule.id,
+        sessionId: 'sess-sidebar-index',
+        firedAt: 12,
+        status: 'running',
+      });
+      await harness.storage.insertRun({
+        id: 'run-old-unread',
+        scheduleId: schedule.id,
+        sessionId: 'sess-sidebar-index',
+        firedAt: 15,
+        finishedAt: 16,
+        status: 'failed',
+      });
+      await harness.storage.insertRun({
+        id: 'run-latest-read',
+        scheduleId: schedule.id,
+        sessionId: 'sess-sidebar-index',
+        firedAt: 20,
+        finishedAt: 21,
+        status: 'success',
+        readAt: 21,
+      });
+
+      const initial = new Map(
+        (await harness.storage.listSidebarIndexRuns()).map((run) => [run.runId, run]),
+      );
+      expect([...initial.keys()]).toEqual(['run-old-unread', 'run-old-running', 'run-latest-read']);
+      expect(initial.get('run-latest-read')?.sessionId).toBe('sess-sidebar-index');
+      expect(initial.get('run-old-unread')?.sessionId).toBe('sess-sidebar-index');
+      expect(initial.get('run-old-running')?.sessionId).toBeUndefined();
+
+      await harness.storage.deleteRun('run-latest-read');
+      const afterDelete = new Map(
+        (await harness.storage.listSidebarIndexRuns()).map((run) => [run.runId, run]),
+      );
+      expect(afterDelete.get('run-old-unread')?.sessionId).toBe('sess-sidebar-index');
+
+      await harness.storage.updateRun('run-old-running', { firedAt: 30 });
+      const afterUpdate = new Map(
+        (await harness.storage.listSidebarIndexRuns()).map((run) => [run.runId, run]),
+      );
+      expect(afterUpdate.get('run-old-running')?.sessionId).toBe('sess-sidebar-index');
+      expect(afterUpdate.get('run-old-unread')?.sessionId).toBe('sess-sidebar-index');
+      expect([...afterUpdate.keys()]).toEqual(['run-old-unread', 'run-old-running']);
+
+      harness.db.run(sql`DELETE FROM sessions WHERE id = 'sess-sidebar-index'`);
+      await expect(harness.db.select().from(schema.scheduleSessionLatestRuns)).resolves.toEqual([]);
+      expect(
+        (await harness.storage.listSidebarIndexRuns()).every((run) => run.sessionId === undefined),
+      ).toBe(true);
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('retains only the latest read failure per session alongside unread runs and latest ownership', async () => {
+    const harness = createStorageHarness();
+    const schedule = baseSchedule({ id: 'sch-failure-history' });
+    try {
+      harness.db.run(sql`
+        INSERT INTO sessions (id, title, source, workspace_kind, created_at, updated_at)
+        VALUES ('sess-failure-history', 'Failure history', 'desktop', 'dialogue', 1, 1)
+      `);
+      await harness.storage.insert(schedule);
+      await harness.storage.insert(baseSchedule({ id: 'sch-latest-owner' }));
+      for (const [id, status, firedAt, readAt] of [
+        ['old-unread', 'failed', 10, undefined],
+        ['old-read', 'failed', 20, 21],
+        ['latest-failure', 'interrupted', 30, undefined],
+        ['aborted', 'aborted', 40, 41],
+      ] as const) {
+        await harness.storage.insertRun({
+          id,
+          status,
+          firedAt,
+          readAt,
+          scheduleId: schedule.id,
+          sessionId: 'sess-failure-history',
+        });
+      }
+      await harness.storage.insertRun({
+        id: 'latest-success',
+        status: 'success',
+        firedAt: 50,
+        readAt: 51,
+        scheduleId: 'sch-latest-owner',
+        sessionId: 'sess-failure-history',
+      });
+      expect((await harness.storage.listSidebarIndexRuns()).map((run) => run.runId)).toEqual([
+        'old-unread',
+        'latest-failure',
+        'latest-success',
+      ]);
+
+      await harness.storage.updateRun('latest-failure', { readAt: 60 });
+      await harness.storage.updateRun('old-unread', { readAt: 60 });
+      const afterRead = await harness.storage.listSidebarIndexRuns();
+      expect(afterRead.map((run) => run.runId)).toEqual(['latest-failure', 'latest-success']);
+      expect(afterRead[0]).toMatchObject({
+        status: 'interrupted',
+        readAt: 60,
+        sessionId: 'sess-failure-history',
+      });
+      expect(afterRead[1]).toMatchObject({ scheduleId: 'sch-latest-owner' });
+      // 独立重查仍保留失败记录，已读并未删除历史。
+      expect(await harness.storage.listSidebarIndexRuns()).toEqual(afterRead);
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('caps unread terminal runs so the sidebar index stays bounded', async () => {
+    const harness = createStorageHarness();
+    try {
+      harness.db.run(sql`
+        INSERT INTO sessions (id, title, source, workspace_kind, created_at, updated_at)
+        VALUES ('sess-unread-cap', 'Unread cap', 'desktop', 'dialogue', 1, 1)
+      `);
+      await harness.storage.insert(baseSchedule({ id: 'sch-unread-cap' }));
+      for (let i = 0; i < 250; i += 1) {
+        await harness.storage.insertRun({
+          id: `unread-${i}`,
+          scheduleId: 'sch-unread-cap',
+          sessionId: 'sess-unread-cap',
+          status: 'failed',
+          firedAt: i,
+        });
+      }
+      await harness.storage.insertRun({
+        id: 'latest-read',
+        scheduleId: 'sch-unread-cap',
+        sessionId: 'sess-unread-cap',
+        status: 'success',
+        firedAt: 1000,
+        readAt: 1001,
+      });
+      const runs = await harness.storage.listSidebarIndexRuns();
+      expect(runs.some((run) => run.runId === 'latest-read')).toBe(true);
+      expect(runs.filter((run) => run.runId.startsWith('unread-'))).toHaveLength(200);
+      expect(runs).toHaveLength(201);
+    } finally {
+      harness.close();
+    }
+  });
+
+  // #10011, DB tier: the existing cap test only checks returned rows. One extra
+  // eligible row must not have its hook parsed by listSidebarIndexRuns. Delegate
+  // the instrumented function to native SQLite so JSON semantics stay unchanged.
+  it('limits hook evaluation to the newest eligible unread runs across schedules', async () => {
+    const harness = createStorageHarness();
+    const nativeJson = new Database(':memory:');
+    try {
+      for (const [id, source] of [
+        ['public', 'user'], ['project', 'project'], ['legacy', 'user'], ['routine', 'bot'],
+      ] as const) {
+        await harness.storage.insert(baseSchedule({ id, source }));
+      }
+      harness.sqlite.prepare("UPDATE schedules SET source = NULL WHERE id = 'legacy'").run();
+      const insert = harness.sqlite.prepare(`INSERT INTO schedule_runs
+        (id, schedule_id, fired_at, status, read_at, pre_run_hook_result) VALUES (?, ?, ?, ?, ?, ?)`);
+      const runIds = Array.from({ length: 201 }, (_, i) => `bounded-${String(i).padStart(3, '0')}`);
+      const statuses = ['success', 'failed', 'aborted', 'interrupted'] as const;
+      harness.sqlite.transaction(() => {
+        for (const [i, id] of runIds.entries()) {
+          insert.run(id, ['public', 'project', 'legacy'][i % 3], Math.floor(i / 2),
+            statuses[i % 4], null, JSON.stringify({ runId: id, decision: 'allow' }));
+          // Newer private history must not consume the public 200-row budget.
+          insert.run(`routine-${i}`, 'routine', 1000 + i, 'success', null, null);
+        }
+        insert.run('read', 'public', 2000, 'success', 2001, null);
+        insert.run('skipped', 'public', 2002, 'skipped', null, null);
+      })();
+      const evaluatedHooks = new Set<string>();
+      const jsonValid = nativeJson.prepare<[string | null], { valid: number }>('SELECT json_valid(?) AS valid');
+      harness.sqlite.function('json_valid', { deterministic: true }, (value: string | null) => {
+        if (value !== null) evaluatedHooks.add(value);
+        return jsonValid.get(value)!.valid;
+      });
+
+      const runs = await harness.storage.listSidebarIndexRuns();
+      // Equal fired_at values at the cutoff are resolved by id, not insertion or
+      // schedule order. The returned unread rows remain oldest first.
+      expect(runs.map((run) => run.runId)).toEqual(runIds.slice(1));
+      expect(new Set(runs.map((run) => run.status))).toEqual(new Set(statuses));
+      expect(new Set(runs.map((run) => run.scheduleId))).toEqual(new Set(['public', 'project', 'legacy']));
+      expect(evaluatedHooks).toEqual(new Set(runIds.slice(1).map((runId) =>
+        JSON.stringify({ runId, decision: 'allow' }))));
+    } finally {
+      harness.close();
+      nativeJson.close();
+    }
+  });
+
+  // The in-task banner reads this projection; without missingPlugin it can only say
+  // "checks blocked" when a plugin uninstall removed the check script.
+  it('projects the missing plugin of a blocked check into the sidebar index', async () => {
+    const harness = createStorageHarness();
+    try {
+      harness.sqlite.exec(`
+        INSERT INTO sessions (id, title, source, workspace_kind, created_at, updated_at)
+        VALUES ('sess-missing-plugin', 'PR follow-up', 'desktop', 'dialogue', 1, 1)
+      `);
+      await harness.storage.insert(baseSchedule({ id: 'sch-missing-plugin' }));
+      await harness.storage.insertRun({
+        id: 'blocked-missing-plugin',
+        scheduleId: 'sch-missing-plugin',
+        sessionId: 'sess-missing-plugin',
+        status: 'failed',
+        firedAt: 1,
+        errorMsg: 'pre-run hook failed: plugin "GitHub" (cindy-github) is not installed',
+        preRunHookResult: {
+          status: 'failed', decision: 'block', exitCode: 1, durationMs: 1, stdout: '', stderr: 'MODULE_NOT_FOUND',
+          stdoutTruncated: false, stderrTruncated: false, timedOut: false, aborted: false,
+          missingPlugin: { ghostId: 'cindy-github', pluginId: 'p1', name: 'GitHub' },
+        },
+      });
+      const [run] = await harness.storage.listSidebarIndexRuns();
+      expect(run).toMatchObject({
+        runId: 'blocked-missing-plugin',
+        failureKind: 'precheck',
+        missingPlugin: { ghostId: 'cindy-github', pluginId: 'p1', name: 'GitHub' },
+      });
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('reuses the sidebar index snapshot until runs change', async () => {
+    const harness = createStorageHarness();
+    try {
+      await harness.storage.insert(baseSchedule({ id: 'sch-cache' }));
+      await harness.storage.insertRun({
+        id: 'run-cache-1',
+        scheduleId: 'sch-cache',
+        status: 'success',
+        firedAt: 1,
+        readAt: 2,
+      });
+      const first = await harness.storage.listSidebarIndexRuns();
+      const second = await harness.storage.listSidebarIndexRuns();
+      expect(second).toBe(first);
+      await harness.storage.insertRun({
+        id: 'run-cache-2',
+        scheduleId: 'sch-cache',
+        status: 'failed',
+        firedAt: 3,
+      });
+      const third = await harness.storage.listSidebarIndexRuns();
+      expect(third).not.toBe(first);
+      expect(third.some((run) => run.runId === 'run-cache-2')).toBe(true);
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('rebuilds sidebar index when another writer changes run status or nextFireAt', async () => {
+    const harness = createStorageHarness();
+    try {
+      await harness.storage.insert(baseSchedule({ id: 'sch-ext', nextFireAt: 9_000 }));
+      await harness.storage.insertRun({
+        id: 'run-ext',
+        scheduleId: 'sch-ext',
+        status: 'running',
+        firedAt: 1,
+      });
+      const cached = await harness.storage.listSidebarIndexRuns();
+      expect(cached.find((run) => run.runId === 'run-ext')).toMatchObject({
+        status: 'running',
+        nextFireAt: 9_000,
+      });
+      expect(await harness.storage.listSidebarIndexRuns()).toBe(cached);
+
+      harness.db.run(sql`
+        UPDATE schedule_runs SET status = 'success', finished_at = 2 WHERE id = 'run-ext'
+      `);
+      const afterFinish = await harness.storage.listSidebarIndexRuns();
+      expect(afterFinish).not.toBe(cached);
+      expect(afterFinish.find((run) => run.runId === 'run-ext')?.status).toBe('success');
+
+      harness.db.run(sql`UPDATE schedules SET next_fire_at = 12000 WHERE id = 'sch-ext'`);
+      const afterReschedule = await harness.storage.listSidebarIndexRuns();
+      expect(afterReschedule).not.toBe(afterFinish);
+      expect(afterReschedule.find((run) => run.runId === 'run-ext')?.nextFireAt).toBe(12_000);
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('recovers warnings per automation without erasing unread history; healthy skips only recover checks', async () => {
+    const harness = createStorageHarness();
+    try {
+      harness.db.run(sql`INSERT INTO sessions (id, title, source, workspace_kind, created_at, updated_at)
+        VALUES ('recovery-session', 'Recovery', 'desktop', 'dialogue', 1, 1)`);
+      await harness.storage.insert(baseSchedule({ id: 'recovery-a' }));
+      await harness.storage.insert(baseSchedule({ id: 'recovery-b' }));
+      const hook = { status: 'failed', decision: 'block', exitCode: 1, durationMs: 1,
+        stdout: '', stderr: 'API rate limit already exceeded', stdoutTruncated: false,
+        stderrTruncated: false, timedOut: false, aborted: false } as const;
+      const insert = (id: string, scheduleId: string, firedAt: number, status: ScheduleRun['status'], extra: Partial<ScheduleRun> = {}) =>
+        harness.storage.insertRun({ id, scheduleId, firedAt, status, sessionId: 'recovery-session', ...extra });
+      await insert('execution-a', 'recovery-a', 1, 'failed', { readAt: 2, errorMsg: 'provider mismatch' });
+      expect((await harness.storage.listSidebarIndexRuns()).find((r) => r.runId === 'execution-a'))
+        .toMatchObject({ errorMsg: 'provider mismatch' });
+      await insert('check-b', 'recovery-b', 3, 'failed', { preRunHookResult: hook });
+      const before = await harness.storage.listSidebarIndexRuns();
+      expect(before.find((r) => r.runId === 'check-b')).toMatchObject({ failureKind: 'rate-limit', failureRecovered: false });
+      await insert('backoff-b', 'recovery-b', 4, 'skipped');
+      expect((await harness.storage.listSidebarIndexRuns()).find((r) => r.runId === 'check-b')?.failureRecovered).toBe(false);
+      await insert('healthy-b', 'recovery-b', 5, 'skipped', { preRunHookResult: { ...hook, status: 'skipped', decision: 'skip', exitCode: 2, checkSucceeded: true } });
+      const recovered = await harness.storage.listSidebarIndexRuns();
+      expect(recovered.find((r) => r.runId === 'check-b')).toMatchObject({ status: 'failed', readAt: undefined, failureRecovered: true });
+      expect(recovered.find((r) => r.runId === 'execution-a')?.failureRecovered).toBe(false);
+      await insert('healthy-a', 'recovery-a', 6, 'skipped', { preRunHookResult: { ...hook, status: 'skipped', decision: 'skip', exitCode: 2, checkSucceeded: true } });
+      expect((await harness.storage.listSidebarIndexRuns()).find((r) => r.runId === 'execution-a')).toBeDefined();
+      await insert('success-a', 'recovery-a', 7, 'success', { readAt: 8 });
+      expect((await harness.storage.listSidebarIndexRuns()).some((r) => r.runId === 'execution-a')).toBe(false);
+      expect((await harness.storage.listRuns('recovery-a', 50)).some((r) => r.id === 'execution-a')).toBe(true);
+      await insert('new-a', 'recovery-a', 9, 'failed');
+      expect((await harness.storage.listSidebarIndexRuns()).find((r) => r.runId === 'new-a')).toMatchObject({ failureRecovered: false, failureKind: 'execution' });
+    } finally { harness.close(); }
+  });
+
+  it.each([null, '{broken', '{}', '{"decision":"skip"}'])('classifies and recovers legacy precheck errors when hook metadata is %s', async (hookJson) => {
+    const harness = createStorageHarness();
+    try {
+      harness.db.run(sql`INSERT INTO sessions (id, title, source, workspace_kind, created_at, updated_at)
+        VALUES ('legacy-check-session', 'Check', 'desktop', 'dialogue', 1, 1)`);
+      await harness.storage.insert(baseSchedule());
+      await harness.storage.insertRun({ id: 'legacy-check', scheduleId: 'sch-1', firedAt: 1,
+        status: 'failed', sessionId: 'legacy-check-session', errorMsg: 'pre-run hook blocked: unavailable' });
+      harness.db.run(sql`UPDATE schedule_runs SET pre_run_hook_result = ${hookJson} WHERE id = 'legacy-check'`);
+      expect(await harness.storage.listSidebarIndexRuns()).toEqual([
+        expect.objectContaining({ runId: 'legacy-check', failureKind: 'precheck' }),
+      ]);
+      await harness.storage.insertRun({ id: 'execution', scheduleId: 'sch-1', firedAt: 2,
+        status: 'failed', sessionId: 'legacy-check-session', errorMsg: 'agent failed' });
+      await harness.storage.insertRun({ id: 'healthy', scheduleId: 'sch-1', firedAt: 3, status: 'skipped',
+        preRunHookResult: { status: 'skipped', decision: 'skip', exitCode: 2, durationMs: 1,
+          stdout: 'CINDY_PRECHECK_OK', stderr: '', stdoutTruncated: false, stderrTruncated: false,
+          timedOut: false, aborted: false, checkSucceeded: true } });
+      const rows = await harness.storage.listSidebarIndexRuns();
+      expect(rows.find((r) => r.runId === 'legacy-check')).toMatchObject({ failureRecovered: true, readAt: undefined });
+      expect(rows.find((r) => r.runId === 'execution')).toMatchObject({ failureRecovered: false });
+      await harness.storage.updateRun('legacy-check', { readAt: 4 });
+      await harness.storage.updateRun('execution', { readAt: 4 });
+      await harness.storage.insertRun({ id: 'latest', scheduleId: 'sch-1', firedAt: 5,
+        status: 'skipped', sessionId: 'legacy-check-session', readAt: 6 });
+      const readRows = await harness.storage.listSidebarIndexRuns();
+      expect(readRows.some((r) => r.runId === 'legacy-check')).toBe(false);
+      expect(readRows.some((r) => r.runId === 'execution')).toBe(true);
+      expect((await harness.storage.listRuns('sch-1', 50)).some((r) => r.id === 'legacy-check')).toBe(true);
+    } finally { harness.close(); }
+  });
+
+  it('keeps renamed legacy aliases from the latest-session projection', async () => {
+    const harness = createStorageHarness();
+    const schedule = baseSchedule({
+      id: 'sch-renamed-legacy',
+      name: 'new automation name',
+      workingDir: '/repo',
+    });
+    try {
+      harness.db.run(sql`
+        INSERT INTO sessions (
+          id, title, source, workspace_kind, working_dir, created_at, updated_at
+        ) VALUES
+          (
+            'sess-renamed-anchor', '[Schedule] old automation name', 'scheduler',
+            'project', '/repo', 1, 1
+          ),
+          (
+            'sess-renamed-orphan', '[Schedule] old automation name', 'scheduler',
+            'project', '/repo', 2, 2
+          )
+      `);
+      await harness.storage.insert(schedule);
+      enableLegacySessionFallback(harness, schedule.id);
+      await harness.storage.insertRun({
+        id: 'run-renamed-anchor',
+        scheduleId: schedule.id,
+        sessionId: 'sess-renamed-anchor',
+        firedAt: 10,
+        finishedAt: 11,
+        status: 'success',
+        readAt: 11,
+      });
+
+      const runs = await harness.storage.listSidebarIndexRuns();
+
+      expect(runs).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            runId: 'run-renamed-anchor',
+            scheduleId: schedule.id,
+            sessionId: 'sess-renamed-anchor',
+          }),
+          expect.objectContaining({
+            runId: 'legacy-session:sess-renamed-orphan',
+            scheduleId: schedule.id,
+            sessionId: 'sess-renamed-orphan',
+          }),
+        ]),
+      );
+      expect(runs).toHaveLength(2);
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('hydrates exact run cost from persisted assistant runId metadata', async () => {
+    const harness = createStorageHarness();
+    const schedule = baseSchedule({ id: 'sch-run-cost' });
+    try {
+      harness.db.run(sql`
+        INSERT INTO sessions (id, title, source, workspace_kind, created_at, updated_at, total_cost_usd)
+        VALUES ('sess-run-cost', 'Persistent schedule session', 'desktop', 'dialogue', 1, 1, 0)
+      `);
+      await harness.storage.insert(schedule);
+      await harness.storage.insertRun({
+        id: 'run-exact',
+        scheduleId: schedule.id,
+        sessionId: 'sess-run-cost',
+        firedAt: 10,
+        finishedAt: 20,
+        status: 'success',
+      });
+      harness.db.run(sql`
+        INSERT INTO messages (id, client_id, session_id, role, content, agent_meta, created_at)
+        VALUES
+          ('run-exact-assistant-1', 'run-exact-assistant-1', 'sess-run-cost', 'assistant', '{}',
+            '{"origin":{"kind":"scheduler","scheduleId":"sch-run-cost","runId":"run-exact"},"turnCostUsd":0.42,"turnUsageDetails":{"inputTokens":100,"outputTokens":20,"cacheReadTokens":30,"cacheCreateTokens":5}}', 11),
+          ('run-exact-assistant-2', 'run-exact-assistant-2', 'sess-run-cost', 'assistant', '{}',
+            '{"origin":{"kind":"scheduler","scheduleId":"sch-run-cost","runId":"run-exact"},"turnCostUsd":0.29,"turnCostIsEstimate":true,"turnUsageDetails":{"inputTokens":200,"outputTokens":25,"cacheReadTokens":50,"cacheCreateTokens":0}}', 12)
+      `);
+
+      await expect(harness.storage.listRuns(schedule.id)).resolves.toEqual([
+        expect.objectContaining({
+          id: 'run-exact',
+          costUsd: 0,
+          estimatedValueUsd: 0,
+          costMoney: actualMoneyFromLegacyUsd(0.42),
+          estimatedValueMoney: estimatedMoneyFromLegacyUsd(0.29),
+          totalTokens: 430,
+          costAttribution: 'exact',
+        }),
+      ]);
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('isolates two schedules and manual turns inside one persistent session', async () => {
+    const harness = createStorageHarness();
+    const scheduleA = baseSchedule({ id: 'sch-a', targetSessionId: 'sess-shared' });
+    const scheduleB = baseSchedule({ id: 'sch-b', targetSessionId: 'sess-shared' });
+    try {
+      harness.db.run(sql`
+        INSERT INTO sessions (id, title, source, workspace_kind, created_at, updated_at, total_cost_usd)
+        VALUES ('sess-shared', 'Shared persistent session', 'desktop', 'dialogue', 1, 1, 1.1)
+      `);
+      await harness.storage.insert(scheduleA);
+      await harness.storage.insert(scheduleB);
+      for (const run of [
+        { id: 'run-a1', scheduleId: 'sch-a', firedAt: 10 },
+        { id: 'run-b1', scheduleId: 'sch-b', firedAt: 30 },
+        { id: 'run-a2', scheduleId: 'sch-a', firedAt: 50 },
+      ]) {
+        await harness.storage.insertRun({
+          ...run,
+          sessionId: 'sess-shared',
+          finishedAt: run.firedAt + 5,
+          status: 'success',
+        });
+      }
+      harness.db.run(sql`
+        INSERT INTO messages (id, client_id, session_id, role, content, agent_meta, created_at)
+        VALUES
+          ('user-a1', 'user-a1', 'sess-shared', 'user', '{}',
+            '{"origin":{"kind":"scheduler","scheduleId":"sch-a","runId":"run-a1"}}', 10),
+          ('assistant-a1', 'assistant-a1', 'sess-shared', 'assistant', '{}',
+            '{"origin":{"kind":"scheduler","scheduleId":"sch-a","runId":"run-a1"},"turnCostUsd":0.1}', 11),
+          ('manual-user', 'manual-user', 'sess-shared', 'user', '{}', NULL, 20),
+          ('manual-assistant', 'manual-assistant', 'sess-shared', 'assistant', '{}',
+            '{"turnCostUsd":0.5}', 21),
+          ('user-b1', 'user-b1', 'sess-shared', 'user', '{}',
+            '{"origin":{"kind":"scheduler","scheduleId":"sch-b","runId":"run-b1"}}', 30),
+          ('assistant-b1', 'assistant-b1', 'sess-shared', 'assistant', '{}',
+            '{"origin":{"kind":"scheduler","scheduleId":"sch-b","runId":"run-b1"},"turnCostUsd":0.2}', 31),
+          ('user-a2', 'user-a2', 'sess-shared', 'user', '{}',
+            '{"origin":{"kind":"scheduler","scheduleId":"sch-a","runId":"run-a2"}}', 50),
+          ('assistant-a2', 'assistant-a2', 'sess-shared', 'assistant', '{}',
+            '{"origin":{"kind":"scheduler","scheduleId":"sch-a","runId":"run-a2"},"turnCostUsd":0.3}', 51)
+      `);
+
+      const summaries = new Map(
+        (await harness.storage.listCostSummaries()).map((summary) => [summary.scheduleId, summary]),
+      );
+      expect(summaries.get('sch-a')).toMatchObject({
+        totalMoney: actualMoneyFromLegacyUsd(0.4),
+        totalEstimatedValueMoney: ZERO_ESTIMATED_MONEY,
+        totalCostUsd: expect.closeTo(0.4, 10),
+        totalEstimatedValueUsd: 0,
+      });
+      expect(summaries.get('sch-b')).toMatchObject({
+        totalMoney: actualMoneyFromLegacyUsd(0.2),
+        totalEstimatedValueMoney: ZERO_ESTIMATED_MONEY,
+        totalCostUsd: expect.closeTo(0.2, 10),
+        totalEstimatedValueUsd: 0,
+      });
+      expect(await harness.storage.listRuns('sch-a')).toEqual([
+        expect.objectContaining({
+          id: 'run-a2',
+          costMoney: actualMoneyFromLegacyUsd(0.3),
+        }),
+        expect.objectContaining({
+          id: 'run-a1',
+          costMoney: actualMoneyFromLegacyUsd(0.1),
+        }),
+      ]);
+      expect(await harness.storage.listRuns('sch-b')).toEqual([
+        expect.objectContaining({
+          id: 'run-b1',
+          costMoney: actualMoneyFromLegacyUsd(0.2),
+        }),
+      ]);
+    } finally {
+      harness.close();
+    }
+  });
+
+  // #8886 / db: a stale expiry scan must not undo another instance's extension.
+  it('matches expireAt before applying a guarded status update', async () => {
+    const harness = createStorageHarness();
+    try {
+      const original = await harness.storage.insert(baseSchedule({ expireAt: 1_800_000_000_000 }));
+      await harness.storage.update(original.id, { expireAt: original.expireAt! + 60_000 });
+      expect(await harness.storage.update(original.id, { status: 'expired', nextFireAt: undefined }, original)).toBeNull();
+      expect((await harness.storage.get(original.id))?.status).toBe('active');
+    } finally { harness.close(); }
+  });
+
+  it('claimDueFire: CAS 命中时置空 next_fire_at 并返回行;不命中不动行', async () => {
+    const harness = createStorageHarness();
+    const due = 1_700_000_060_000;
+    try {
+      await harness.storage.insert(baseSchedule({ id: 'sch-claim', nextFireAt: due }));
+
+      // 期望值对不上(模拟另一进程已改期/已认领)→ 输,行原样
+      expect(await harness.storage.claimDueFire('sch-claim', due + 1)).toBeNull();
+      expect((await harness.storage.get('sch-claim'))?.nextFireAt).toBe(due);
+
+      // 期望值精确匹配 → 赢,next_fire_at 被置空
+      const claimed = await harness.storage.claimDueFire('sch-claim', due);
+      expect(claimed?.id).toBe('sch-claim');
+      expect(claimed?.nextFireAt).toBeUndefined();
+
+      // 同一到点第二次认领(模拟双开另一进程紧随其后)→ 输
+      expect(await harness.storage.claimDueFire('sch-claim', due)).toBeNull();
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('claimDueFire: 经 DbClient drizzleProxy(worker RPC)也能拿到 changes 完成 CAS', async () => {
+    // 回归测试 — 防退化:主进程生产链路的 db 是 drizzleProxy,不是直连
+    // better-sqlite3 drizzle。代理对隐式 await 的写操作丢弃 { changes },
+    // claimDueFire 曾因此每次认领都 throw"driver did not report changes count",
+    // 任务到点后无限重试、永不触发(2026-07-04 dev 实测)。此用例保证认领
+    // 走真代理链路时胜负语义完整。
+    const client = await createDbClient({ useInlineWorker: true });
+    const due = 1_700_000_060_000;
+    try {
+      for (const statement of SCHEDULER_DDL) await client.exec(statement);
+      const storage = new DrizzleScheduleStorage(() => client.drizzle as SchedulerDrizzleDb);
+      await storage.insert(baseSchedule({ id: 'sch-proxy', nextFireAt: due }));
+
+      // 期望值不匹配 → 判负返回 null(而不是 throw)
+      expect(await storage.claimDueFire('sch-proxy', due + 1)).toBeNull();
+
+      // 精确匹配 → 判胜,next_fire_at 置空
+      const claimed = await storage.claimDueFire('sch-proxy', due);
+      expect(claimed?.id).toBe('sch-proxy');
+      expect(claimed?.nextFireAt).toBeUndefined();
+
+      // 二次认领 → 判负
+      expect(await storage.claimDueFire('sch-proxy', due)).toBeNull();
+      // Recovery completion uses the same UPDATE RETURNING through real RPC.
+      const stale = (await storage.get('sch-proxy'))!;
+      const newer = await storage.update('sch-proxy', { lastFiredAt: due, nextFireAt: due + 1000 });
+      expect(await storage.update('sch-proxy', { status: 'expired' }, stale)).toBeNull();
+      expect(await storage.update('sch-proxy', { lastFinishedAt: due + 1 }, newer!))
+        .toMatchObject({ status: 'active', lastFiredAt: due, nextFireAt: due + 1000 });
+      expect(await storage.update('sch-proxy', { lastFinishedAt: due }))
+        .toMatchObject({ lastFinishedAt: due + 1 });
+    } finally {
+      await client.dispose();
+    }
+  });
+
+  it('markRunningAsInterrupted: 只回收心跳过期的 running 行,排除名单与新鲜心跳都不动', async () => {
+    const harness = createStorageHarness();
+    const now = 1_700_000_300_000;
+    const stale = now - 61_000;
+    try {
+      await harness.storage.insert(baseSchedule({ id: 'sch-a' }));
+      await harness.storage.insert(baseSchedule({ id: 'sch-b', name: 'other' }));
+      // 另一活实例正在跑:心跳新鲜 → 不许动
+      await harness.storage.insertRun({
+        id: 'run-alive',
+        scheduleId: 'sch-a',
+        firedAt: now - 300_000,
+        status: 'running',
+        heartbeatAt: now - 5_000,
+      });
+      // 真僵尸:心跳过期 → 回收
+      await harness.storage.insertRun({
+        id: 'run-dead',
+        scheduleId: 'sch-a',
+        firedAt: now - 300_000,
+        status: 'running',
+        heartbeatAt: now - 120_000,
+      });
+      // 老版本行(无心跳):按 fired_at 兜底 → 回收
+      await harness.storage.insertRun({
+        id: 'run-legacy',
+        scheduleId: 'sch-b',
+        firedAt: now - 120_000,
+        status: 'running',
+      });
+      // 本进程 in-flight(心跳虽然过期也在排除名单里)→ 不许动
+      await harness.storage.insertRun({
+        id: 'run-mine',
+        scheduleId: 'sch-b',
+        firedAt: now - 300_000,
+        status: 'running',
+        heartbeatAt: now - 120_000,
+      });
+      // 终态行无论心跳如何都不受影响
+      await harness.storage.insertRun({
+        id: 'run-done',
+        scheduleId: 'sch-a',
+        firedAt: now - 300_000,
+        finishedAt: now - 200_000,
+        status: 'success',
+      });
+
+      const affected = await harness.storage.markRunningAsInterrupted(stale, ['run-mine']);
+      expect(affected.sort()).toEqual(['sch-a', 'sch-b']);
+
+      const byId = new Map(
+        [
+          ...(await harness.storage.listRuns('sch-a')),
+          ...(await harness.storage.listRuns('sch-b')),
+        ].map((r) => [r.id, r]),
+      );
+      expect(byId.get('run-alive')?.status).toBe('running');
+      expect(byId.get('run-mine')?.status).toBe('running');
+      expect(byId.get('run-done')?.status).toBe('success');
+      expect(byId.get('run-dead')?.status).toBe('interrupted');
+      expect(byId.get('run-dead')?.errorMsg).toBe('app restarted');
+      expect(byId.get('run-legacy')?.status).toBe('interrupted');
+
+      // 再扫一遍(同样的排除名单):已回收的行不重复计入 → 空结果(调用方据此不广播)
+      expect(await harness.storage.markRunningAsInterrupted(stale, ['run-mine'])).toEqual([]);
+
+      // legacyStaleBefore(运行期清扫模式):NULL 心跳行(老版本实例写入)按
+      // fired_at 走独立宽窗口 —— 窗口内跳过(可能是跨版本活实例正在跑),
+      // 窗口外照收(否则老版本崩溃残留永久卡死 busy probe)。
+      await harness.storage.insertRun({
+        id: 'run-old-version',
+        scheduleId: 'sch-a',
+        firedAt: now - 300_000,
+        status: 'running',
+      });
+      expect(
+        await harness.storage.markRunningAsInterrupted(stale, ['run-mine'], {
+          legacyStaleBefore: now - 600_000,
+        }),
+      ).toEqual([]);
+      expect(
+        await harness.storage.markRunningAsInterrupted(stale, ['run-mine'], {
+          legacyStaleBefore: now - 200_000,
+        }),
+      ).toEqual(['sch-a']);
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('hasRunningRuns: 支持 schedule 范围查询,不受行数影响', async () => {
+    const harness = createStorageHarness();
+    const now = 1_700_000_300_000;
+    try {
+      await harness.storage.insert(baseSchedule({ id: 'sch-x' }));
+      await harness.storage.insert(baseSchedule({ id: 'sch-y', name: 'other' }));
+      // sch-x:一条最老的活 run + 大量更新的终态行(挤出任何展示窗口都不影响)
+      await harness.storage.insertRun({
+        id: 'run-live',
+        scheduleId: 'sch-x',
+        firedAt: now - 900_000,
+        status: 'running',
+        heartbeatAt: now,
+      });
+      for (let i = 0; i < 15; i++) {
+        await harness.storage.insertRun({
+          id: `run-done-${i}`,
+          scheduleId: 'sch-x',
+          firedAt: now - 500_000 + i * 1_000,
+          finishedAt: now - 499_000 + i * 1_000,
+          status: 'success',
+        });
+      }
+      expect(await harness.storage.hasRunningRuns('sch-x')).toBe(true);
+      expect(await harness.storage.hasRunningRuns('sch-y')).toBe(false);
+      expect(await harness.storage.hasRunningRuns()).toBe(true);
+    } finally {
+      harness.close();
+    }
+  });
+
+  // discussion_r4420812422 / db: startup checks the real SQLite statuses, not
+  // a bounded history page. Newer finished runs cannot hide an unfinished Once.
+  it.each(['running', 'interrupted'] as const)('finds unfinished %s runs beyond the history window', async (status) => {
+    const harness = createStorageHarness();
+    try {
+      await harness.storage.insert(baseSchedule({ id: 'unfinished-once', recurring: false }));
+      await harness.storage.insert(baseSchedule({ id: 'other-once', recurring: false }));
+      harness.sqlite.prepare("INSERT INTO sessions (id, title) VALUES ('unfinished-task', 'task')").run();
+      await harness.storage.insertRun({ id: 'unfinished', scheduleId: 'unfinished-once', sessionId: 'unfinished-task', firedAt: 1, status });
+      harness.sqlite.prepare(`INSERT INTO messages (id, client_id, session_id, role, content, agent_meta, created_at)
+        VALUES ('accepted', 'accepted', 'unfinished-task', 'user', 'prompt', ?, 1)`)
+        .run(JSON.stringify({ origin: { kind: 'scheduler', runId: 'unfinished' } }));
+      for (let i = 0; i < 60; i++) {
+        await harness.storage.insertRun({ id: `finished-${i}`, scheduleId: 'unfinished-once', firedAt: i + 2, status: 'success' });
+      }
+      expect(await harness.storage.hasUnfinishedRuns('unfinished-once')).toBe(true);
+      expect(await harness.storage.hasUnfinishedRuns('other-once')).toBe(false);
+      await harness.storage.updateRun('unfinished', { status: 'success' });
+      expect(await harness.storage.hasUnfinishedRuns('unfinished-once')).toBe(false);
+    } finally { harness.close(); }
+  });
+
+  // discussion_r4420988894 / db: a pre-accept crash must not consume Once
+  // forever. Use the same persisted run/message and stale sweep as production;
+  // a later manual input blocks Continue but must not replay an accepted prompt.
+  it.each(['absent', 'accepted', 'other-run', 'other-task', 'later-input', 'invalid-json'] as const)(
+    'only accepted input keeps a swept Once claimed: %s', async (mode) => {
+      const h = createStorageHarness();
+      try {
+        h.sqlite.prepare(`INSERT INTO sessions (id, title, active_turn_started_at)
+          VALUES ('once-task', 'task', 20), ('other-task', 'other', 20)`).run();
+        await h.storage.insert(baseSchedule({ recurring: false, nextFireAt: undefined }));
+        await h.storage.insertRun({ id: 'pending-once', scheduleId: 'sch-1', sessionId: 'once-task',
+          firedAt: 10, heartbeatAt: 10, status: 'running' });
+        if (mode !== 'absent') {
+          const meta = mode === 'invalid-json' ? '{' : JSON.stringify({
+            origin: { kind: 'scheduler', runId: mode === 'other-run' ? 'other' : 'pending-once' },
+          });
+          h.sqlite.prepare(`INSERT INTO messages (id, client_id, session_id, role, content, agent_meta, created_at)
+            VALUES ('input', 'input', ?, 'user', 'prompt', ?, 15)`)
+            .run(mode === 'other-task' ? 'other-task' : 'once-task', meta);
+        }
+        if (mode === 'later-input') h.sqlite.prepare(`INSERT INTO messages
+          (id, client_id, session_id, role, content, created_at)
+          VALUES ('later', 'later', 'once-task', 'user', 'manual input', 30)`).run();
+        // Fresh running owners remain protected even before their input commit.
+        expect(await h.storage.hasUnfinishedRuns('sch-1')).toBe(true);
+        expect(await h.storage.markRunningAsInterrupted(11)).toEqual(['sch-1']);
+        expect(await h.storage.hasUnfinishedRuns('sch-1')).toBe(mode === 'accepted' || mode === 'later-input');
+        const claimed = await h.storage.claimInterruptedRun('once-task', 40);
+        if (mode === 'accepted') expect(claimed?.id).toBe('pending-once');
+        else expect(claimed).toBeNull();
+      } finally { h.close(); }
+    },
+  );
+
+  it('touchRunHeartbeats: 只给 running 行续心跳,终态行不补写', async () => {
+    const harness = createStorageHarness();
+    const now = 1_700_000_300_000;
+    try {
+      await harness.storage.insert(baseSchedule({ id: 'sch-hb' }));
+      await harness.storage.insertRun({
+        id: 'run-going',
+        scheduleId: 'sch-hb',
+        firedAt: now - 30_000,
+        status: 'running',
+        heartbeatAt: now - 30_000,
+      });
+      await harness.storage.insertRun({
+        id: 'run-over',
+        scheduleId: 'sch-hb',
+        firedAt: now - 30_000,
+        finishedAt: now - 10_000,
+        status: 'success',
+        heartbeatAt: now - 30_000,
+      });
+      await harness.storage.touchRunHeartbeats(['run-going', 'run-over'], now);
+      const byId = new Map((await harness.storage.listRuns('sch-hb')).map((r) => [r.id, r]));
+      expect(byId.get('run-going')?.heartbeatAt).toBe(now);
+      expect(byId.get('run-over')?.heartbeatAt).toBe(now - 30_000);
+      // 空名单是 no-op(引擎 inflight 清空后的防御调用)
+      await expect(harness.storage.touchRunHeartbeats([], now)).resolves.toBeUndefined();
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('claimDueFire: 非 active 状态不可认领', async () => {
+    const harness = createStorageHarness();
+    const due = 1_700_000_060_000;
+    try {
+      await harness.storage.insert(
+        baseSchedule({ id: 'sch-paused', status: 'paused', nextFireAt: due }),
+      );
+      expect(await harness.storage.claimDueFire('sch-paused', due)).toBeNull();
+      expect((await harness.storage.get('sch-paused'))?.nextFireAt).toBe(due);
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('script 任务的能力清单经 DB 往返不丢项(回归:mapper 曾私自维护白名单漏掉 feishu.read)', async () => {
+    const harness = createStorageHarness();
+    const capabilities: NonNullable<Schedule['scriptConfig']>['capabilities'] = [
+      'jira.read',
+      'jira.comment',
+      'sessions.dispatch',
+      'feishu.read',
+    ];
+    try {
+      await harness.storage.insert(
+        baseSchedule({
+          id: 'sch-script-caps',
+          prompt: '',
+          executionMode: 'script',
+          scriptConfig: { command: 'python demo.py', capabilities, timeoutMs: 30_000 },
+        }),
+      );
+      const back = await harness.storage.get('sch-script-caps');
+      expect(back?.executionMode).toBe('script');
+      expect(back?.scriptConfig).toEqual({
+        command: 'python demo.py',
+        capabilities,
+        timeoutMs: 30_000,
+      });
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('no-break: 不设 providerId 的 schedule 往返为 undefined(= 原生默认来源)', async () => {
+    const harness = createStorageHarness();
+    const schedule = baseSchedule({ id: 'sch-no-provider' });
+    try {
+      harness.db.run(sql`
+        INSERT INTO sessions (id, title, source, workspace_kind, created_at, updated_at, total_cost_usd)
+        VALUES ('sess-subscription', 'Subscription session', 'desktop', 'dialogue', 1, 1, 0)
+      `);
+      await harness.storage.insert(schedule);
+      const got = await harness.storage.get(schedule.id);
+      expect(got?.providerId).toBeUndefined();
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('summarizes automation cost from scheduler turns instead of whole bound session cost', async () => {
+    const harness = createStorageHarness();
+    const schedule = baseSchedule({
+      id: 'sch-cost',
+      name: 'PR followup',
+      targetSessionId: 'sess-bound',
+    });
+
+    try {
+      harness.db.run(sql`
+        INSERT INTO sessions (id, title, source, workspace_kind, working_dir, created_at, updated_at, total_cost_usd)
+        VALUES ('sess-bound', 'Existing PR session', 'desktop', 'project', '/repo', 1, 1, 303.26)
+      `);
+      await harness.storage.insert(schedule);
+      await harness.storage.insertRun({
+        id: 'run-cost-1',
+        scheduleId: schedule.id,
+        sessionId: 'sess-bound',
+        firedAt: 10,
+        finishedAt: 40,
+        status: 'success',
+      });
+
+      harness.db.run(sql`
+        INSERT INTO messages (id, client_id, session_id, role, content, agent_meta, created_at, rewind_at)
+        VALUES
+          ('m1', 'm1', 'sess-bound', 'assistant', '{}', '{"turnCostUsd":123.45}', 1, NULL),
+          ('z-user', 'z-user', 'sess-bound', 'user', '{}', '{"origin":{"kind":"scheduler","scheduleId":"sch-cost","scheduleName":"PR followup"}}', 10, NULL),
+          ('a-assistant', 'a-assistant', 'sess-bound', 'assistant', '{}', '{"turnCostUsd":0.42}', 10, NULL),
+          ('m4', 'm4', 'sess-bound', 'assistant', '{}', '{"turnCostUsd":0.08}', 30, NULL),
+          ('m4-estimate', 'm4-estimate', 'sess-bound', 'assistant', '{}', '{"turnCostUsd":9.99,"turnCostIsEstimate":true}', 35, NULL),
+          ('rewound-user', 'rewound-user', 'sess-bound', 'user', '{}', '{"origin":{"kind":"scheduler","scheduleId":"sch-cost","scheduleName":"PR followup"}}', 36, 60),
+          ('rewound-assistant', 'rewound-assistant', 'sess-bound', 'assistant', '{}', '{"turnCostUsd":0.25}', 37, 60),
+          ('m5', 'm5', 'sess-bound', 'user', '{}', NULL, 40, NULL),
+          ('m6', 'm6', 'sess-bound', 'assistant', '{}', '{"turnCostUsd":44}', 50, NULL)
+      `);
+
+      await expect(harness.storage.listCostSummaries()).resolves.toEqual([
+        {
+          scheduleId: schedule.id,
+          totalMoney: actualMoneyFromLegacyUsd(0.75),
+          totalEstimatedValueMoney: estimatedMoneyFromLegacyUsd(9.99),
+          totalCostUsd: expect.closeTo(0.75, 10),
+          totalEstimatedValueUsd: expect.closeTo(9.99, 10),
+          sessionCount: 1,
+          sessions: [
+            {
+              sessionId: 'sess-bound',
+              totalMoney: actualMoneyFromLegacyUsd(0.75),
+              totalEstimatedValueMoney: estimatedMoneyFromLegacyUsd(9.99),
+              totalCostUsd: expect.closeTo(0.75, 10),
+              totalEstimatedValueUsd: expect.closeTo(9.99, 10),
+            },
+          ],
+        },
+      ]);
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('summarizes subscription value separately from billable cost', async () => {
+    const harness = createStorageHarness();
+    const schedule = baseSchedule({ id: 'sch-subscription', targetSessionId: 'sess-subscription' });
+    try {
+      harness.db.run(sql`
+        INSERT INTO sessions (id, title, source, workspace_kind, created_at, updated_at, total_cost_usd)
+        VALUES ('sess-subscription', 'Subscription session', 'desktop', 'dialogue', 1, 1, 0)
+      `);
+      await harness.storage.insert(schedule);
+      await harness.storage.insertRun({
+        id: 'run-subscription',
+        scheduleId: schedule.id,
+        sessionId: 'sess-subscription',
+        firedAt: 10,
+        finishedAt: 20,
+        status: 'success',
+      });
+      harness.db.run(sql`
+        INSERT INTO messages (id, client_id, session_id, role, content, agent_meta, created_at)
+        VALUES
+          ('subscription-user', 'subscription-user', 'sess-subscription', 'user', '{}',
+            '{"origin":{"kind":"scheduler","scheduleId":"sch-subscription"}}', 10),
+          ('subscription-assistant', 'subscription-assistant', 'sess-subscription', 'assistant', '{}',
+            '{"turnCostUsd":0.29,"turnCostIsEstimate":true}', 11)
+      `);
+
+      await expect(harness.storage.listCostSummaries()).resolves.toEqual([
+        {
+          scheduleId: schedule.id,
+          totalMoney: ZERO_ACTUAL_MONEY,
+          totalEstimatedValueMoney: estimatedMoneyFromLegacyUsd(0.29),
+          totalCostUsd: 0,
+          totalEstimatedValueUsd: expect.closeTo(0.29, 10),
+          sessionCount: 1,
+          sessions: [
+            {
+              sessionId: 'sess-subscription',
+              totalMoney: ZERO_ACTUAL_MONEY,
+              totalEstimatedValueMoney: estimatedMoneyFromLegacyUsd(0.29),
+              totalCostUsd: 0,
+              totalEstimatedValueUsd: expect.closeTo(0.29, 10),
+            },
+          ],
+        },
+      ]);
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('keeps API cost in the billable field', async () => {
+    const harness = createStorageHarness();
+    const schedule = baseSchedule({ id: 'sch-api', targetSessionId: 'sess-api' });
+    try {
+      harness.db.run(sql`
+        INSERT INTO sessions (id, title, source, workspace_kind, created_at, updated_at, total_cost_usd)
+        VALUES ('sess-api', 'API session', 'desktop', 'dialogue', 1, 1, 0)
+      `);
+      await harness.storage.insert(schedule);
+      await harness.storage.insertRun({
+        id: 'run-api',
+        scheduleId: schedule.id,
+        sessionId: 'sess-api',
+        firedAt: 10,
+        finishedAt: 20,
+        status: 'success',
+      });
+      harness.db.run(sql`
+        INSERT INTO messages (id, client_id, session_id, role, content, agent_meta, created_at)
+        VALUES
+          ('api-user', 'api-user', 'sess-api', 'user', '{}',
+            '{"origin":{"kind":"scheduler","scheduleId":"sch-api"}}', 10),
+          ('api-assistant', 'api-assistant', 'sess-api', 'assistant', '{}',
+            '{"turnCostUsd":0.42}', 11)
+      `);
+
+      await expect(harness.storage.listCostSummaries()).resolves.toEqual([
+        {
+          scheduleId: schedule.id,
+          totalMoney: actualMoneyFromLegacyUsd(0.42),
+          totalEstimatedValueMoney: ZERO_ESTIMATED_MONEY,
+          totalCostUsd: expect.closeTo(0.42, 10),
+          totalEstimatedValueUsd: 0,
+          sessionCount: 1,
+          sessions: [
+            {
+              sessionId: 'sess-api',
+              totalMoney: actualMoneyFromLegacyUsd(0.42),
+              totalEstimatedValueMoney: ZERO_ESTIMATED_MONEY,
+              totalCostUsd: expect.closeTo(0.42, 10),
+              totalEstimatedValueUsd: 0,
+            },
+          ],
+        },
+      ]);
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('includes direct run ledger costs when no assistant message can carry origin', async () => {
+    const harness = createStorageHarness();
+    const schedule = baseSchedule({ id: 'sch-direct', targetSessionId: 'sess-direct' });
+    try {
+      harness.db.run(sql`
+        INSERT INTO sessions (id, title, source, workspace_kind, created_at, updated_at, total_cost_usd)
+        VALUES ('sess-direct', 'Direct cost session', 'desktop', 'dialogue', 1, 1, 0.42)
+      `);
+      await harness.storage.insert(schedule);
+      await harness.storage.insertRun({
+        id: 'run-direct',
+        scheduleId: schedule.id,
+        sessionId: 'sess-direct',
+        firedAt: 10,
+        finishedAt: 20,
+        status: 'success',
+        costUsd: 0.42,
+        costAttribution: 'exact',
+      });
+
+      await expect(harness.storage.listCostSummaries()).resolves.toEqual([
+        {
+          scheduleId: schedule.id,
+          totalMoney: actualMoneyFromLegacyUsd(0.42),
+          totalEstimatedValueMoney: ZERO_ESTIMATED_MONEY,
+          totalCostUsd: expect.closeTo(0.42, 10),
+          totalEstimatedValueUsd: 0,
+          sessionCount: 1,
+          sessions: [
+            {
+              sessionId: 'sess-direct',
+              totalMoney: actualMoneyFromLegacyUsd(0.42),
+              totalEstimatedValueMoney: ZERO_ESTIMATED_MONEY,
+              totalCostUsd: expect.closeTo(0.42, 10),
+              totalEstimatedValueUsd: 0,
+            },
+          ],
+        },
+      ]);
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('accumulates multiple direct run ledger segments', async () => {
+    const harness = createStorageHarness();
+    const schedule = baseSchedule({ id: 'sch-direct-segments' });
+    const dbClient = { drizzle: harness.db } as unknown as DbClient;
+    try {
+      await harness.storage.insert(schedule);
+      await harness.storage.insertRun({
+        id: 'run-direct-segments',
+        scheduleId: schedule.id,
+        firedAt: 10,
+        finishedAt: 20,
+        status: 'success',
+        costAttribution: 'unavailable',
+      });
+      setCurrentDbClient(dbClient, 'test-user');
+
+      await recordScheduleRunCostDirect({
+        runId: 'run-direct-segments',
+        money: { amount: 0.42, currency: 'CNY', approximate: false, kind: 'actual-cost' },
+      });
+      await recordScheduleRunCostDirect({
+        runId: 'run-direct-segments',
+        money: { amount: 0.18, currency: 'CNY', approximate: false, kind: 'actual-cost' },
+      });
+      await recordScheduleRunCostDirect({
+        runId: 'run-direct-segments',
+        money: { amount: 0, currency: 'CNY', approximate: false, kind: 'actual-cost' },
+      });
+
+      await expect(harness.storage.listRuns(schedule.id)).resolves.toEqual([
+        expect.objectContaining({
+          id: 'run-direct-segments',
+          costMoney: {
+            amount: expect.closeTo(0.6, 10),
+            currency: 'CNY',
+            approximate: false,
+            kind: 'actual-cost',
+          },
+          costAttribution: 'direct',
+        }),
+      ]);
+    } finally {
+      clearCurrentDbClient(dbClient);
+      harness.close();
+    }
+  });
+
+  it('keeps direct ledger remainder when a run also has message costs', async () => {
+    const harness = createStorageHarness();
+    const schedule = baseSchedule({ id: 'sch-mixed-ledger', targetSessionId: 'sess-mixed-ledger' });
+    try {
+      harness.db.run(sql`
+        INSERT INTO sessions (id, title, source, workspace_kind, created_at, updated_at, total_cost_usd)
+        VALUES ('sess-mixed-ledger', 'Mixed ledger session', 'desktop', 'dialogue', 1, 1, 0)
+      `);
+      await harness.storage.insert(schedule);
+      await harness.storage.insertRun({
+        id: 'run-mixed-ledger',
+        scheduleId: schedule.id,
+        sessionId: 'sess-mixed-ledger',
+        firedAt: 10,
+        finishedAt: 20,
+        status: 'success',
+        costUsd: 0.6,
+        costAttribution: 'mixed',
+      });
+      harness.db.run(sql`
+        INSERT INTO messages (id, client_id, session_id, role, content, agent_meta, created_at)
+        VALUES
+          ('mixed-user', 'mixed-user', 'sess-mixed-ledger', 'user', '{}',
+            '{"origin":{"kind":"scheduler","scheduleId":"sch-mixed-ledger","runId":"run-mixed-ledger"}}', 10),
+          ('mixed-assistant', 'mixed-assistant', 'sess-mixed-ledger', 'assistant', '{}',
+            '{"origin":{"kind":"scheduler","scheduleId":"sch-mixed-ledger","runId":"run-mixed-ledger"},"turnCostUsd":0.42}', 11)
+      `);
+
+      await expect(harness.storage.listCostSummaries()).resolves.toEqual([
+        {
+          scheduleId: schedule.id,
+          totalMoney: actualMoneyFromLegacyUsd(0.6),
+          totalEstimatedValueMoney: ZERO_ESTIMATED_MONEY,
+          totalCostUsd: expect.closeTo(0.6, 10),
+          totalEstimatedValueUsd: 0,
+          sessionCount: 1,
+          sessions: [
+            {
+              sessionId: 'sess-mixed-ledger',
+              totalMoney: actualMoneyFromLegacyUsd(0.6),
+              totalEstimatedValueMoney: ZERO_ESTIMATED_MONEY,
+              totalCostUsd: expect.closeTo(0.6, 10),
+              totalEstimatedValueUsd: 0,
+            },
+          ],
+        },
+      ]);
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('merges direct-only snapshot with a later message ledger update', async () => {
+    const harness = createStorageHarness();
+    const schedule = baseSchedule({
+      id: 'sch-direct-only-snapshot',
+      targetSessionId: 'sess-direct-only',
+    });
+    const dbClient = { drizzle: harness.db } as unknown as DbClient;
+    try {
+      harness.db.run(sql`
+        INSERT INTO sessions (id, title, source, workspace_kind, created_at, updated_at, total_cost_usd)
+        VALUES ('sess-direct-only', 'Direct-only snapshot session', 'desktop', 'dialogue', 1, 1, 0)
+      `);
+      await harness.storage.insert(schedule);
+      await harness.storage.insertRun({
+        id: 'run-direct-only-snapshot',
+        scheduleId: schedule.id,
+        sessionId: 'sess-direct-only',
+        firedAt: 10,
+        finishedAt: 20,
+        status: 'success',
+        costAttribution: 'unavailable',
+      });
+      setCurrentDbClient(dbClient, 'test-user');
+      await recordScheduleRunCostDirect({
+        runId: 'run-direct-only-snapshot',
+        money: {
+          amount: 0.6,
+          currency: 'USD',
+          approximate: false,
+          kind: 'actual-cost',
+        },
+      });
+      harness.db.run(sql`
+        INSERT INTO messages (id, client_id, session_id, role, content, agent_meta, created_at)
+        VALUES
+          ('direct-only-user', 'direct-only-user', 'sess-direct-only', 'user', '{}',
+            '{"origin":{"kind":"scheduler","scheduleId":"sch-direct-only-snapshot","runId":"run-direct-only-snapshot"}}', 10),
+          ('direct-only-assistant', 'direct-only-assistant', 'sess-direct-only', 'assistant', '{}',
+            '{"origin":{"kind":"scheduler","scheduleId":"sch-direct-only-snapshot","runId":"run-direct-only-snapshot"},"turnCostUsd":0.4}', 11)
+      `);
+
+      await expect(harness.storage.listRuns(schedule.id)).resolves.toEqual([
+        expect.objectContaining({
+          id: 'run-direct-only-snapshot',
+          costMoney: actualMoneyFromLegacyUsd(1),
+          costAttribution: 'exact',
+        }),
+      ]);
+      await expect(harness.storage.listCostSummaries()).resolves.toEqual([
+        {
+          scheduleId: schedule.id,
+          totalMoney: actualMoneyFromLegacyUsd(1),
+          totalEstimatedValueMoney: ZERO_ESTIMATED_MONEY,
+          totalCostUsd: expect.closeTo(1, 10),
+          totalEstimatedValueUsd: 0,
+          sessionCount: 1,
+          sessions: [
+            {
+              sessionId: 'sess-direct-only',
+              totalMoney: actualMoneyFromLegacyUsd(1),
+              totalEstimatedValueMoney: ZERO_ESTIMATED_MONEY,
+              totalCostUsd: expect.closeTo(1, 10),
+              totalEstimatedValueUsd: 0,
+            },
+          ],
+        },
+      ]);
+    } finally {
+      clearCurrentDbClient(dbClient);
+      harness.close();
+    }
+  });
+
+  it('marks runs with no reliable pricing as unavailable instead of zero', async () => {
+    const harness = createStorageHarness();
+    const schedule = baseSchedule({ id: 'sch-unavailable', targetSessionId: 'sess-unavailable' });
+    try {
+      harness.db.run(sql`
+        INSERT INTO sessions (id, title, source, workspace_kind, created_at, updated_at, total_cost_usd)
+        VALUES ('sess-unavailable', 'Unavailable cost session', 'desktop', 'dialogue', 1, 1, 0)
+      `);
+      await harness.storage.insert(schedule);
+      await harness.storage.insertRun({
+        id: 'run-unavailable',
+        scheduleId: schedule.id,
+        sessionId: 'sess-unavailable',
+        firedAt: 10,
+        finishedAt: 20,
+        status: 'success',
+        costAttribution: 'unavailable',
+      });
+
+      await expect(harness.storage.listCostSummaries()).resolves.toEqual([
+        {
+          scheduleId: schedule.id,
+          totalMoney: ZERO_ACTUAL_MONEY,
+          totalEstimatedValueMoney: ZERO_ESTIMATED_MONEY,
+          totalCostUsd: 0,
+          totalEstimatedValueUsd: 0,
+          hasUnavailableCost: true,
+          sessionCount: 1,
+          sessions: [
+            {
+              sessionId: 'sess-unavailable',
+              totalMoney: ZERO_ACTUAL_MONEY,
+              totalEstimatedValueMoney: ZERO_ESTIMATED_MONEY,
+              totalCostUsd: 0,
+              totalEstimatedValueUsd: 0,
+            },
+          ],
+        },
+      ]);
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('keeps a confirmed zero-cost run distinct from unavailable pricing', async () => {
+    const harness = createStorageHarness();
+    const schedule = baseSchedule({ id: 'sch-zero', executionMode: 'script' });
+    try {
+      await harness.storage.insert(schedule);
+      await harness.storage.insertRun({
+        id: 'run-zero',
+        scheduleId: schedule.id,
+        firedAt: 10,
+        finishedAt: 20,
+        status: 'success',
+        costAttribution: 'zero',
+      });
+
+      await expect(harness.storage.listCostSummaries()).resolves.toEqual([
+        {
+          scheduleId: schedule.id,
+          totalMoney: ZERO_ACTUAL_MONEY,
+          totalEstimatedValueMoney: ZERO_ESTIMATED_MONEY,
+          totalCostUsd: 0,
+          totalEstimatedValueUsd: 0,
+          sessionCount: 0,
+          sessions: [],
+        },
+      ]);
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('preserves legacy baseline when a scheduler session later gains turn costs', async () => {
+    const harness = createStorageHarness();
+    const schedule = baseSchedule({
+      id: 'sch-mixed',
+      name: 'legacy task',
+      workspaceKind: 'project',
+      workingDir: '/repo',
+      persistentSession: true,
+      targetSessionId: 'sess-legacy',
+    });
+
+    try {
+      harness.db.run(sql`
+        INSERT INTO sessions (id, title, source, workspace_kind, working_dir, created_at, updated_at, total_cost_usd)
+        VALUES ('sess-legacy', '[Schedule] legacy task', 'scheduler', 'project', '/repo', 1, 60, 4.25)
+      `);
+      await harness.storage.insert(schedule);
+      enableLegacySessionFallback(harness, schedule.id);
+      harness.db.run(sql`
+        INSERT INTO messages (id, client_id, session_id, role, content, agent_meta, created_at)
+        VALUES
+          ('mixed-user', 'mixed-user', 'sess-legacy', 'user', '{}', '{"origin":{"kind":"scheduler","scheduleId":"sch-mixed","scheduleName":"legacy task"}}', 40),
+          ('mixed-assistant', 'mixed-assistant', 'sess-legacy', 'assistant', '{}', '{"turnCostUsd":1.25}', 50),
+          ('structured-assistant', 'structured-assistant', 'sess-legacy', 'assistant', '{}', '{"turnCost":{"amount":5,"currency":"USD","approximate":false,"kind":"actual-cost"}}', 52),
+          ('manual-user', 'manual-user', 'sess-legacy', 'user', '{}', NULL, 55),
+          ('manual-assistant', 'manual-assistant', 'sess-legacy', 'assistant', '{}', '{"turnCostUsd":2}', 60)
+      `);
+
+      await expect(harness.storage.listCostSummaries()).resolves.toEqual([
+        {
+          scheduleId: schedule.id,
+          totalMoney: {
+            ...actualMoneyFromLegacyUsd(2.25),
+            amount: expect.closeTo(2.25 + 5, 10),
+          },
+          totalEstimatedValueMoney: ZERO_ESTIMATED_MONEY,
+          totalCostUsd: expect.closeTo(2.25 + 5, 10),
+          totalEstimatedValueUsd: 0,
+          sessionCount: 1,
+          sessions: [
+            {
+              sessionId: 'sess-legacy',
+              totalMoney: {
+                ...actualMoneyFromLegacyUsd(2.25),
+                amount: expect.closeTo(2.25 + 5, 10),
+              },
+              totalEstimatedValueMoney: ZERO_ESTIMATED_MONEY,
+              totalCostUsd: expect.closeTo(2.25 + 5, 10),
+              totalEstimatedValueUsd: 0,
+            },
+          ],
+        },
+      ]);
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('subtracts post-metadata manual costs from unlinked legacy sessions', async () => {
+    const harness = createStorageHarness();
+    const schedule = baseSchedule({
+      id: 'sch-unlinked',
+      name: 'unlinked legacy',
+      workspaceKind: 'project',
+      workingDir: '/repo',
+      persistentSession: true,
+    });
+
+    try {
+      harness.db.run(sql`
+        INSERT INTO sessions (id, title, source, workspace_kind, working_dir, created_at, updated_at, total_cost_usd)
+        VALUES ('sess-unlinked', '[Schedule] unlinked legacy', 'scheduler', 'project', '/repo', 1, 60, 3.5)
+      `);
+      await harness.storage.insert(schedule);
+      enableLegacySessionFallback(harness, schedule.id);
+
+      harness.db.run(sql`
+        INSERT INTO messages (id, client_id, session_id, role, content, agent_meta, created_at)
+        VALUES
+          ('unlinked-manual-user', 'unlinked-manual-user', 'sess-unlinked', 'user', '{}', NULL, 40),
+          ('unlinked-manual-assistant', 'unlinked-manual-assistant', 'sess-unlinked', 'assistant', '{}', '{"turnCostUsd":2}', 50)
+      `);
+
+      await expect(harness.storage.listCostSummaries()).resolves.toEqual([
+        {
+          scheduleId: schedule.id,
+          totalMoney: actualMoneyFromLegacyUsd(1.5),
+          totalEstimatedValueMoney: ZERO_ESTIMATED_MONEY,
+          totalCostUsd: expect.closeTo(1.5, 10),
+          totalEstimatedValueUsd: 0,
+          sessionCount: 1,
+          sessions: [
+            {
+              sessionId: 'sess-unlinked',
+              totalMoney: actualMoneyFromLegacyUsd(1.5),
+              totalEstimatedValueMoney: ZERO_ESTIMATED_MONEY,
+              totalCostUsd: expect.closeTo(1.5, 10),
+              totalEstimatedValueUsd: 0,
+            },
+          ],
+        },
+      ]);
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('does not attach retained legacy sessions to a deleted and recreated same-name schedule', async () => {
+    const harness = createStorageHarness();
+    const oldSchedule = baseSchedule({
+      id: 'sch-old-generation',
+      name: 'weekly summary',
+      workingDir: '/repo',
+    });
+    const newSchedule = baseSchedule({
+      id: 'sch-new-generation',
+      name: oldSchedule.name,
+      workingDir: oldSchedule.workingDir,
+      createdAt: oldSchedule.createdAt + 10_000,
+      updatedAt: oldSchedule.updatedAt + 10_000,
+    });
+
+    try {
+      await harness.storage.insert(oldSchedule);
+      // 模拟 0079 migration：升级时已经存在的任务保留 legacy fallback 资格。
+      enableLegacySessionFallback(harness, oldSchedule.id);
+      harness.db.run(sql`
+        INSERT INTO sessions (
+          id, title, source, workspace_kind, working_dir, created_at, updated_at, total_cost_usd
+        ) VALUES
+          (
+            'sess-old-retained', '[Schedule] weekly summary', 'scheduler', 'project', '/repo',
+            ${oldSchedule.createdAt + 1}, ${oldSchedule.createdAt + 2}, 4.25
+          ),
+          (
+            'sess-old-archived', '[Schedule] weekly summary', 'scheduler', 'project', '/repo',
+            ${oldSchedule.createdAt + 3}, ${oldSchedule.createdAt + 4}, 2.5
+          ),
+          (
+            'sess-old-deleted', '[Schedule] weekly summary', 'scheduler', 'project', '/repo',
+            ${oldSchedule.createdAt + 5}, ${oldSchedule.createdAt + 6}, 1.25
+          )
+      `);
+
+      expect((await harness.storage.listRuns(oldSchedule.id)).map((run) => run.sessionId)).toEqual(
+        expect.arrayContaining(['sess-old-retained', 'sess-old-archived', 'sess-old-deleted']),
+      );
+
+      // 分别模拟删除弹窗的三种会话处置：保留、归档、删除。
+      await harness.storage.delete(oldSchedule.id);
+      harness.db.run(sql`UPDATE sessions SET status = 'archived' WHERE id = 'sess-old-archived'`);
+      harness.db.run(sql`DELETE FROM sessions WHERE id = 'sess-old-deleted'`);
+      await harness.storage.insert(newSchedule);
+
+      await expect(harness.storage.listRuns(newSchedule.id)).resolves.toEqual([]);
+      expect(await harness.storage.listSidebarIndexRuns()).toEqual([]);
+      expect(await harness.storage.listCostSummaries()).toEqual([]);
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('keeps legacy sessions owned by the fallback schedule when a duplicate is added', async () => {
+    const harness = createStorageHarness();
+    const legacySchedule = baseSchedule({
+      id: 'sch-legacy-owner',
+      name: 'weekly summary',
+      workingDir: '/repo',
+    });
+    const duplicate = baseSchedule({
+      id: 'sch-new-duplicate',
+      name: legacySchedule.name,
+      workingDir: legacySchedule.workingDir,
+      createdAt: legacySchedule.createdAt + 10_000,
+      updatedAt: legacySchedule.updatedAt + 10_000,
+    });
+
+    try {
+      await harness.storage.insert(legacySchedule);
+      enableLegacySessionFallback(harness, legacySchedule.id);
+      harness.db.run(sql`
+        INSERT INTO sessions (
+          id, title, source, workspace_kind, working_dir, created_at, updated_at, total_cost_usd
+        ) VALUES (
+          'sess-legacy-owner', '[Schedule] weekly summary', 'scheduler', 'project', '/repo',
+          ${legacySchedule.createdAt + 1}, ${legacySchedule.createdAt + 2}, 4.25
+        )
+      `);
+      await harness.storage.insert(duplicate);
+
+      await expect(harness.storage.listRuns(legacySchedule.id)).resolves.toEqual([
+        expect.objectContaining({
+          scheduleId: legacySchedule.id,
+          sessionId: 'sess-legacy-owner',
+        }),
+      ]);
+      await expect(harness.storage.listRuns(duplicate.id)).resolves.toEqual([]);
+      await expect(harness.storage.listSidebarIndexRuns()).resolves.toEqual([
+        expect.objectContaining({
+          scheduleId: legacySchedule.id,
+          sessionId: 'sess-legacy-owner',
+        }),
+      ]);
+      await expect(harness.storage.listCostSummaries()).resolves.toEqual([
+        expect.objectContaining({
+          scheduleId: legacySchedule.id,
+          sessionCount: 1,
+        }),
+      ]);
+    } finally {
+      harness.close();
+    }
+  });
+});
+
+it('excludes internal routine rows in SQLite before materializing the public sidebar index', async () => {
+  const queries: { query: string; params: unknown[] }[] = [];
+  const harness = createStorageHarness(queries);
+  try {
+    for (const id of ['public', 'legacy', 'routine-owned']) {
+      await harness.storage.insert(baseSchedule({ id, source: id === 'routine-owned' ? 'bot' : 'user' }));
+      harness.db.run(sql`INSERT INTO sessions (id, title) VALUES (${id}, ${id})`);
+      await harness.storage.insertRun({ id: `${id}-failed`, scheduleId: id, sessionId: id, firedAt: 1, status: 'failed', readAt: 2 });
+      await harness.storage.insertRun({ id: `${id}-running`, scheduleId: id, sessionId: id, firedAt: 2, status: 'running' });
+      await harness.storage.insertRun({ id: `${id}-latest`, scheduleId: id, sessionId: id, firedAt: 3, status: 'success', readAt: 4 });
+    }
+    harness.db.run(sql`UPDATE schedules SET source = NULL WHERE id = 'legacy'`);
+    for (let i = 0; i < 128; i++) {
+      await harness.storage.insertRun({ id: `routine-unread-${i}`, scheduleId: 'routine-owned', sessionId: 'routine-owned', firedAt: i + 4, status: 'success' });
+    }
+    queries.length = 0;
+    const runs = await harness.storage.listSidebarIndexRuns();
+    expect(new Set(runs.map((run) => run.scheduleId))).toEqual(new Set(['public', 'legacy']));
+
+    // Execute the captured SQL directly: a final JS filter alone cannot pass this assertion.
+    const indexQueries = queries.filter(({ query }) =>
+      query.startsWith('select "schedule_runs"."id", "schedules"."id",'),
+    );
+    expect(indexQueries).toHaveLength(4);
+    for (const { query, params } of indexQueries) {
+      const rows = harness.sqlite.prepare(query).all(...params) as { source: string | null }[];
+      expect(rows.every((row) => row.source !== 'bot')).toBe(true);
+    }
+    expect(await harness.storage.listRuns('routine-owned', 131)).toHaveLength(131);
+  } finally {
+    harness.close();
+  }
+});
+
+it('excludes internal routine history from public indexes, unread counts and deletion', async () => {
+  const harness = createStorageHarness();
+  try {
+    await harness.storage.insert(baseSchedule({ id: 'public' }));
+    await harness.storage.insert(baseSchedule({ id: 'routine-owned', source: 'bot', manual: true }));
+    await harness.storage.insertRun({ id: 'public-run', scheduleId: 'public', firedAt: 1, finishedAt: 2, status: 'success' });
+    await harness.storage.insertRun({ id: 'routine-run', scheduleId: 'routine-owned', firedAt: 1, finishedAt: 2, status: 'success' });
+    expect((await harness.storage.listSidebarIndexRuns()).map((run) => run.runId)).toEqual(['public-run']);
+    expect(await harness.storage.getUnreadRunCount()).toBe(1);
+    await expect(harness.storage.deleteRun('routine-run', { excludeBotSchedules: true })).resolves.toBeNull();
+    expect(await harness.storage.listRuns('routine-owned')).toHaveLength(1);
+    await harness.storage.markAllUnreadRuns();
+    expect(await harness.storage.getUnreadRunCount()).toBe(0);
+    expect((await harness.storage.listRuns('routine-owned'))[0].readAt).toBeUndefined();
+    await expect(harness.storage.deleteRun('routine-run')).resolves.toMatchObject({ id: 'routine-run' });
+    await expect(harness.storage.deleteRun('public-run', { excludeBotSchedules: true })).resolves.toMatchObject({ id: 'public-run' });
+  } finally {
+    harness.close();
+  }
+});
+
+
+it('bounds history chunk reads while preserving run costs and schedule totals', async () => {
+  const harness = createStorageHarness();
+  try {
+    await harness.storage.insert(baseSchedule());
+    const session = harness.sqlite.prepare("INSERT INTO sessions (id,title,source) VALUES (?, 'scheduled', 'scheduler')");
+    const run = harness.sqlite.prepare("INSERT INTO schedule_runs (id,schedule_id,session_id,fired_at,status,cost_attribution) VALUES (?, 'sch-1', ?, ?, 'success', 'exact')");
+    const message = harness.sqlite.prepare("INSERT INTO messages (id,client_id,session_id,role,content,agent_meta,created_at) VALUES (?, ?, ?, 'assistant', '{}', ?, 1)");
+    harness.sqlite.transaction(() => {
+      for (let i = 0; i < 1001; i++) {
+        const id = `s-${i}`;
+        const runId = `r-${i}`;
+        session.run(id);
+        run.run(runId, id, i);
+        message.run(id, id, id, JSON.stringify({ origin: { kind: 'scheduler', scheduleId: 'sch-1', runId }, turnCostUsd: 1 }));
+      }
+    })();
+    let active = 0;
+    let peak = 0;
+    let messageReads = 0;
+    const transport: DbTransport = {
+      async send<R>(op: string, args: unknown): Promise<R> {
+        if (op !== 'rawAll') throw new Error(`unexpected read operation: ${op}`);
+        const { sql, params } = args as { sql: string; params: unknown[] };
+        peak = Math.max(peak, ++active);
+        if (sql.includes('from "messages"')) messageReads++;
+        try {
+          const rows = harness.sqlite.prepare(sql).raw().all(...params);
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          return rows as R;
+        } finally { active--; }
+      },
+      on() {}, onTerminated() {}, async close() {},
+    };
+    const storage = new DrizzleScheduleStorage(() => createDrizzleProxy(transport) as SchedulerDrizzleDb);
+    const runs = await storage.listRuns('sch-1', 1001);
+    expect(runs).toHaveLength(1001);
+    for (const run of runs) expect(run.costMoney).toEqual(actualMoneyFromLegacyUsd(1));
+    expect(messageReads).toBe(3);
+    expect(peak).toBe(1);
+    peak = messageReads = 0;
+    const summaries = await storage.listCostSummaries();
+    expect(summaries).toHaveLength(1);
+    expect(summaries[0]).toMatchObject({ sessionCount: 1001, totalMoney: actualMoneyFromLegacyUsd(1001) });
+    expect(messageReads).toBe(3);
+    expect(peak).toBe(1);
+  } finally { harness.close(); }
+});
+
+
+it('deduplicates only identical unrecovered failures across persistent history', async () => {
+  const h = createStorageHarness();
+  try {
+    await h.storage.insert(baseSchedule());
+    const failed: ScheduleRun = { id: 'failure', scheduleId: 'sch-1', firedAt: 1, status: 'failed', errorMsg: 'pre-run hook failed with exit code 1' };
+    await h.storage.insertRun(failed);
+    const next = { ...failed, id: 'next', firedAt: 1000 };
+    expect(await h.storage.hasUnrecoveredMatchingFailure(failed)).toBe(false);
+    expect(await h.storage.hasUnrecoveredMatchingFailure(next)).toBe(true);
+    expect(await h.storage.hasUnrecoveredMatchingFailure({ ...next, errorMsg: 'different failure' })).toBe(false);
+    expect(await h.storage.hasUnrecoveredMatchingFailure({ ...next, scheduleId: 'another' })).toBe(false);
+    // More than a UI page of skipped/backoff checks must not reset the error fingerprint.
+    for (let i = 2; i < 65; i++) await h.storage.insertRun({ id: `skip-${i}`, scheduleId: 'sch-1', firedAt: i, status: 'skipped' });
+    expect(await h.storage.hasUnrecoveredMatchingFailure(next)).toBe(true);
+    await h.storage.insertRun({ id: 'healthy', scheduleId: 'sch-1', firedAt: 66, status: 'skipped', preRunHookResult: {
+      status: 'skipped', decision: 'skip', exitCode: 2, timedOut: false, aborted: false, checkSucceeded: true, durationMs: 1, stdout: 'CINDY_PRECHECK_OK', stderr: '', stdoutTruncated: false, stderrTruncated: false,
+    } });
+    expect(await h.storage.hasUnrecoveredMatchingFailure(next)).toBe(false);
+    await h.storage.insertRun({ ...failed, id: 'execution', firedAt: 67, errorMsg: 'model unavailable' });
+    await h.storage.insertRun({ id: 'recovered', scheduleId: 'sch-1', firedAt: 68, status: 'success' });
+    expect(await h.storage.hasUnrecoveredMatchingFailure({ ...next, errorMsg: 'model unavailable' })).toBe(false);
+  } finally { h.close(); }
+});
+
+// 心跳持续权限失配：引擎把失败与放行的 gate 结果写进同一条 run，runner 的失败通知
+// 也必须带同一份 gate 结果，否则 stderr 不同会让每一轮都重新通知。
+it('deduplicates a persistent permission mismatch until the heartbeat succeeds', async () => {
+  const h = createStorageHarness();
+  try {
+    await h.storage.insert(baseSchedule());
+    const gate = {
+      status: 'passed', decision: 'run', exitCode: 0, timedOut: false, aborted: false, checkSucceeded: true,
+      durationMs: 1, stdout: 'CINDY_PRECHECK_OK', stderr: 'gate warning on stderr', stdoutTruncated: false, stderrTruncated: false,
+    } as unknown as NonNullable<ScheduleRun['preRunHookResult']>;
+    const errorMsg = '[SCHEDULED_TASK_PERMISSION_MISMATCH] The bound task task-1 is saved as auto, Plan off but its running session uses bypassPermissions, Plan off; the heartbeat was not dispatched. It runs again once the task runs with its saved setting.';
+    // 第一次告警：此前没有同样的失败，通知照发。
+    const first: ScheduleRun = { id: 'mismatch-1', scheduleId: 'sch-1', firedAt: 10, status: 'failed', errorMsg, preRunHookResult: gate };
+    expect(await h.storage.hasUnrecoveredMatchingFailure(first)).toBe(false);
+    await h.storage.insertRun(first);
+    // 下一轮同样失配：runner 通知时的 run 尚未落库，按同文案同 gate 结果命中去重。
+    const second: ScheduleRun = { ...first, id: 'mismatch-2', firedAt: 20 };
+    expect(await h.storage.hasUnrecoveredMatchingFailure(second)).toBe(true);
+    // 不带 gate 结果的通知对不上 stderr，去重失效（这就是 runner 要带上它的原因）。
+    expect(await h.storage.hasUnrecoveredMatchingFailure({ ...second, preRunHookResult: undefined })).toBe(false);
+    await h.storage.insertRun(second);
+    // gate 跳过（无变化）不算恢复：执行类失败只认 success。
+    await h.storage.insertRun({ id: 'idle-skip', scheduleId: 'sch-1', firedAt: 25, status: 'skipped', preRunHookResult: { ...gate, status: 'skipped', decision: 'skip', exitCode: 2 } as never });
+    expect(await h.storage.hasUnrecoveredMatchingFailure({ ...first, id: 'mismatch-3', firedAt: 30 })).toBe(true);
+    // 真实恢复：一次成功执行之后，再出现同样的失配重新通知。
+    await h.storage.insertRun({ id: 'recovered', scheduleId: 'sch-1', firedAt: 40, status: 'success' });
+    expect(await h.storage.hasUnrecoveredMatchingFailure({ ...first, id: 'mismatch-4', firedAt: 50 })).toBe(false);
+  } finally { h.close(); }
+});

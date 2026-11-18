@@ -1,0 +1,846 @@
+import type { ScheduledModelSelection } from '../../maker-ipc/scheduledModelSelection';
+import { describe, expect, it, vi, beforeEach, onTestFinished } from 'vitest';
+
+import type {
+  AgentEvent,
+  Maker,
+  Session,
+  SessionSendResult,
+} from '@cindy/maker-core';
+import type {
+  FireContext,
+  Logger,
+  Notifier,
+  Schedule,
+  ScheduleRun,
+} from '@cindy/maker-scheduler';
+
+const mocks = vi.hoisted(() => ({
+  createMessage: vi.fn(),
+  getSessionRowSnapshot: vi.fn(),
+  restoreArchivedSessionForSend: vi.fn(),
+  ensureDialogueWorkspaceDir: vi.fn(),
+  wireSessionToIpc: vi.fn(),
+  isSessionInTurn: vi.fn(() => false),
+  resolveWorkingDir: vi.fn(),
+  backfillSessionMeta: vi.fn(),
+}));
+
+vi.mock('../../localDb/ipc/messages.js', () => ({
+  createMessage: mocks.createMessage,
+}));
+
+vi.mock('../../localDb/ipc/sessions.js', () => ({
+  getSessionRowSnapshot: mocks.getSessionRowSnapshot,
+  restoreArchivedSessionForSend: mocks.restoreArchivedSessionForSend,
+  touchUserSendInDb: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock('../../localDb/dialogueWorkspace', () => ({
+  ensureDialogueWorkspaceDir: mocks.ensureDialogueWorkspaceDir,
+}));
+
+vi.mock('../../maker-ipc/register.js', () => ({
+  wireSessionToIpc: mocks.wireSessionToIpc,
+  isSessionInTurn: mocks.isSessionInTurn,
+  noteSilentStopUserSend: vi.fn(),
+  onSilentStopSettled: vi.fn(() => () => {}),
+}));
+
+vi.mock('../workdir-resolver', () => ({
+  resolveWorkingDir: mocks.resolveWorkingDir,
+}));
+
+vi.mock('../runners/_shared', () => ({
+  backfillSessionMeta: mocks.backfillSessionMeta,
+}));
+
+import { MakerScheduleRunner } from '../runner.desktop';
+import { ScheduledModelSelectionBusyError } from '../../maker-ipc/scheduledModelSelection';
+import { isHeadlessGhostSetupTurn } from '../../mcp-integrations/ghostSetupInteractionSurface';
+
+type SessionSendOptions = Parameters<Session['send']>[1];
+type SendImpl = (
+  message: Parameters<Session['send']>[0],
+  opts?: SessionSendOptions,
+) => Promise<SessionSendResult>;
+
+interface FakeSessionHarness {
+  session: Session;
+  send: ReturnType<typeof vi.fn<SendImpl>>;
+  off: ReturnType<typeof vi.fn>;
+  emit(event: AgentEvent): void;
+  listenerCount(): number;
+}
+
+function createSessionHarness(sendImpl: SendImpl): FakeSessionHarness {
+  const listeners: Array<(event: AgentEvent) => void> = [];
+  const off = vi.fn(() => {
+    listeners.splice(0, listeners.length);
+  });
+  const send = vi.fn<SendImpl>(sendImpl);
+  const session = {
+    id: 'scheduler-session',
+    agentKind: 'codex',
+    send,
+    onEvent(listener: (event: AgentEvent) => void) {
+      listeners.push(listener);
+      return off;
+    },
+    abort: vi.fn(async () => undefined),
+    close: vi.fn(async () => undefined),
+  } as unknown as Session;
+
+  return {
+    session,
+    send,
+    off,
+    emit(event: AgentEvent) {
+      for (const listener of [...listeners]) listener(event);
+    },
+    listenerCount() {
+      return listeners.length;
+    },
+  };
+}
+
+function createLogger(): Logger & {
+  warn: ReturnType<typeof vi.fn>;
+  info: ReturnType<typeof vi.fn>;
+  debug: ReturnType<typeof vi.fn>;
+  error: ReturnType<typeof vi.fn>;
+} {
+  return {
+    warn: vi.fn(),
+    info: vi.fn(),
+    debug: vi.fn(),
+    error: vi.fn(),
+  };
+}
+
+function baseSchedule(overrides: Partial<Schedule> = {}): Schedule {
+  return {
+    id: 'schedule-1',
+    name: 'review-pr unattended run',
+    prompt: 'PROMPT_SECRET full user message TOKEN_VALUE file body',
+    jobType: 'prompt',
+    source: 'user',
+    kind: 'cron',
+    cronExpr: '0 9 * * *',
+    timezone: 'Asia/Hong_Kong',
+    recurring: true,
+    manual: false,
+    agentKind: 'codex',
+    // 留空模型要靠默认解析(本 harness 未接),这里显式给模型。
+    model: 'gpt-6-astra',
+    workspaceKind: 'project',
+    workingDir: 'F:\\XDMaker',
+    useWorktree: false,
+    notify: { desktop: true, feishu: false },
+    status: 'active',
+    createdAt: 1_700_000_000_000,
+    updatedAt: 1_700_000_000_000,
+    ...overrides,
+  };
+}
+
+function createFireContext(): FireContext & {
+  controller: AbortController;
+  removeAbortListener: ReturnType<typeof vi.spyOn>;
+} {
+  const abortController = new AbortController();
+  const removeAbortListener = vi.spyOn(abortController.signal, 'removeEventListener');
+  return {
+    runId: 'run-1',
+    firedAt: 1_700_000_000_100,
+    signal: abortController.signal,
+    controller: abortController,
+    onSessionBound: vi.fn(async () => undefined),
+    removeAbortListener,
+  };
+}
+
+function createRunnerHarness(
+  session: Session,
+  depsOverrides: Partial<ConstructorParameters<typeof MakerScheduleRunner>[0]> = {},
+) {
+  const logger = createLogger();
+  const notifier: Notifier & { notify: ReturnType<typeof vi.fn> } = {
+    notify: vi.fn(async () => undefined),
+  };
+  const maker = {
+    createSession: vi.fn(async () => session),
+    getSessionMeta: vi.fn(async () => null),
+    isSessionAlive: vi.fn(() => false),
+    closeSession: vi.fn(async () => undefined),
+    recyclePiRuntimeIfResourcesDrifted: vi.fn(async () => false),
+  } as unknown as Maker;
+  const runner = new MakerScheduleRunner({
+    maker,
+    getDb: () => ({}) as never,
+    notifier,
+    logger,
+    ...depsOverrides,
+  });
+  return { runner, logger, notifier, maker };
+}
+
+async function settleWithin<T>(
+  promise: Promise<T>,
+  ms = 50,
+): Promise<
+  | { status: 'resolved'; value: T }
+  | { status: 'rejected'; error: unknown }
+  | { status: 'timeout' }
+> {
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<{ status: 'timeout' }>((resolve) => {
+    timeoutId = setTimeout(() => resolve({ status: 'timeout' }), ms);
+  });
+  const result = await Promise.race([
+    promise.then(
+      (value) => ({ status: 'resolved' as const, value }),
+      (error) => ({ status: 'rejected' as const, error }),
+    ),
+    timeout,
+  ]);
+  if (timeoutId) clearTimeout(timeoutId);
+  return result;
+}
+
+function latestNotifiedRun(notifier: Notifier & { notify: ReturnType<typeof vi.fn> }): ScheduleRun {
+  return notifier.notify.mock.calls.at(-1)?.[1] as ScheduleRun;
+}
+
+function expectSafeSendFailureLog(
+  logger: ReturnType<typeof createLogger>,
+  expected: {
+    source: string;
+    reason: string;
+    action?: string;
+  },
+): void {
+  expect(logger.warn).toHaveBeenCalledWith(
+    '[runner] session send failed before dispatch',
+    expect.objectContaining({
+      kind: 'session-dispatch',
+      source: expected.source,
+      owner: 'scheduler-host',
+      entrypoint: 'scheduler-host.runner.fire',
+      sessionId: 'scheduler-session',
+      action: expected.action ?? 'send-user-prompt',
+      reason: expected.reason,
+      context: expect.stringContaining('scheduler-host.runner.fire'),
+    }),
+  );
+  const loggedPayload = JSON.stringify(logger.warn.mock.calls);
+  expect(loggedPayload).not.toContain('PROMPT_SECRET');
+  expect(loggedPayload).not.toContain('full user message');
+  expect(loggedPayload).not.toContain('TOKEN_VALUE');
+  expect(loggedPayload).not.toContain('file body');
+}
+
+describe('MakerScheduleRunner send outcome policy', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.createMessage.mockResolvedValue(undefined);
+    mocks.backfillSessionMeta.mockResolvedValue(undefined);
+    mocks.resolveWorkingDir.mockResolvedValue({ ok: true, path: 'F:\\XDMaker' });
+    mocks.isSessionInTurn.mockReturnValue(false);
+    mocks.getSessionRowSnapshot.mockResolvedValue({
+      status: 'active',
+    });
+  });
+
+  it('marks accepted:false scheduler runs failed without waiting for terminal events; review-pr inherits this runner policy', async () => {
+    const h = createSessionHarness(async () => ({
+      accepted: false,
+      reason: 'cancelled-before-dispatch',
+    }));
+    const { runner, logger, notifier } = createRunnerHarness(h.session);
+    const ctx = createFireContext();
+    const firePromise = runner.fire(baseSchedule(), ctx);
+
+    const settled = await settleWithin(firePromise);
+
+    expect(settled.status).toBe('rejected');
+    const run = latestNotifiedRun(notifier);
+    expect(run.status).toBe('failed');
+    expect(run.status).not.toBe('skipped');
+    expect(run.errorMsg).toContain('cancelled-before-dispatch');
+    expectSafeSendFailureLog(logger, {
+      source: 'scheduler-runner',
+      reason: 'cancelled-before-dispatch',
+    });
+    expect(h.off).toHaveBeenCalledTimes(1);
+    expect(ctx.removeAbortListener).toHaveBeenCalledTimes(1);
+    expect(h.session.close).not.toHaveBeenCalled();
+  });
+
+  it('treats a cancelled send result as an abort when the fire is cancelled', async () => {
+    const ctx = createFireContext();
+    const h = createSessionHarness(async () => {
+      ctx.controller.abort();
+      return { accepted: false, reason: 'cancelled-before-dispatch' };
+    });
+    const { runner, notifier } = createRunnerHarness(h.session);
+
+    await expect(runner.fire(baseSchedule(), ctx)).rejects.toThrow(/schedule fire aborted/);
+    expect(notifier.notify).not.toHaveBeenCalled();
+    expect(h.off).toHaveBeenCalledTimes(1);
+    expect(ctx.removeAbortListener).toHaveBeenCalledTimes(1);
+  });
+
+  it('closes an accepted ephemeral turn before propagating an abort', async () => {
+    const ctx = createFireContext();
+    const h = createSessionHarness(async (_message, opts) => {
+      await opts?.onAccepted?.();
+      ctx.controller.abort();
+      throw new Error('send interrupted by abort');
+    });
+    const { runner, maker, notifier } = createRunnerHarness(h.session);
+
+    await expect(runner.fire(baseSchedule(), ctx)).rejects.toThrow(/send interrupted by abort/);
+    expect(maker.closeSession).toHaveBeenCalledTimes(1);
+    expect(maker.closeSession).toHaveBeenCalledWith('scheduler-session');
+    expect(notifier.notify).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('applies the route before heartbeat meta lookup (explicit selection: %s)', async (explicit) => {
+    const order: string[] = [];
+    const h = createSessionHarness(async () => {
+      order.push('send');
+      return {
+        accepted: false,
+        reason: 'cancelled-before-dispatch',
+      };
+    });
+    const releaseAgentSwitchLock = vi.fn(() => {
+      order.push('release');
+    });
+    const acquirePendingAgentSwitch = vi.fn(async (_id: string, _signal?: AbortSignal, selection?: ScheduledModelSelection) => {
+      order.push('apply');
+      return selection ? { release: releaseAgentSwitchLock, selection } : releaseAgentSwitchLock;
+    });
+    const { runner, maker } = createRunnerHarness(h.session, { acquirePendingAgentSwitch });
+    vi.mocked(maker.getSessionMeta).mockImplementation(async () => {
+      order.push('meta');
+      return {
+        id: 'scheduler-session',
+        agentKind: 'codex',
+        workDir: 'F:\\XDMaker',
+        model: 'gpt-5.5-codex',
+        effort: 'high',
+        permissionMode: 'bypassPermissions',
+        fastMode: true,
+      } as never;
+    });
+    mocks.getSessionRowSnapshot.mockResolvedValue({
+      status: 'active',
+      userSendAt: null,
+      providerId: null,
+    });
+    const ctx = createFireContext();
+
+    await expect(
+      runner.fire(
+        baseSchedule({
+          targetSessionId: 'scheduler-session',
+          agentKind: 'claude-code',
+          model: explicit ? 'gpt-5.5-codex' : undefined,
+          ...(explicit ? { modelAgentKind: 'codex' as const, providerId: 'xd', effort: 'high', fastMode: true } : {}),
+        }),
+        ctx,
+      ),
+    ).rejects.toThrow(/cancelled-before-dispatch/);
+
+    expect(order.slice(0, 2)).toEqual(['apply', 'meta']);
+    if (explicit) {
+      expect(acquirePendingAgentSwitch).toHaveBeenCalledWith('scheduler-session', ctx.signal, {
+        agentKind: 'codex', model: 'gpt-5.5-codex', providerId: 'xd', effort: 'high', fastMode: true,
+      });
+    } else {
+      expect(acquirePendingAgentSwitch).toHaveBeenCalledWith('scheduler-session', ctx.signal);
+    }
+    expect(maker.createSession).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: 'scheduler-session',
+        agentKind: 'codex',
+        model: 'gpt-5.5-codex',
+      }),
+    );
+    expect(h.send).toHaveBeenCalledTimes(1);
+    expect(order).toEqual(['apply', 'meta', 'send', 'release']);
+  });
+
+
+  it('defers an explicit selection when the target is busy without dispatching', async () => {
+    const h = createSessionHarness(async () => ({ accepted: true }));
+    const { runner, maker } = createRunnerHarness(h.session, {
+      acquirePendingAgentSwitch: vi.fn(async () => { throw new ScheduledModelSelectionBusyError('busy'); }),
+    });
+    const result = await runner.fire(baseSchedule({ targetSessionId: 'scheduler-session',
+      modelAgentKind: 'pi', model: 'grok-4.6' }), createFireContext());
+    expect(result).toMatchObject({ deferred: true, sessionId: 'scheduler-session' });
+    expect(maker.createSession).not.toHaveBeenCalled();
+    expect(h.send).not.toHaveBeenCalled();
+  });
+
+  it('releases the heartbeat route lock before deferring to recent user activity', async () => {
+    const order: string[] = [];
+    const h = createSessionHarness(async () => ({ accepted: true }));
+    const releaseAgentSwitchLock = vi.fn(() => {
+      order.push('release');
+    });
+    const acquirePendingAgentSwitch = vi.fn(async () => releaseAgentSwitchLock);
+    const { runner, maker } = createRunnerHarness(h.session, { acquirePendingAgentSwitch });
+    vi.mocked(maker.getSessionMeta).mockResolvedValue({
+      id: 'scheduler-session',
+      agentKind: 'codex',
+      workDir: 'F:\\XDMaker',
+      model: 'gpt-5.5-codex',
+      effort: 'high',
+      permissionMode: 'bypassPermissions',
+      fastMode: false,
+    } as never);
+    mocks.getSessionRowSnapshot.mockResolvedValue({
+      status: 'active',
+      userSendAt: Date.now(),
+      providerId: null,
+    });
+    mocks.isSessionInTurn.mockReturnValue(true);
+
+    const result = await runner.fire(
+      baseSchedule({ targetSessionId: 'scheduler-session' }),
+      createFireContext(),
+    );
+
+    expect(result).toMatchObject({
+      sessionId: 'scheduler-session',
+      deferred: true,
+    });
+    expect(order).toEqual(['release']);
+    expect(releaseAgentSwitchLock).toHaveBeenCalledTimes(1);
+    expect(h.send).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { racing: false, target: { status: 'deleted' } },
+    { racing: true, target: { status: 'deleted' } },
+    { racing: false, target: { status: 'archived', orcaRole: 'worker' } },
+    { racing: true, target: { status: 'archived', orcaRole: 'worker' } },
+  ])('retires an unavailable managed/deleted target and releases its lock: %j', async ({ racing, target }) => {
+    const order: string[] = [];
+    const h = createSessionHarness(async () => ({ accepted: true }));
+    const releaseAgentSwitchLock = vi.fn(() => {
+      order.push('release');
+    });
+    const acquirePendingAgentSwitch = vi.fn(async () => releaseAgentSwitchLock);
+    const { runner, notifier } = createRunnerHarness(h.session, { acquirePendingAgentSwitch });
+    notifier.notify.mockImplementation(async () => {
+      order.push('notify');
+    });
+    mocks.getSessionRowSnapshot.mockResolvedValue({
+      ...target,
+      userSendAt: null,
+      providerId: null,
+    });
+    if (racing) mocks.getSessionRowSnapshot.mockResolvedValueOnce({ status: 'active', userSendAt: null, providerId: null });
+    const pause = vi.fn(async () => { order.push('pause'); });
+    runner.attachScheduler({ pause } as never);
+
+    await expect(
+      runner.fire(
+        baseSchedule({ targetSessionId: 'scheduler-session' }),
+        createFireContext(),
+      ),
+    ).resolves.toMatchObject({ skipped: true });
+
+    expect(order).toEqual(racing ? ['release', 'pause'] : ['pause']);
+    expect(acquirePendingAgentSwitch).toHaveBeenCalledTimes(racing ? 1 : 0);
+    expect(pause).toHaveBeenCalledWith('schedule-1', { exemptRunId: 'run-1' });
+    expect(notifier.notify).not.toHaveBeenCalled();
+    expect(h.send).not.toHaveBeenCalled();
+  });
+
+  // Scheduled input must keep both the business task and native history after
+  // restoration; the old archived-target test only covered pausing. Unit fixture.
+  it.each([false, true])('restores and completes in the original task without rearchiving (persistent=%s)', async (persistentSession) => {
+    const target = { status: 'archived', providerId: null, agentDeviceId: 'other-computer' };
+    mocks.getSessionRowSnapshot.mockImplementation(async () => ({ ...target }));
+    mocks.restoreArchivedSessionForSend.mockImplementation(async () => { target.status = 'active'; });
+    const h = createSessionHarness(async (_message, options) => {
+      await options?.onAccepted?.();
+      h.emit({ type: 'done', sessionId: h.session.id, data: {} } as AgentEvent);
+      return { accepted: true };
+    });
+    const { runner, maker } = createRunnerHarness(h.session, {
+      acquirePendingAgentSwitch: async () => {
+        expect(target.status).toBe('active');
+        return vi.fn();
+      },
+    });
+    vi.mocked(maker.getSessionMeta).mockResolvedValue({ workDir: '/work', sdkSessionId: 'native-history', model: 'gpt-6-astra' } as never);
+    const pause = vi.fn();
+    const update = vi.fn();
+    runner.attachScheduler({ pause, update, isRunSilenced: () => false } as never);
+    await expect(runner.fire(baseSchedule({ targetSessionId: h.session.id, persistentSession }), createFireContext()))
+      .resolves.toMatchObject({ sessionId: h.session.id });
+    expect(maker.createSession).toHaveBeenCalledWith(expect.objectContaining({
+      id: h.session.id, resumeSessionId: 'native-history', agentDeviceId: 'other-computer',
+    }));
+    expect(h.send).toHaveBeenCalledOnce();
+    expect(target.status).toBe('active');
+    expect(mocks.restoreArchivedSessionForSend).toHaveBeenCalledOnce();
+    expect(pause).not.toHaveBeenCalled();
+    expect(update).not.toHaveBeenCalled();
+  });
+
+  it('keeps the schedule active when the target is archived again during preparation', async () => {
+    const h = createSessionHarness(async () => ({ accepted: true }));
+    mocks.getSessionRowSnapshot.mockResolvedValueOnce({ status: 'active' })
+      .mockResolvedValue({ status: 'archived' });
+    const release = vi.fn();
+    const { runner } = createRunnerHarness(h.session, { acquirePendingAgentSwitch: async () => release });
+    const pause = vi.fn();
+    const update = vi.fn();
+    runner.attachScheduler({ pause, update } as never);
+    await expect(runner.fire(baseSchedule({ targetSessionId: h.session.id, persistentSession: true }), createFireContext()))
+      .resolves.toMatchObject({ skipped: true, sessionId: h.session.id });
+    expect(release).toHaveBeenCalledOnce();
+    expect(pause).not.toHaveBeenCalled();
+    expect(update).not.toHaveBeenCalled();
+    expect(h.send).not.toHaveBeenCalled();
+  });
+
+  it.each(['archived', 'deleted'])('keeps unavailable %s bot targets in the routine failure lifecycle', async (status) => {
+    const order: string[] = [];
+    const h = createSessionHarness(async () => ({ accepted: true }));
+    const acquirePendingAgentSwitch = vi.fn(async () => () => { order.push('release'); });
+    const { runner, notifier } = createRunnerHarness(h.session, { acquirePendingAgentSwitch });
+    notifier.notify.mockImplementation(async () => { order.push('notify'); });
+    mocks.getSessionRowSnapshot.mockResolvedValue({ status, userSendAt: null, providerId: null });
+    const pause = vi.fn(async () => { order.push('pause'); throw new Error('Schedule not found: schedule-1'); });
+    runner.attachScheduler({ pause } as never);
+    await expect(runner.fire(baseSchedule({ source: 'bot', manual: true, targetSessionId: 'scheduler-session' }),
+      createFireContext())).rejects.toThrow(`target session not available (${status})`);
+    expect(order).toEqual(['release', 'pause', 'notify']);
+    expect(pause).toHaveBeenCalledWith('schedule-1', { exemptRunId: 'run-1' });
+    expect(h.send).not.toHaveBeenCalled();
+  });
+
+  it('captures the scheduler git baseline after the user row exists and aborts it when send is rejected', async () => {
+    const order: string[] = [];
+    let releaseBaseline: (() => void) | undefined;
+    mocks.createMessage.mockImplementation(async () => {
+      order.push('persist');
+    });
+    const beforeDispatchUserTurn = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseBaseline = () => {
+            order.push('baseline');
+            resolve();
+          };
+        }),
+    );
+    const onUndispatchedUserTurn = vi.fn(() => {
+      order.push('abort');
+    });
+    const h = createSessionHarness(async (_message, opts) => {
+      order.push('send');
+      await opts?.onAccepted?.();
+      order.push('after-accepted');
+      return {
+        accepted: false,
+        reason: 'cancelled-before-dispatch',
+      };
+    });
+    const { runner } = createRunnerHarness(h.session, {
+      beforeDispatchUserTurn,
+      onUndispatchedUserTurn,
+    });
+    const ctx = createFireContext();
+
+    const firePromise = runner.fire(baseSchedule(), ctx);
+
+    await vi.waitFor(() => expect(h.send).toHaveBeenCalled());
+    await vi.waitFor(() => expect(beforeDispatchUserTurn).toHaveBeenCalledWith('scheduler-session', undefined));
+    expect(order).toEqual(['send', 'persist']);
+
+    releaseBaseline?.();
+    const settled = await settleWithin(firePromise);
+
+    expect(settled.status).toBe('rejected');
+    expect(order).toEqual(['send', 'persist', 'baseline', 'after-accepted', 'abort']);
+    expect(onUndispatchedUserTurn).toHaveBeenCalledWith('scheduler-session');
+  });
+
+  it('marks thrown send errors failed without waiting for terminal events and logs sanitized metadata', async () => {
+    const sendError = new Error('PROMPT_SECRET full user message TOKEN_VALUE file body');
+    const h = createSessionHarness(async (_message, opts) => {
+      await opts?.onAccepted?.();
+      throw sendError;
+    });
+    const { runner, logger, notifier } = createRunnerHarness(h.session);
+    const ctx = createFireContext();
+
+    const settled = await settleWithin(runner.fire(baseSchedule(), ctx));
+
+    expect(settled.status).toBe('rejected');
+    const run = latestNotifiedRun(notifier);
+    expect(run.status).toBe('failed');
+    expect(run.errorMsg).not.toContain('PROMPT_SECRET');
+    expectSafeSendFailureLog(logger, {
+      source: 'session.send',
+      reason: 'Error',
+    });
+    expect(h.off).toHaveBeenCalledTimes(1);
+    expect(ctx.removeAbortListener).toHaveBeenCalledTimes(1);
+  });
+
+  it('marks onAccepted rejection failed without waiting for terminal events and records the source', async () => {
+    mocks.createMessage.mockRejectedValue(
+      new Error('PROMPT_SECRET full user message TOKEN_VALUE file body'),
+    );
+    const h = createSessionHarness(async (_message, opts) => {
+      await opts?.onAccepted?.();
+      return { accepted: true };
+    });
+    const { runner, logger, notifier } = createRunnerHarness(h.session);
+    const ctx = createFireContext();
+
+    const settled = await settleWithin(runner.fire(baseSchedule(), ctx));
+
+    expect(settled.status).toBe('rejected');
+    const run = latestNotifiedRun(notifier);
+    expect(run.status).toBe('failed');
+    expect(run.errorMsg).toContain('onAccepted');
+    expect(run.errorMsg).not.toContain('PROMPT_SECRET');
+    expectSafeSendFailureLog(logger, {
+      source: 'onAccepted',
+      reason: 'onAccepted-rejected',
+    });
+    expect(h.off).toHaveBeenCalledTimes(1);
+    expect(ctx.removeAbortListener).toHaveBeenCalledTimes(1);
+  });
+
+  it('marks SESSION_RUNNING failed without waiting for terminal events and records the reason', async () => {
+    const err = new Error('SESSION_RUNNING: existing turn') as Error & { code?: string };
+    err.code = 'SESSION_RUNNING';
+    const h = createSessionHarness(async () => {
+      throw err;
+    });
+    const { runner, logger, notifier } = createRunnerHarness(h.session);
+    const ctx = createFireContext();
+
+    const settled = await settleWithin(runner.fire(baseSchedule(), ctx));
+
+    expect(settled.status).toBe('rejected');
+    const run = latestNotifiedRun(notifier);
+    expect(run.status).toBe('failed');
+    expect(run.errorMsg).toContain('SESSION_RUNNING');
+    expectSafeSendFailureLog(logger, {
+      source: 'session-state',
+      reason: 'SESSION_RUNNING',
+    });
+    expect(h.off).toHaveBeenCalledTimes(1);
+    expect(ctx.removeAbortListener).toHaveBeenCalledTimes(1);
+  });
+
+  it('waits for the terminal event when send is accepted', async () => {
+    const h = createSessionHarness(async (_message, opts) => {
+      await opts?.onAccepted?.();
+      return { accepted: true };
+    });
+    const { runner, notifier } = createRunnerHarness(h.session);
+    const ctx = createFireContext();
+    const firePromise = runner.fire(baseSchedule(), ctx);
+
+    expect(await settleWithin(firePromise, 25)).toEqual({ status: 'timeout' });
+    expect(notifier.notify).not.toHaveBeenCalled();
+    expect(h.listenerCount()).toBe(1);
+
+    h.emit({ type: 'text', data: { text: 'done text', isFinal: true } });
+    h.emit({ type: 'done', data: {} });
+
+    await expect(firePromise).resolves.toEqual({
+      sessionId: 'scheduler-session',
+      resultText: 'done text',
+    });
+    const run = latestNotifiedRun(notifier);
+    expect(run.status).toBe('success');
+    expect(run.resultText).toBe('done text');
+    expect(ctx.removeAbortListener).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps quota failures in scheduler notifications free of IM recovery instructions', async () => {
+    const h = createSessionHarness(async (_message, opts) => {
+      await opts?.onAccepted?.();
+      return { accepted: true };
+    });
+    const { runner, notifier } = createRunnerHarness(h.session);
+    const message = 'You hit your spend cap set by the owner of your workspace.';
+    const firePromise = runner.fire(baseSchedule(), createFireContext());
+    const rejected = expect(firePromise).rejects.toThrow(message);
+
+    await vi.waitFor(() => expect(h.listenerCount()).toBe(1));
+    h.emit({ type: 'error', data: { message, isTerminal: true } });
+
+    await rejected;
+    const run = latestNotifiedRun(notifier);
+    expect(run.status).toBe('failed');
+    expect(run.errorMsg).toBe(message);
+  });
+
+  it('projects tool-loop terminal errors to a safe scheduler notification', async () => {
+    // 终止原因文案随界面语言（imBot.text.shared.*），这里固定中文以核对投影内容。
+    const { setMainLocale } = await import('../../i18n.desktop');
+    setMainLocale('zh-CN');
+    onTestFinished(() => setMainLocale('en'));
+    const h = createSessionHarness(async (_message, opts) => {
+      await opts?.onAccepted?.();
+      return { accepted: true };
+    });
+    const { runner, notifier } = createRunnerHarness(h.session);
+    const firePromise = runner.fire(baseSchedule(), createFireContext());
+
+    await vi.waitFor(() => expect(h.listenerCount()).toBe(1));
+    h.emit({
+      type: 'error',
+      data: {
+        message: '上游模型疑似陷入死循环: missing_required_field',
+        isTerminal: true,
+        reason: 'tool_use_loop_detected',
+        toolLoop: { kind: 'contract', count: 3 },
+      },
+    });
+
+    await expect(firePromise).rejects.toThrow(/连续触发了无效的工具调用/);
+    const run = latestNotifiedRun(notifier);
+    expect(run.status).toBe('failed');
+    expect(run.errorMsg).toContain('连续触发了无效的工具调用');
+    expect(run.errorMsg).not.toContain('missing_required_field');
+    expect(run.errorMsg).not.toContain('tool_use_loop_detected');
+  });
+
+  it('marks a direct scheduler turn headless only after acceptance and releases it at terminal', async () => {
+    let releaseSend!: (result: SessionSendResult) => void;
+    let onAccepted: NonNullable<SessionSendOptions>['onAccepted'];
+    const sendGate = new Promise<SessionSendResult>((resolve) => {
+      releaseSend = resolve;
+    });
+    const h = createSessionHarness(async (_message, opts) => {
+      onAccepted = opts?.onAccepted;
+      return sendGate;
+    });
+    const { runner } = createRunnerHarness(h.session);
+    const firePromise = runner.fire(baseSchedule(), createFireContext());
+
+    await vi.waitFor(() => expect(h.send).toHaveBeenCalledTimes(1));
+    expect(isHeadlessGhostSetupTurn('scheduler-session')).toBe(false);
+
+    await onAccepted?.();
+    expect(isHeadlessGhostSetupTurn('scheduler-session')).toBe(true);
+    releaseSend({ accepted: true });
+    await vi.waitFor(() => expect(h.listenerCount()).toBe(1));
+
+    h.emit({ type: 'done', data: {} });
+    await expect(firePromise).resolves.toEqual({
+      sessionId: 'scheduler-session',
+      resultText: undefined,
+    });
+    expect(isHeadlessGhostSetupTurn('scheduler-session')).toBe(false);
+  });
+
+  it('broadcasts a newly accepted schedule session after its user row is durable', async () => {
+    const order: string[] = [];
+    mocks.createMessage.mockImplementation(async () => {
+      order.push('persist');
+    });
+    const onSessionCreated = vi.fn(() => {
+      order.push('broadcast');
+    });
+    const h = createSessionHarness(async (_message, opts) => {
+      await opts?.onAccepted?.();
+      return { accepted: true };
+    });
+    const { runner } = createRunnerHarness(h.session, { onSessionCreated });
+    const firePromise = runner.fire(baseSchedule(), createFireContext());
+
+    await vi.waitFor(() => expect(onSessionCreated).toHaveBeenCalledWith('scheduler-session'));
+    expect(order).toEqual(['persist', 'broadcast']);
+
+    h.emit({ type: 'done', data: {} });
+    await expect(firePromise).resolves.toEqual({
+      sessionId: 'scheduler-session',
+      resultText: undefined,
+    });
+  });
+
+  it('does not reacquire headless state when acceptance arrives after send cleanup', async () => {
+    let lateOnAccepted: NonNullable<SessionSendOptions>['onAccepted'];
+    const h = createSessionHarness(async (_message, opts) => {
+      lateOnAccepted = opts?.onAccepted;
+      return { accepted: false, reason: 'cancelled-before-dispatch' };
+    });
+    const { runner } = createRunnerHarness(h.session);
+
+    await expect(runner.fire(baseSchedule(), createFireContext())).rejects.toThrow(
+      /cancelled-before-dispatch/,
+    );
+    expect(isHeadlessGhostSetupTurn('scheduler-session')).toBe(false);
+
+    await lateOnAccepted?.();
+    expect(isHeadlessGhostSetupTurn('scheduler-session')).toBe(false);
+    expect(mocks.createMessage).not.toHaveBeenCalled();
+  });
+
+  it('rebuilds a recycled runtime in place and dispatches on the rebuilt instance (direct-send degradation)', async () => {
+    // 回归(MagicLizi P1):直发降级的「漂移回收 → 就地重建 → wireSessionToIpc 重接」
+    // 分支此前零覆盖;换实例不重接会让本轮回复与工具记录不进聊天页(两次踩中的隐性契约)。
+    const h = createSessionHarness(async () => ({ accepted: true }));
+    const rebuilt = createSessionHarness(async () => ({ accepted: true }));
+    const { runner, maker, logger, notifier } = createRunnerHarness(h.session);
+    (maker.recyclePiRuntimeIfResourcesDrifted as ReturnType<typeof vi.fn>).mockResolvedValue(true);
+    let created = 0;
+    (maker.createSession as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+      created += 1;
+      return created === 1 ? h.session : rebuilt.session;
+    });
+    const ctx = createFireContext();
+    const firePromise = runner.fire(baseSchedule(), ctx);
+    await vi.waitFor(() => expect(rebuilt.send).toHaveBeenCalled());
+    // accepted 后 fire 等 turn 终态:重建实例上发出 done 收口本轮。
+    rebuilt.emit({ type: 'done', data: {} } as AgentEvent);
+    await firePromise;
+
+    expect(maker.recyclePiRuntimeIfResourcesDrifted).toHaveBeenCalledWith(h.session);
+    expect(logger.info).toHaveBeenCalledWith(
+      '[runner] project resources drifted, recycled runtime before dispatch',
+      { sessionId: 'scheduler-session' },
+    );
+    // 投递必须落在重建实例上;旧实例已关闭,打到它只会得到误导性的失败。
+    expect(mocks.wireSessionToIpc).toHaveBeenCalledWith(rebuilt.session);
+    expect(rebuilt.send).toHaveBeenCalledTimes(1);
+    expect(h.send).not.toHaveBeenCalled();
+    expect(latestNotifiedRun(notifier).status).toBe('success');
+  });
+
+  it('surfaces rebuild failure loudly after a successful recycle instead of sending to a closed instance', async () => {
+    // 回归(fe45afa803 语义):回收成功(旧实例已关)后的重建失败必须上抛原始原因,
+    // 继续用已关闭实例只会把真实原因换成误导性的「会话已关闭」。
+    const h = createSessionHarness(async () => ({ accepted: true }));
+    const { runner, maker, notifier } = createRunnerHarness(h.session);
+    (maker.recyclePiRuntimeIfResourcesDrifted as ReturnType<typeof vi.fn>).mockResolvedValue(true);
+    (maker.createSession as ReturnType<typeof vi.fn>)
+      .mockImplementationOnce(async () => h.session)
+      .mockRejectedValueOnce(new Error('pi startup failed: model catalog unavailable'));
+    const ctx = createFireContext();
+
+    // 重建失败在 run 组装前裸上抛(不产出 failed run):大声失败正是修复语义。
+    await expect(runner.fire(baseSchedule(), ctx)).rejects.toThrow(/pi startup failed/);
+    expect(h.send).not.toHaveBeenCalled();
+    expect(notifier.notify).not.toHaveBeenCalled();
+  });
+});

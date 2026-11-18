@@ -1,0 +1,2106 @@
+import { randomUUID } from 'node:crypto';
+import { EventEmitter } from 'node:events';
+import { promises as fsp } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { providerShareGuestPeer } from '@cindy/device-link';
+
+import { describe, expect, it, vi } from 'vitest';
+
+import * as activeCatalogForHostParity from '../active-catalog.js';
+import { readCreatedSubscriptionProviders } from '../../subscription-accounts/placement.js';
+import { createHostProviderConfig } from '../../../../../host/src/agent/provider-config.js';
+import { projectSubscriptionPoolCatalog } from '../subscriptionPoolCatalog.js';
+import { createHostModelContext } from '../../../../../host/src/agent/model-context.js';
+
+const h = vi.hoisted(() => ({
+  endpoint: 'https://model.cn.example',
+  buildEndpoint: 'https://model.cn.example',
+  owner: 'owner-default',
+  profileRoot: null as string | null,
+  actualPlacement: false,
+  placementError: null as Error | null,
+  imageKeys: new Map<string, string>(),
+  speechKey: null as string | null,
+  secretsClearedListeners: new Set<() => void>(),
+  canUseCindyGateway: true,
+  loads: [] as Array<{
+    source: Record<string, unknown>;
+    resolve: (
+      catalog: unknown,
+      capabilityEvidence?: 'current' | 'fallback',
+      unverifiedXdMediaKinds?: readonly ('image' | 'video' | 'embedding')[],
+    ) => void;
+  }>,
+  refreshLoads: [] as Array<{
+    source: Record<string, unknown>;
+    resolve: (result: unknown) => void;
+  }>,
+  customProviderRead: vi.fn(),
+  casUpdate: vi.fn<(...args: unknown[]) => Promise<boolean>>(async () => true),
+  migrateManaged: vi.fn<(config?: unknown) => unknown>(() => null),
+  getGrokAccessToken: vi.fn(),
+  recoverGrokAuthAfterRejection: vi.fn(),
+  warn: vi.fn(),
+  request: vi.fn(),
+  catalogIo: null as Parameters<typeof import('@cindy/model-providers').loadCatalog>[1] | null,
+  pool: null as import('../../../shared/subscriptionAccounts.js').SubscriptionPoolConfig | null,
+  legacyLoggedIn: new Set<string>(),
+  /** `${kind}:${accountId}` -> provider the account belongs to (placement.ts); absent = built-in. */
+  placement: {} as Record<string, string>,
+  restoreLegacy: vi.fn<(...args: unknown[]) => Promise<boolean>>(async () => false),
+  copyAccountOverrides: vi.fn(),
+  /** Providers Cindy created for subscription accounts, and the providers whose accounts were read. */
+  created: {} as Record<string, { kind: 'openai' | 'anthropic'; name: string; account: string }>,
+  refreshed: new Set<string>(),
+  poolModels: null as import('@cindy/model-providers').CatalogModel[] | null,
+  poolModelsByProvider: {} as Record<string, import('@cindy/model-providers').CatalogModel[]>,
+  boundPoolModelsByProvider: {} as Record<string, import('@cindy/model-providers').CatalogModel[]>,
+  boundAccountIdsByProvider: {} as Record<string, string[]>,
+  poolConnectionByProvider: {} as Record<string, { serving: boolean; bound: boolean }>,
+  disabledModels: {} as Record<string, true>,
+  migrateLegacy: vi.fn<(...args: unknown[]) => Promise<boolean>>(async () => false),
+}));
+vi.mock('../../subscription-accounts/store.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../subscription-accounts/store.js')>();
+  return {
+    ...actual,
+    readPool: (id: string) => id === 'openai' ? h.pool : null,
+    readLegacyCodexAccountId: (id: string) => h.pool?.legacyCodexAccounts?.[id],
+    readProviderBoundAccountIds: (_kind: string, id: string) => new Set(h.boundAccountIdsByProvider[id] ?? []),
+  };
+});
+vi.mock('../../subscription-accounts/placement.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../subscription-accounts/placement.js')>();
+  const owner = (kind: string, accountId: string) => h.placement[`${kind}:${accountId}`] ?? kind;
+  // A legacy connection is merged while its account belongs to another provider (no created ones here).
+  const merged = (providerId: string) => {
+    const accountId = h.pool?.legacyCodexAccounts?.[providerId] ?? h.created[providerId]?.account;
+    return accountId && owner('openai', accountId) !== providerId
+      && !h.pool?.accounts.some(account => owner('openai', account.id) === providerId) ? accountId : undefined;
+  };
+  return {
+    ...actual,
+    accountProviderId: owner,
+    readMergedLegacyCodexAccountId: merged,
+    readMergedProviderAccount: merged,
+    restoreAutoMergedLegacyCodexAccounts: h.restoreLegacy,
+    restoreUnplacedSubscriptionAccounts: (options: Parameters<typeof actual.restoreUnplacedSubscriptionAccounts>[0]) =>
+      h.actualPlacement ? actual.restoreUnplacedSubscriptionAccounts(options) : Promise.resolve(false),
+    readCreatedSubscriptionProviders: () => {
+      if (h.placementError) throw h.placementError;
+      return h.actualPlacement ? actual.readCreatedSubscriptionProviders() : h.created;
+    },
+    readCreatedSubscriptionProvidersIfReadable: () => {
+      if (h.placementError) throw h.placementError;
+      return h.actualPlacement ? actual.readCreatedSubscriptionProvidersIfReadable() : h.created;
+    },
+  };
+});
+vi.mock('../../subscription-accounts/runtime.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../subscription-accounts/runtime.js')>();
+  return {
+    ...actual,
+    // A created provider is connected once its own accounts were read (the built-ins follow the pool).
+    hasConnectedSubscriptionPool: (id: string, options?: { includeBoundAccounts?: boolean }) => h.poolConnectionByProvider[id]
+      ? h.poolConnectionByProvider[id][options?.includeBoundAccounts ? 'bound' : 'serving']
+      : (h.created[id] || h.pool?.legacyCodexAccounts?.[id]
+        ? h.refreshed.has(id) || h.legacyLoggedIn.has(id) : Boolean(h.pool && !h.pool.disconnected)),
+    // No real CLI homes here: a read only records which provider was read.
+    refreshSubscriptionPool: async (id: string) => {
+      h.refreshed.add(id);
+      return { providerId: id, configured: true, strategy: 'least' as const, accounts: [] };
+    },
+    refreshSubscriptionPoolCodexModels: async () => undefined,
+    readSubscriptionPoolCodexModels: (providerId = 'openai', options?: { includeBoundAccounts?: boolean }) =>
+      (options?.includeBoundAccounts ? h.boundPoolModelsByProvider[providerId] : undefined)
+      ?? h.poolModelsByProvider[providerId] ?? h.poolModels,
+  };
+});
+vi.mock('../codex-account-auth.desktop.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../codex-account-auth.desktop.js')>();
+  return { ...actual, codexAccountState: (id: string) => ({ authenticated: h.legacyLoggedIn.has(id) }) };
+});
+vi.mock('../model-disable-store.js', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../model-disable-store.js')>(),
+  readModelDisableOverrides: () => ({ disabledModels: h.disabledModels, disabledProviders: {} }),
+  copyProviderDisableOverrides: h.copyAccountOverrides,
+}));
+
+vi.mock('../../userDataPath.js', () => ({ getUserDataDir: () => os.tmpdir(), userDataPath: (...parts: string[]) => path.join(os.tmpdir(), ...parts) }));
+
+vi.mock('electron', () => ({
+  app: { getPath: () => os.tmpdir() },
+  BrowserWindow: { getAllWindows: () => [] },
+  net: { request: h.request },
+}));
+
+vi.mock('@cindy/model-providers', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@cindy/model-providers')>();
+  return {
+    ...actual,
+    loadCatalog: vi.fn(
+      (
+        source: Record<string, unknown>,
+        io: Parameters<typeof import('@cindy/model-providers').loadCatalog>[1],
+        onResolved?: (result: unknown) => void,
+      ) =>
+        new Promise((resolve) => {
+          h.catalogIo = io;
+          h.loads.push({
+            source,
+            resolve: (
+              catalog,
+              capabilityEvidence = 'current',
+              unverifiedXdMediaKinds = capabilityEvidence === 'current'
+                ? []
+                : ['image', 'video', 'embedding'],
+            ) => {
+              onResolved?.({
+                catalog,
+                source: capabilityEvidence === 'current' ? 'remote' : 'cache',
+                capabilityEvidence,
+                unverifiedXdMediaKinds,
+              });
+              resolve(catalog);
+            },
+          });
+        }),
+    ),
+    loadCatalogWithSource: vi.fn(
+      (source: Record<string, unknown>) =>
+        new Promise((resolve) => {
+          h.refreshLoads.push({ source, resolve });
+        }),
+    ),
+  };
+});
+
+vi.mock('../../manifestService.js', () => ({
+  getBaseUrl: () => 'https://legacy-build-cdn.example',
+}));
+vi.mock('../../clientEndpointsService.js', () => ({
+  getBuildClientEndpoint: () => h.buildEndpoint,
+  getClientEndpoint: () => h.endpoint,
+}));
+vi.mock('../../logger.js', () => ({
+  createLogger: () => ({
+    debug: vi.fn(),
+    info: vi.fn(),
+    warn: h.warn,
+    error: vi.fn(),
+  }),
+}));
+vi.mock('../../authManager.js', () => ({
+  getAuthState: () => ({ mode: 'signed-out', user: null }),
+}));
+vi.mock('../../appSessionState.js', () => ({
+  getActiveAppSession: () => ({ mode: 'signed-out', dataOwnerId: h.owner }),
+  activeOwnerScopeKey: () => `signed-out:${h.owner ?? 'none'}`,
+  isAppSessionBoundaryPending: () => false,
+  ownerScopedUserDataPath: (...segments: string[]) =>
+    path.join(h.profileRoot ?? path.join(os.tmpdir(), 'provider-catalog-realm-reload'), h.owner, ...segments),
+}));
+vi.mock('../../../shared/brandRegion.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../../shared/brandRegion.js')>();
+  return { ...actual, CURRENT_CINDY_REGION: 'cn' };
+});
+vi.mock('../../appCapabilities.js', () => ({
+  getAppCapabilities: () => ({ canUseCindyGateway: h.canUseCindyGateway }),
+}));
+vi.mock('../../ownerNamespaceMigration.js', () => ({
+  hasLegacyOwnerNamespaceClaim: () => false,
+}));
+vi.mock('../auth-adapters.js', () => ({
+  readClaudeApiKey: () => null,
+  desktopCodexAuthAdapter: {
+    hasCodexOAuthLogin: () => false,
+    hasCodexOAuthLoginReadOnly: () => false,
+    hasCodexOAuthLoginUnbound: () => false,
+    readAccountPresentationState: async () => ({ authenticated: false }),
+  },
+}));
+vi.mock('../claude-native-auth.js', () => ({
+  hasClaudeNativeLogin: () => false,
+  hasClaudeNativeLoginUnbound: () => false,
+}));
+vi.mock('../claude-native-connection.js', () => ({ readClaudeNativeLogin: async () => null }));
+vi.mock('../claude-native-cli.desktop.js', () => ({ readClaudeCliLoginStatus: async () => ({ loggedIn: false }) }));
+vi.mock('../grok-oauth-login.desktop.js', () => ({
+  getGrokAccessToken: h.getGrokAccessToken,
+  peekGrokAccessToken: () => null,
+  hasGrokOAuthLogin: () => false,
+  hasGrokOAuthLoginUnbound: () => false,
+  recoverGrokAuthAfterRejection: h.recoverGrokAuthAfterRejection,
+  resetGrokOAuthMemoryCache: () => undefined,
+}));
+vi.mock('../generic-oauth.desktop.js', () => ({
+  configureGenericOAuth: () => undefined,
+  hasGenericOAuthLogin: () => false,
+  readCachedGenericOAuthAccessToken: () => null,
+  readGenericOAuthAccessToken: async () => null,
+  resetGenericOAuthMemoryCache: () => undefined,
+}));
+vi.mock('../../secrets/providerSecretStore.js', () => ({
+  genericOAuthSecretIo: {},
+  readCustomProviderHeaders: () => null,
+  readCustomProviderKey: (providerId: string) => providerId === 'speech-review' ? h.speechKey : null,
+  getProviderSecretStore: () => ({
+    get: (id: string) => id === 'openai-images' ? h.imageKeys.get(h.owner) ?? null : null,
+    invalidateCaches: () => h.secretsClearedListeners.forEach((listener) => listener()),
+  }),
+  setProviderSecretsClearedListener: () => undefined,
+  addProviderSecretsClearedListener: (listener: () => void) => h.secretsClearedListeners.add(listener),
+}));
+vi.mock('../outbound-fetch.desktop.js', () => ({
+  outboundFetch: vi.fn(async () => { throw new Error('offline'); }),
+}));
+vi.mock('../provider-route.js', () => ({
+  getProviderRouteCredentialRevision: () => 0,
+  setCustomProviderHeaderReader: () => undefined,
+  setCustomProviderKeyReader: () => undefined,
+  setOAuthTokenReader: () => undefined,
+  setProviderOAuthTokenReader: () => undefined,
+  setProviderViewsReader: () => undefined,
+}));
+vi.mock('../provider-diagnostics.js', () => ({
+  setDiagnosticsKeyReader: () => undefined,
+  setDiagnosticsOAuthTokenReader: () => undefined,
+}));
+vi.mock('../codex-model-discovery.js', () => ({
+  readCodexDiscoveredModels: async () => null,
+  readCodexDiscoveredModelsForAuthRefresh: async () => [],
+}));
+vi.mock('../model-discovery/anthropic.js', () => ({
+  getAnthropicModelDiscoveryFailure: () => null,
+  loadAnthropicModelsFromDiskCache: async () => undefined,
+  refreshAnthropicModelsFromHttp: async () => undefined,
+}));
+// Host and Desktop share the same asynchronous DB result; no database or credential IO here.
+vi.mock('../customProviderHeaderService.js', () => ({
+  createCustomProviderHeaderService: () => ({ listCustomProvidersWithSecureHeaders: () => h.customProviderRead() }),
+}));
+vi.mock('../../localDb/client/current.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../localDb/client/current.js')>();
+  const snapshot = {};
+  return { ...actual, getCurrentDbClientSnapshot: () => snapshot };
+});
+vi.mock('../custom-provider-header-secrets.js', () => ({
+  listCustomProvidersWithSecureHeaders: () => h.customProviderRead(),
+}));
+vi.mock('../../local-model-runtime/managedOllamaProvider.js', () => ({
+  migrateManagedOllamaOnCatalogLoad: async () => false,
+  migrateManagedOllamaProvider: (config: unknown) => h.migrateManaged(config),
+}));
+vi.mock('../../local-model-runtime/localConnectHarness.js', () => ({
+  migrateLocalConnectPresetsOnCatalogLoad: async () => 0,
+}));
+vi.mock('../../../shared/localConnectHarness.js', () => ({
+  migrateLocalConnectPresetsOnCatalogLoad: async () => 0,
+  migrateLocalConnectProvider: () => null,
+}));
+vi.mock('../custom-provider-store.js', () => ({
+  updateCustomProviderIfUnchanged: (...args: unknown[]) => h.casUpdate(...args),
+}));
+
+import {
+  BUNDLED_CATALOG,
+  buildUserProvider,
+  type Catalog,
+  type CustomProviderConfig,
+  XAI_API_CUSTOM_PROVIDER_ID,
+} from '@cindy/model-providers';
+import { resolveScheduledModelSelection } from '../../maker-ipc/scheduledModelSelection.js';
+import { deriveCindyMediaConfig } from '../../cindy-brain/cindyMediaCatalog.js';
+import { listEvaluationModels } from '../../cindy-evaluate/models.js';
+import { setModelVisibilityMirror, clearModelVisibilityMirror } from '../model-visibility-mirror.js';
+import { getProviderSecretStore } from '../../secrets/providerSecretStore.js';
+import {
+  getActiveCatalog,
+  commitModelPlaneFromCatalog,
+  setActiveCatalog,
+  setActiveCatalogChangedListener,
+  setCustomProviderConfigs,
+  setCustomProviders,
+  setSubscriptionPoolProviders,
+  setDiscoveredCodexModels,
+} from '../active-catalog.js';
+import {
+  __testing,
+  ensureActiveCatalogLoaded,
+  getDesktopSelectableCatalog,
+  getDesktopProviderService,
+  refreshActiveCatalogFromSource,
+  refreshCustomProvidersIntoCatalog,
+  reloadActiveCatalogForEndpointChange,
+  syncLocalCatalogOverridesIntoActiveCatalog,
+  refreshDiscoveredCodexModels,
+} from '../createDesktopProviderService.js';
+import { createGuestProviderRouteBinder, guestProviderModelIds } from '../../remote-agent/host/providerAccess.js';
+import {
+  buildCodexCustomProviderArgs,
+  deriveCodexCustomProviderRoutes,
+  hasCodexAppliedCustomProviderCapability,
+  setCodexAppliedCustomProviderRoutes,
+} from '../codex-custom-provider-route.js';
+
+function catalogNamed(name: string, updatedAt?: string): Catalog {
+  return {
+    ...BUNDLED_CATALOG,
+    ...(updatedAt && BUNDLED_CATALOG.modelRegistry
+      ? { modelRegistry: { ...BUNDLED_CATALOG.modelRegistry, updatedAt } }
+      : {}),
+    providers: BUNDLED_CATALOG.providers.map((provider, index) =>
+      index === 0 ? { ...provider, name } : provider,
+    ),
+  };
+}
+
+function activeMarker(): string | undefined {
+  return getActiveCatalog().providers[0]?.name;
+}
+
+describe('provider catalog realm reload', () => {
+  // #10405, unit: merging A(a1,a2) into B must not remove a2-only m2 from a saved
+  // schedule's strict route resolver. Picker/guest membership still cannot borrow B's m3.
+  it.each(['healthy', 'origin-signed-out', 'bound-paused', 'builtin-signed-out', 'builtin-disconnected'] as const)(
+    'keeps a merged provider historical account model available only to full routing (%s)', async state => {
+    const previous = getActiveCatalog();
+    const builtin = state === 'builtin-signed-out' || state === 'builtin-disconnected';
+    const original = builtin ? 'openai' : 'openai-sub-a';
+    const target = 'openai-sub-b';
+    const model = (id: string): import('@cindy/model-providers').CatalogModel => ({
+      id, name: id, contextWindow: 272_000, efforts: [], defaultEffort: null,
+    });
+    h.pool = { strategy: 'least', disconnected: state === 'builtin-disconnected',
+      accounts: [builtin ? 'default' : 'a1', 'a2', 'b', 'imported'].map(id => ({ id, paused: false, limit: 4, weight: 1 })),
+      legacyCodexAccounts: { 'legacy-imported': 'imported' } };
+    h.created = { ...(!builtin ? { [original]: { kind: 'openai' as const, name: 'A', account: 'a1' } } : {}),
+      [target]: { kind: 'openai', name: 'B', account: 'b' } };
+    h.placement = { ...(!builtin ? { 'openai:a1': target } : {}), 'openai:a2': target, 'openai:b': target, 'openai:imported': target };
+    h.poolModelsByProvider = { openai: [], [original]: builtin ? [] : [model('m1')], [target]: [model('m1'), model('m2'), model('m3')] };
+    h.boundPoolModelsByProvider = { [original]: builtin ? [model('m2')] : [model('m1'), model('m2')] };
+    h.boundAccountIdsByProvider = { [original]: ['a2', 'imported'] };
+    if (state === 'origin-signed-out' || builtin) h.poolConnectionByProvider[original] = { serving: false, bound: true };
+    if (state === 'bound-paused') for (const account of h.pool.accounts) {
+      if (account.id === 'a2' || account.id === 'imported') account.paused = true;
+    }
+    h.legacyLoggedIn.add('legacy-imported');
+    h.refreshed.add(original);
+    h.refreshed.add(target);
+    try {
+      setActiveCatalog(BUNDLED_CATALOG);
+      h.customProviderRead.mockResolvedValue([{ id: 'legacy-imported', name: 'Legacy',
+        auth: { method: 'oauth', native: 'codex' }, runtimes: { codex: {
+          baseUrl: 'https://chatgpt.com/backend-api/codex', models: [{ id: 'm-imported', name: 'Imported model' }],
+        } } }]);
+      await refreshCustomProvidersIntoCatalog();
+      const service = getDesktopProviderService({ allowSideEffects: false });
+      const selection = { agentKind: 'codex' as const, model: 'm2', providerId: original, effort: null, fastMode: false };
+      const routing = await service.listProviders({ catalog: getActiveCatalog(), snapshotOnly: true });
+      expect(resolveScheduledModelSelection(selection, routing)).toMatchObject({ providerId: original, model: 'm2' });
+      expect(resolveScheduledModelSelection({ ...selection, model: 'm-imported' }, routing))
+        .toMatchObject({ providerId: original, model: 'm-imported' });
+      expect(() => resolveScheduledModelSelection({ ...selection, model: 'm3' }, routing))
+        .toThrow('MODEL_SELECTION_UNAVAILABLE');
+      const selectable = await service.listProviders({ snapshotOnly: true });
+      expect(selectable.find(provider => provider.id === original)?.connected).toBe(state !== 'origin-signed-out' && !builtin);
+      expect(guestProviderModelIds(selectable, original, 'codex')).toEqual(builtin ? [] : ['m1']);
+    } finally {
+      h.pool = null;
+      h.created = {};
+      h.placement = {};
+      h.poolModelsByProvider = {};
+      h.boundPoolModelsByProvider = {};
+      h.boundAccountIdsByProvider = {};
+      h.poolConnectionByProvider = {};
+      h.legacyLoggedIn.delete('legacy-imported');
+      h.refreshed.clear();
+      setCustomProviders([]);
+      setActiveCatalog(previous);
+    }
+  });
+  // #10405, unit: provider-list models must come from that provider's accounts. The
+  // previous fixtures had just one pool, so copying the global OpenAI union looked correct.
+  it('keeps discovered models inside the created or legacy provider that owns the account', async () => {
+    const previous = getActiveCatalog();
+    const model = (id: string): import('@cindy/model-providers').CatalogModel => ({
+      id, name: id, contextWindow: 272_000, efforts: [], defaultEffort: null,
+    });
+    h.pool = { strategy: 'least', accounts: ['a', 'b', 'legacy', 'imported'].map(id => ({ id, paused: false, limit: 4, weight: 1 })),
+      legacyCodexAccounts: { 'legacy-target': 'imported' } };
+    h.created = {
+      'openai-sub-a': { kind: 'openai', name: 'Account A', account: 'a' },
+      'openai-sub-b': { kind: 'openai', name: 'Account B', account: 'b' },
+    };
+    h.placement = { 'openai:a': 'openai-sub-a', 'openai:b': 'openai-sub-b',
+      'openai:legacy': 'legacy-target', 'openai:imported': 'legacy-target' };
+    h.poolModelsByProvider = { openai: [], 'openai-sub-a': [model('model-a')],
+      'openai-sub-b': [model('model-b')], 'legacy-target': [model('model-legacy')] };
+    h.legacyLoggedIn.add('legacy-target');
+    const legacy: CustomProviderConfig = { id: 'legacy-target', name: 'Old OpenAI',
+      auth: { method: 'oauth', native: 'codex' }, runtimes: { codex: {
+        baseUrl: 'https://chatgpt.com/backend-api/codex', models: [{ id: 'legacy-native', name: 'Legacy model' }],
+      } } };
+    try {
+      setActiveCatalog(BUNDLED_CATALOG);
+      h.customProviderRead.mockResolvedValue([legacy]);
+      await refreshCustomProvidersIntoCatalog();
+      const views = await getDesktopProviderService({ allowSideEffects: false }).listProviders({ snapshotOnly: true });
+      const models = (id: string) => views.find(provider => provider.id === id)?.models.codex?.map(model => model.id);
+      expect(models('openai')).toEqual([]);
+      expect(models('openai-sub-a')).toEqual(['model-a']);
+      expect(models('openai-sub-b')).toEqual(['model-b']);
+      expect(models('legacy-target')).toEqual(['legacy-native', 'model-legacy']);
+      for (const state of ['signed-out', 'paused']) {
+        const imported = h.pool.accounts.find(account => account.id === 'imported')!;
+        if (state === 'signed-out') h.legacyLoggedIn.delete('legacy-target');
+        else imported.paused = true;
+        const selectable = await getDesktopProviderService({ allowSideEffects: false }).listProviders({ snapshotOnly: true });
+        expect(selectable.find(provider => provider.id === 'legacy-target')?.models.codex?.map(model => model.id))
+          .toEqual(['model-legacy']);
+        const routing = await getDesktopProviderService({ allowSideEffects: false }).listProviders({ snapshotOnly: true, getCatalog: getActiveCatalog });
+        expect(routing.find(provider => provider.id === 'legacy-target')?.models.codex?.map(model => model.id))
+          .toEqual(['legacy-native', 'model-legacy']);
+        h.legacyLoggedIn.add('legacy-target');
+        imported.paused = false;
+      }
+      h.placement['openai:imported'] = 'openai-sub-b';
+      const moved = await getDesktopProviderService({ allowSideEffects: false }).listProviders({ snapshotOnly: true });
+      expect(moved.find(provider => provider.id === 'legacy-target')?.models.codex?.map(model => model.id))
+        .toEqual(['model-legacy']);
+      expect(moved.find(provider => provider.id === 'openai-sub-b')?.models.codex?.map(model => model.id))
+        .toEqual(['model-b', 'legacy-native']);
+      h.placement['openai:legacy'] = 'openai-sub-b';
+      const merged = await getDesktopProviderService({ allowSideEffects: false }).listProviders({ snapshotOnly: true });
+      expect(merged.find(provider => provider.id === 'legacy-target')).toMatchObject({
+        subscriptionPoolAlias: true, subscriptionPoolTarget: 'openai-sub-b',
+      });
+    } finally {
+      h.pool = null;
+      h.created = {};
+      h.placement = {};
+      h.poolModelsByProvider = {};
+      h.legacyLoggedIn.delete('legacy-target');
+      setCustomProviders([]);
+      setActiveCatalog(previous);
+    }
+  });
+  // #10405, unit: a legacy connection whose original login is signed out can still
+  // run with a healthy account merged into it. Listing must refresh that target pool.
+  it('refreshes legacy target pools and uses their aggregate connection state', async () => {
+    const previous = getActiveCatalog();
+    h.pool = { strategy: 'least', accounts: ['imported', 'second'].map(id => ({ id, paused: false, limit: 4, weight: 1 })),
+      legacyCodexAccounts: { 'legacy-target': 'imported' } };
+    h.placement = { 'openai:imported': 'legacy-target', 'openai:second': 'legacy-target' };
+    const legacy: CustomProviderConfig = { id: 'legacy-target', name: 'Old OpenAI',
+      auth: { method: 'oauth', native: 'codex' }, runtimes: { codex: {
+        baseUrl: 'https://chatgpt.com/backend-api/codex', models: [{ id: 'gpt-fixture', name: 'Fixture model' }],
+      } } };
+    try {
+      setActiveCatalog(BUNDLED_CATALOG);
+      h.customProviderRead.mockResolvedValue([legacy]);
+      await refreshCustomProvidersIntoCatalog();
+      const service = getDesktopProviderService({ allowSideEffects: false });
+      const target = async (snapshotOnly: boolean) =>
+        (await service.listProviders({ snapshotOnly })).find(provider => provider.id === legacy.id);
+      expect((await target(true))?.connected).toBe(false);
+      expect((await target(false))?.connected).toBe(true);
+      expect(h.refreshed.has(legacy.id)).toBe(true);
+    } finally {
+      h.pool = null;
+      h.placement = {};
+      h.refreshed.clear();
+      setCustomProviders([]);
+      setActiveCatalog(previous);
+    }
+  });
+
+  // #10405, unit: owner reset and a failed next-owner DB read must remove account-derived
+  // provider names too. Previous owner-reset coverage only injected custom configurations.
+  it.each(['owner-reset', 'read-failure'] as const)('clears created subscription providers on %s', async reason => {
+    const previous = getActiveCatalog();
+    setSubscriptionPoolProviders([{ id: 'owner-a-sub', kind: 'openai', name: 'Owner A account' }]);
+    expect(getActiveCatalog().providers.some(provider => provider.id === 'owner-a-sub')).toBe(true);
+    try {
+      if (reason === 'owner-reset') setCustomProviders([]);
+      else {
+        h.customProviderRead.mockRejectedValueOnce(new Error('Owner B database unavailable'));
+        await refreshCustomProvidersIntoCatalog();
+      }
+      expect(getActiveCatalog().providers.some(provider => provider.id === 'owner-a-sub')).toBe(false);
+    } finally {
+      setSubscriptionPoolProviders([]);
+      setActiveCatalog(previous);
+    }
+  });
+  // Review regression (2026-11-13, subscription-account-pools.md 合并与拿出由用户决定): a created
+  // provider counts as connected from reading its own accounts, but listing providers read only the
+  // built-in pool, so a created GPT provider stayed out of the new-task picker until its settings
+  // page was opened. Real provider list wiring; account reads are stood in by `h.refreshed`.
+  it('reads created subscription providers with the built-in one when listing providers', async () => {
+    const previous = getActiveCatalog();
+    h.pool = { strategy: 'least', accounts: [{ id: 'second', paused: false, limit: 4, weight: 1 }] };
+    h.created = { 'openai-sub-fixture': { kind: 'openai', name: 'OpenAI · second', account: 'second' } };
+    try {
+      setActiveCatalog(BUNDLED_CATALOG);
+      h.customProviderRead.mockResolvedValue([]);
+      await refreshCustomProvidersIntoCatalog();
+      const service = getDesktopProviderService({ allowSideEffects: false });
+      const created = async (snapshotOnly: boolean) =>
+        (await service.listProviders({ snapshotOnly })).find(provider => provider.id === 'openai-sub-fixture');
+      expect((await created(true))?.connected).toBe(false);
+      expect((await created(false))?.connected).toBe(true);
+    } finally {
+      h.pool = null;
+      h.created = {};
+      h.refreshed.clear();
+      setActiveCatalog(previous);
+    }
+  });
+  // Unit regression: a revoked default login cleared the supplier catalog even
+  // after the pool selected a healthy second account. Existing coverage only
+  // projected legacy connection aliases, not ordinary pool accounts.
+  it('keeps healthy pooled membership at the guest startup entry after default auth invalidation', async () => {
+    const previous = getActiveCatalog();
+    const model = (id: string): import('@cindy/model-providers').CatalogModel => ({
+      id, name: id, contextWindow: 272_000, efforts: [], defaultEffort: null,
+    });
+    h.pool = { strategy: 'least', accounts: ['default', 'second'].map(id => ({ id, paused: false, limit: 4, weight: 1 })) };
+    h.poolModels = [model('healthy-model')];
+    try {
+      setDiscoveredCodexModels([model('default-only')]);
+      await refreshDiscoveredCodexModels(false);
+      const service = getDesktopProviderService({ allowSideEffects: false });
+      for (const options of [{}, { catalog: getActiveCatalog() }, { getCatalog: getActiveCatalog }]) {
+        const views = await service.listProviders({ ...options, snapshotOnly: true });
+        expect(guestProviderModelIds(views, 'openai', 'codex')).toContain('healthy-model');
+        expect(guestProviderModelIds(views, 'openai', 'codex')).not.toContain('default-only');
+      }
+      h.poolModels = ['healthy-model', 'unshared-model', 'disabled-model', 'other-group-model'].map(model);
+      h.disabledModels = { 'openai:disabled-model': true };
+      const binder = createGuestProviderRouteBinder({
+        readProviders: () => service.listProviders({ snapshotOnly: true }),
+        guestAccess: () => ({ providerId: 'openai', memberId: 'member' }),
+        ownerAllowed: () => true, providerAllowed: () => true,
+        modelAccess: {
+          allows: (_provider, id) => id !== 'unshared-model',
+          read: () => ({ models: ['healthy-model', 'disabled-model', 'other-group-model'], providerModels: null }),
+        },
+      });
+      const route = await binder({ kind: 'codex', hostSessionId: 'pool-guest', sessionId: 'pool-task', providerId: 'openai',
+        controller: providerShareGuestPeer('share', 'member', 'device'), isCurrent: () => true,
+        relayModelAccess: { models: ['healthy-model', 'unshared-model', 'disabled-model'], allows: async () => true } });
+      try { expect(route?.modelIds).toEqual(['healthy-model']); }
+      finally { route?.release(); }
+      h.poolModels = [model('recovered-default'), model('healthy-model')];
+      expect(getDesktopSelectableCatalog().providers.find(p => p.id === 'openai')?.models.codex?.map(m => m.id))
+        .toEqual(['recovered-default', 'healthy-model']);
+      h.poolModels = [model('healthy-model'), model('gpt-history[1m]')];
+      expect(guestProviderModelIds(await service.listProviders({ snapshotOnly: true }), 'openai', 'codex'))
+        .toEqual(['healthy-model']);
+      expect(guestProviderModelIds(await service.listProviders({ snapshotOnly: true, getCatalog: getActiveCatalog }), 'openai', 'codex'))
+        .toEqual(['healthy-model', 'gpt-history[1m]']);
+      h.poolModels = [];
+      expect(guestProviderModelIds(await service.listProviders({ snapshotOnly: true }), 'openai', 'codex')).toEqual([]);
+    } finally {
+      h.pool = null;
+      h.poolModels = null;
+      h.disabledModels = {};
+      setDiscoveredCodexModels([]);
+      setActiveCatalog(previous);
+    }
+  });
+  it('filters legacy context profiles after imported pool projection in both desktop and Host', () => {
+    const input = structuredClone(getActiveCatalog());
+    const openai = input.providers.find(provider => provider.id === 'openai')!;
+    const model = (id: string) => ({ id, name: id, contextWindow: 100_000, efforts: [], defaultEffort: null });
+    openai.models.codex = [model('base-fixture')];
+    // The projection accepts native Codex imports independently of auth.method;
+    // only the canonical OAuth provider applies the legacy-profile filter. This
+    // input exposes a filter-before-projection implementation leaking the alias.
+    input.providers.push({ ...openai, id: 'legacy-order-fixture',
+      auth: { method: 'apiKey', native: 'codex' },
+      models: { codex: [model('gpt-order[1m]'), model('imported-order-fixture')] },
+    });
+    h.pool = { strategy: 'least', accounts: [{ id: 'imported', paused: false, limit: 4, weight: 1 }],
+      legacyCodexAccounts: { 'legacy-order-fixture': 'imported' } };
+    h.poolModels = null;
+    h.legacyLoggedIn.add('legacy-order-fixture');
+    const read = vi.spyOn(activeCatalogForHostParity, 'getActiveCatalog').mockReturnValue(input);
+    try {
+      const host = createHostModelContext({ readGatewayKey: () => null, hasCodexOAuthLogin: () => false,
+        codexAccountState: id => ({ authenticated: h.legacyLoggedIn.has(id) }) });
+      const ids = (catalog: typeof input) => catalog.providers.find(provider => provider.id === 'openai')!.models.codex!.map(m => m.id);
+      expect(ids(getDesktopSelectableCatalog())).toEqual(['base-fixture', 'imported-order-fixture']);
+      expect(ids(host.getSelectableCatalog())).toEqual(ids(getDesktopSelectableCatalog()));
+      expect(input.providers.at(-1)!.models.codex!.map(m => m.id)).toContain('gpt-order[1m]');
+    } finally {
+      read.mockRestore();
+      h.pool = null;
+      h.legacyLoggedIn.clear();
+    }
+  });
+
+  // Test value: main caf1429fc9/a11646d4cb/78efab80b8 changed placement and
+  // historical routing; the old OpenAI-only projection loses placed account models.
+  // Unit: real Desktop binding + Host selectable binding + shared routing core,
+  // with deterministic store ports, no CLI discovery or native homes.
+  it.each([false, true])('projects placed, merged, lent and paused accounts with routing=%s', (routing) => {
+    const input = structuredClone(getActiveCatalog());
+    const openai = input.providers.find(provider => provider.id === 'openai')!;
+    const model = (id: string) => ({ id, name: id, contextWindow: 100_000, efforts: [], defaultEffort: null });
+    openai.models = { codex: [model('base')] };
+    const imported = (id: string, modelId: string) => ({ ...openai, id,
+      auth: { method: 'apiKey' as const, native: 'codex' as const }, models: { codex: [model(modelId)] } });
+    input.providers = [openai, { ...openai, id: 'openai-created', subscriptionPool: 'openai', models: { codex: [model('created-base')] } },
+      { ...openai, id: 'borrower', models: { codex: [model('borrower-base')] } },
+      imported('legacy-merged', 'merged-only'), imported('legacy-lent', 'lent-only'), imported('legacy-paused', 'paused-only')];
+    h.pool = { strategy: 'least', accounts: ['merged', 'lent', 'paused'].map(id => ({ id, paused: id === 'paused', limit: 4, weight: 1 })),
+      legacyCodexAccounts: { 'legacy-merged': 'merged', 'legacy-lent': 'lent', 'legacy-paused': 'paused' } };
+    h.placement = { 'openai:merged': 'openai-created', 'openai:lent': 'borrower', 'openai:paused': 'borrower' };
+    h.created = { 'openai-created': { kind: 'openai', name: 'Created', account: 'merged' } };
+    h.boundAccountIdsByProvider = { 'openai-created': ['paused'] };
+    h.legacyLoggedIn = new Set(['legacy-merged', 'legacy-lent', 'legacy-paused']);
+    const read = vi.spyOn(activeCatalogForHostParity, 'getActiveCatalog').mockReturnValue(input);
+    const ids = (catalog: Catalog, id: string) => catalog.providers.find(p => p.id === id)!.models.codex!.map(m => m.id);
+    try {
+      const host = createHostModelContext({ readGatewayKey: () => null, hasCodexOAuthLogin: () => false,
+        codexAccountState: id => ({ authenticated: h.legacyLoggedIn.has(id) }) });
+      const ports = {
+        readPool: () => h.pool,
+        codexAccountState: (id: string) => ({ authenticated: h.legacyLoggedIn.has(id) }),
+        readSubscriptionPoolCodexModels: () => null,
+        getActiveCatalogWithCodexModels: activeCatalogForHostParity.getActiveCatalogWithCodexModels,
+        accountProviderId: (_kind: string, id: string) => h.placement[`openai:${id}`] ?? 'openai',
+        readMergedProviderAccount: (id: string) => h.pool?.legacyCodexAccounts?.[id],
+        readProviderBoundAccountIds: (_kind: string, id: string) => new Set(h.boundAccountIdsByProvider[id] ?? []),
+      } satisfies Parameters<typeof projectSubscriptionPoolCatalog>[1];
+      const projected = projectSubscriptionPoolCatalog(input, ports, routing);
+      expect(ids(projected, 'openai-created')).toEqual(routing ? ['created-base', 'merged-only', 'paused-only'] : ['created-base', 'merged-only']);
+      expect(ids(projected, 'borrower')).toEqual(['borrower-base', 'lent-only']);
+      // Host only consumes selectable=false; even in a routing test it must not
+      // absorb the paused historical model into its selectable list.
+      expect(ids(host.getSelectableCatalog(), 'openai-created')).toEqual(['created-base', 'merged-only']);
+      expect(host.getSelectableCatalog()).toEqual(getDesktopSelectableCatalog());
+    } finally {
+      read.mockRestore(); h.pool = null; h.placement = {}; h.created = {};
+      h.boundAccountIdsByProvider = {}; h.legacyLoggedIn.clear();
+    }
+  });
+
+  it.each([false, true])('keeps the explicit Desktop-discovery / Host-null difference with routing=%s', async routing => {
+    const previous = getActiveCatalog();
+    const input = structuredClone(previous);
+    const openai = input.providers.find(p => p.id === 'openai')!;
+    openai.models.codex = [{ id: 'host-snapshot', name: 'Host snapshot', contextWindow: 100_000, efforts: [], defaultEffort: null }];
+    input.providers.push({ ...openai, id: 'openai-discovery-created', subscriptionPool: 'openai', models: { codex: [{ id: 'created-snapshot', name: 'Created snapshot', contextWindow: 100_000, efforts: [], defaultEffort: null }] } });
+    h.created = { 'openai-discovery-created': { kind: 'openai', name: 'Created discovery', account: 'fixture' } };
+    h.poolConnectionByProvider = { 'openai-discovery-created': { serving: true, bound: true } };
+    const read = vi.spyOn(activeCatalogForHostParity, 'getActiveCatalog').mockReturnValue(input);
+    h.pool = { strategy: 'least', accounts: [{ id: 'fixture', paused: false, limit: 4, weight: 1 }] };
+    h.poolModels = [{ id: 'pool-discovered', name: 'Pool discovered', contextWindow: 100_000, efforts: [], defaultEffort: null }];
+    try {
+      const host = createHostModelContext({ readGatewayKey: () => null, hasCodexOAuthLogin: () => false,
+        codexAccountState: () => ({ authenticated: false }) });
+      const hostIds = host.getSelectableCatalog().providers.find(p => p.id === 'openai')!.models.codex!.map(m => m.id);
+      const desktop = routing ? getDesktopProviderService({ allowSideEffects: false }).listProviders({ catalog: input, snapshotOnly: true }) : null;
+      // The binding's default=false path also uses the discovered account list.
+      expect(getDesktopSelectableCatalog().providers.find(p => p.id === 'openai')!.models.codex!.map(m => m.id)).toEqual(['pool-discovered']);
+      expect(hostIds).toEqual(['host-snapshot']);
+      expect(host.getSelectableCatalog().providers.find(p => p.id === 'openai-discovery-created')!.models.codex!.map(m => m.id)).toEqual(['created-snapshot']);
+      expect(getDesktopSelectableCatalog().providers.find(p => p.id === 'openai-discovery-created')!.models.codex!.map(m => m.id)).toEqual(['pool-discovered']);
+      if (desktop) {
+        const views = await desktop;
+        expect(guestProviderModelIds(views, 'openai', 'codex')).toEqual(['pool-discovered']);
+        expect(guestProviderModelIds(views, 'openai-discovery-created', 'codex')).toEqual(['pool-discovered']);
+      }
+    } finally { read.mockRestore(); h.poolModels = null; h.pool = null; h.created = {}; h.poolConnectionByProvider = {}; }
+  });
+
+  // Test value: a created provider must reach the catalog at both production
+  // read boundaries, while unreadable placement and stale reads preserve isolation.
+  // Unit: one unique temp profile, real placement-file reader, no vault/network.
+  it('publishes the same placement file through Desktop and Host and preserves unreadable bytes', async () => {
+    const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'cindy-placement-parity-'));
+    const previousOwner = h.owner;
+    h.profileRoot = root; h.owner = randomUUID(); h.actualPlacement = true;
+    const file = path.join(root, h.owner, 'subscription-account-placement.json');
+    const config = createHostProviderConfig({ profileDir: root, ownerId: h.owner, openExternal: async () => {},
+      credentials: { decrypt: () => { throw Error('no credential IO'); }, read: () => null, write: () => { throw Error('no credential IO'); }, remove: () => {} } });
+    const publish = vi.spyOn(activeCatalogForHostParity, 'setSubscriptionPoolProviders');
+    try {
+      await fsp.mkdir(path.dirname(file), { recursive: true });
+      const contents = JSON.stringify({ accounts: {}, providers: { 'openai-sub-1234abcd': { kind: 'openai', name: 'Fixture', account: 'cindy-123456789abc-12345678-1234-1234-1234-123456789abc' } }, strategies: {} });
+      await fsp.writeFile(file, contents);
+      h.customProviderRead.mockResolvedValue([]);
+      await refreshCustomProvidersIntoCatalog();
+      expect(publish).toHaveBeenLastCalledWith([{ id: 'openai-sub-1234abcd', kind: 'openai', name: 'Fixture' }]);
+      const desktopArgs = publish.mock.lastCall;
+      await config.list();
+      expect(publish.mock.lastCall).toEqual(desktopArgs);
+      expect(getActiveCatalog().providers.some(p => p.id === 'openai-sub-1234abcd')).toBe(true);
+      await fsp.writeFile(file, '{unreadable-placement');
+      publish.mockClear();
+      await refreshCustomProvidersIntoCatalog(); await config.list();
+      // Publication preserves the current list; other readers keep default-empty semantics.
+      expect(publish).not.toHaveBeenCalled();
+      expect(getActiveCatalog().providers.some(p => p.id === 'openai-sub-1234abcd')).toBe(true);
+      expect(await fsp.readFile(file, 'utf8')).toBe('{unreadable-placement');
+      expect(readCreatedSubscriptionProviders()).toEqual({});
+      await fsp.writeFile(file, contents.replace('Fixture', 'Renamed'));
+      publish.mockClear();
+      await refreshCustomProvidersIntoCatalog(); await config.list();
+      const renamed = [[{ id: 'openai-sub-1234abcd', kind: 'openai', name: 'Renamed' }]];
+      expect(publish.mock.calls).toEqual([renamed, renamed]);
+      expect(getActiveCatalog().providers.find(p => p.id === 'openai-sub-1234abcd')?.name).toBe('Renamed');
+    } finally {
+      publish.mockRestore(); await config.close(); setCustomProviders([]);
+      h.profileRoot = null; h.owner = previousOwner; h.actualPlacement = false; h.customProviderRead.mockReset();
+      await fsp.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  // Unit: real owner-scoped placement file through both launchers. Publication
+  // must distinguish missing/valid-empty from unreadable without sharing old-owner state.
+  it.each(['valid-empty', 'missing', 'cold-and-new-owner'] as const)('publishes %s placement consistently in both launchers', async state => {
+    const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'cindy-placement-states-'));
+    const previousOwner = h.owner;
+    h.profileRoot = root; h.owner = randomUUID(); h.actualPlacement = true;
+    const file = () => path.join(root, h.owner, 'subscription-account-placement.json');
+    const contents = JSON.stringify({ providers: { 'openai-sub-1234abcd': { kind: 'openai', name: 'Fixture',
+      account: 'cindy-123456789abc-12345678-1234-1234-1234-123456789abc' } } });
+    const createConfig = () => createHostProviderConfig({ profileDir: root, ownerId: h.owner, openExternal: async () => {},
+      credentials: { decrypt: () => { throw Error('no credential IO'); }, read: () => null, write: () => { throw Error('no credential IO'); }, remove: () => {} } });
+    let config = createConfig();
+    const exists = () => getActiveCatalog().providers.some(p => p.id === 'openai-sub-1234abcd');
+    try {
+      h.customProviderRead.mockResolvedValue([]);
+      await fsp.mkdir(path.dirname(file()), { recursive: true });
+      if (state === 'cold-and-new-owner') {
+        setCustomProviders([]);
+        await fsp.writeFile(file(), '{cold-damage');
+        await refreshCustomProvidersIntoCatalog(); await config.list();
+        expect(exists()).toBe(false);
+        await fsp.writeFile(file(), contents);
+        await refreshCustomProvidersIntoCatalog(); await config.list();
+        expect(exists()).toBe(true);
+        await config.close();
+        h.owner = randomUUID(); setCustomProviders([]); config = createConfig();
+        await fsp.mkdir(path.dirname(file()), { recursive: true }); await fsp.writeFile(file(), '{new-owner-damage');
+        await refreshCustomProvidersIntoCatalog(); await config.list();
+        expect(exists()).toBe(false);
+        expect(await fsp.readFile(file(), 'utf8')).toBe('{new-owner-damage');
+      } else {
+        for (const launcher of ['desktop', 'host']) {
+          await fsp.writeFile(file(), contents);
+          await (launcher === 'desktop' ? refreshCustomProvidersIntoCatalog() : config.list());
+          expect(exists()).toBe(true);
+          if (state === 'missing') await fsp.unlink(file()); else await fsp.writeFile(file(), '{}');
+          await (launcher === 'desktop' ? refreshCustomProvidersIntoCatalog() : config.list());
+          expect(exists()).toBe(false);
+        }
+      }
+    } finally {
+      await config.close(); setCustomProviders([]); h.profileRoot = null; h.owner = previousOwner;
+      h.actualPlacement = false; h.customProviderRead.mockReset(); await fsp.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  // 2026-11-14 user correction: old wizard/pool additions must also become separate providers.
+  // Unit, real catalog refresh + placement file; prior restoration covered only legacy connections.
+  // Minimal failure: default + one unplaced account, no custom-provider connection to restore.
+  it('publishes a separate provider for an old pooled account on catalog refresh and keeps it on reload', async () => {
+    const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'cindy-pooled-account-restore-'));
+    const previous = getActiveCatalog();
+    const previousOwner = h.owner;
+    const accountId = 'cindy-123456789abc-12345678-1234-1234-1234-123456789abc';
+    h.profileRoot = root; h.owner = randomUUID(); h.actualPlacement = true;
+    h.pool = { strategy: 'least', accounts: ['default', accountId].map(id => ({ id, paused: false, limit: 4, weight: 1 })) };
+    h.customProviderRead.mockResolvedValue([]);
+    h.copyAccountOverrides.mockClear();
+    try {
+      setActiveCatalog(BUNDLED_CATALOG);
+      await refreshCustomProvidersIntoCatalog();
+      const created = getActiveCatalog().providers.filter(p => p.id.startsWith('openai-sub-'));
+      expect(created).toHaveLength(1);
+      expect(h.copyAccountOverrides).toHaveBeenCalledExactlyOnceWith('openai', created[0].id);
+      const file = path.join(root, h.owner, 'subscription-account-placement.json');
+      const persisted = await fsp.readFile(file, 'utf8');
+      expect(JSON.parse(persisted).accounts).toEqual({ [`openai:${accountId}`]: created[0].id });
+      await refreshCustomProvidersIntoCatalog();
+      expect(getActiveCatalog().providers.filter(p => p.id.startsWith('openai-sub-')).map(p => p.id)).toEqual([created[0].id]);
+      expect(await fsp.readFile(file, 'utf8')).toBe(persisted);
+    } finally {
+      setCustomProviders([]); setActiveCatalog(previous);
+      h.pool = null; h.profileRoot = null; h.owner = previousOwner;
+      h.actualPlacement = false; h.customProviderRead.mockReset();
+      await fsp.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('retains the published list in both launchers when the placement read port throws', async () => {
+    const config = createHostProviderConfig({ profileDir: os.tmpdir(), ownerId: h.owner, openExternal: async () => {},
+      credentials: { decrypt: () => '', read: () => null, write: () => {}, remove: () => {} } });
+    setSubscriptionPoolProviders([{ id: 'openai-current', kind: 'openai', name: 'Current' }]);
+    const publish = vi.spyOn(activeCatalogForHostParity, 'setSubscriptionPoolProviders');
+    try {
+      h.customProviderRead.mockResolvedValue([]);
+      h.placementError = Error('placement reader threw');
+      await refreshCustomProvidersIntoCatalog(); await config.list();
+      expect(publish).not.toHaveBeenCalled();
+      expect(getActiveCatalog().providers.some(p => p.id === 'openai-current')).toBe(true);
+      expect(h.warn).toHaveBeenCalledWith('publishing subscription providers failed', { err: 'Error: placement reader threw' });
+    } finally { publish.mockRestore(); h.placementError = null; await config.close(); setCustomProviders([]); h.customProviderRead.mockReset(); }
+  });
+
+  it.each(['owner', 'generation', 'failure'] as const)('does not publish a stale or failed %s read in either launcher', async reason => {
+    const previousOwner = h.owner;
+    const config = createHostProviderConfig({ profileDir: os.tmpdir(), ownerId: h.owner, openExternal: async () => {},
+      credentials: { decrypt: () => '', read: () => null, write: () => {}, remove: () => {} } });
+    const publish = vi.spyOn(activeCatalogForHostParity, 'setSubscriptionPoolProviders');
+    try {
+      for (const launcher of ['desktop', 'host']) {
+        h.created = { 'openai-current': { kind: 'openai', name: 'Current', account: 'current' } };
+        setSubscriptionPoolProviders([{ id: 'openai-current', kind: 'openai', name: 'Current' }]);
+        let resolve!: (configs: CustomProviderConfig[]) => void;
+        let reject!: (error: Error) => void;
+        h.customProviderRead.mockReset().mockReturnValueOnce(new Promise<CustomProviderConfig[]>((yes, no) => { resolve = yes; reject = no; }));
+        publish.mockClear();
+        const pending = launcher === 'desktop' ? refreshCustomProvidersIntoCatalog() : config.list();
+        if (reason === 'owner') h.owner = previousOwner + '-stale';
+        if (reason === 'generation') {
+          h.customProviderRead.mockResolvedValueOnce([]);
+          await (launcher === 'desktop' ? refreshCustomProvidersIntoCatalog() : config.list());
+          publish.mockClear();
+        }
+        if (reason === 'failure') reject(Error('fixture DB failure')); else resolve([]);
+        if (launcher === 'host' && reason !== 'generation') await expect(pending).rejects.toThrow(reason === 'owner' ? 'PROVIDER_OWNER_CHANGED' : 'fixture DB failure');
+        else await pending;
+        expect(publish).not.toHaveBeenCalled();
+        expect(getActiveCatalog().providers.some(p => p.id === 'openai-current')).toBe(reason !== 'failure');
+        h.owner = previousOwner;
+      }
+    } finally { publish.mockRestore(); await config.close(); h.owner = previousOwner; h.created = {}; setCustomProviders([]); h.customProviderRead.mockReset(); }
+  });
+
+  // A connection merged into OpenAI (since 2026-11-13 only when the user chose it) keeps its model
+  // membership under the canonical supplier through the real loader/view wiring. Regression: the
+  // picker was covered but explicit/lazy full-catalog reads used by scheduled admission dropped
+  // imported-only models and rejected the saved route. Every catalog refresh offers only native
+  // Codex connections to the restore of upgrade-merged accounts (subscription-account-pools.md).
+  it('projects merged model membership under OpenAI while retaining compatibility routes', async () => {
+    const previous = getActiveCatalog();
+    h.pool = { strategy: 'least', accounts: [{ id: 'imported', paused: false, limit: 4, weight: 1 }],
+      legacyCodexAccounts: { 'legacy-imported': 'imported' } };
+    h.placement = { 'openai:imported': 'openai' };
+    h.legacyLoggedIn.add('legacy-imported');
+    const legacy: CustomProviderConfig = { id: 'legacy-imported', name: 'Old OpenAI',
+      auth: { method: 'oauth', native: 'codex' }, runtimes: { codex: {
+        baseUrl: 'https://chatgpt.com/backend-api/codex', models: [{ id: 'gpt-migration-fixture', name: 'Fixture model' }],
+      } } };
+    const api: CustomProviderConfig = { id: 'migration-api', name: 'API stays separate', runtimes: { codex: {
+      baseUrl: 'https://fixture.example/v1', models: [{ id: 'api-fixture', name: 'API fixture' }],
+    } } };
+    try {
+      setActiveCatalog(BUNDLED_CATALOG);
+      h.customProviderRead.mockResolvedValue([legacy, api]);
+      h.restoreLegacy.mockClear();
+      await refreshCustomProvidersIntoCatalog();
+      expect(h.restoreLegacy.mock.calls[0][0]).toEqual(new Set(['legacy-imported']));
+      const catalog = getDesktopSelectableCatalog();
+      expect(catalog.providers.find(provider => provider.id === 'openai')?.models.codex?.some(model => model.id === 'gpt-migration-fixture')).toBe(true);
+      expect(catalog.providers.some(provider => provider.id === 'legacy-imported')).toBe(true);
+      expect(catalog.providers.some(provider => provider.id === 'migration-api')).toBe(true);
+      const selection = { agentKind: 'codex' as const, providerId: 'openai',
+        model: 'gpt-migration-fixture', effort: null, fastMode: false };
+      const service = getDesktopProviderService({ allowSideEffects: false });
+      const readRoutes = () => Promise.all([
+        service.listProviders({ snapshotOnly: true }),
+        service.listProviders({ snapshotOnly: true, catalog: getActiveCatalog() }),
+        service.listProviders({ snapshotOnly: true, getCatalog: getActiveCatalog }),
+      ]);
+      for (const views of await readRoutes()) {
+        expect(resolveScheduledModelSelection(selection, views)).toMatchObject({
+          model: selection.model, providerId: 'openai', agentKind: 'codex',
+        });
+        expect(() => resolveScheduledModelSelection({ ...selection, model: 'api-fixture' }, views))
+          .toThrow('MODEL_SELECTION_UNAVAILABLE');
+      }
+      // Projection must not mutate the raw catalog or retain membership after pause/sign-out.
+      expect(getActiveCatalog().providers.find(provider => provider.id === 'openai')?.models.codex?.some(model => model.id === selection.model)).not.toBe(true);
+      for (const unavailable of ['paused', 'signed-out', 'disconnected'] as const) {
+        h.pool.accounts[0].paused = unavailable === 'paused';
+        h.pool.disconnected = unavailable === 'disconnected';
+        if (unavailable === 'signed-out') h.legacyLoggedIn.clear();
+        else h.legacyLoggedIn.add('legacy-imported');
+        expect(getDesktopSelectableCatalog().providers.find(provider => provider.id === 'openai')?.models.codex?.some(model => model.id === selection.model)).not.toBe(true);
+        for (const views of await readRoutes()) {
+          expect(() => resolveScheduledModelSelection(selection, views)).toThrow('MODEL_SELECTION_UNAVAILABLE');
+        }
+      }
+      // Restored to its own connection (the upgrade merge undone): the connection is an ordinary
+      // visible provider again and OpenAI no longer borrows its models or schedules its account.
+      h.pool.accounts[0].paused = false;
+      h.pool.disconnected = false;
+      h.legacyLoggedIn.add('legacy-imported');
+      h.placement = { 'openai:imported': 'legacy-imported' };
+      expect(getDesktopSelectableCatalog().providers.find(provider => provider.id === 'openai')?.models.codex?.some(model => model.id === selection.model)).not.toBe(true);
+      for (const views of await readRoutes()) {
+        const restored = views.find(view => view.id === 'legacy-imported');
+        expect(restored).toBeDefined();
+        expect(restored?.subscriptionPoolAlias).toBeUndefined();
+        expect(() => resolveScheduledModelSelection(selection, views)).toThrow('MODEL_SELECTION_UNAVAILABLE');
+      }
+    } finally {
+      h.pool = null;
+      h.placement = {};
+      h.legacyLoggedIn.clear();
+      setCustomProviders([]);
+      setActiveCatalog(previous);
+    }
+  });
+  // Unit: real provider-list wiring must retain channel readiness after hiding a
+  // standalone model, otherwise the user's OFF switch becomes impossible to re-enable.
+  it.each(['evaluation', 'rerank'] as const)('keeps hidden %s models manageable but excludes them from calls', async mode => {
+    const previous = getActiveCatalog();
+    const previousModels = activeCatalogForHostParity.getXdGatewayModels();
+    const id = `example-${mode}`;
+    const api = mode === 'evaluation' ? 'decisions' : 'rerank';
+    try {
+      setActiveCatalog(BUNDLED_CATALOG);
+      activeCatalogForHostParity.setXdGatewayModels([{ id, name: 'Standalone', mode, agents: [], availability: 'available' }]);
+      const agent = getActiveCatalog().providers.find(provider => provider.id === 'xd')!.agents[0];
+      setModelVisibilityMirror({ [`${agent}:xd:${id}`]: false });
+      const listed = await getDesktopProviderService().listProviders({ allowSideEffects: false, snapshotOnly: true });
+      expect(listed.find(provider => provider.id === 'xd')?.availableMediaModelIds).toContain(id);
+      expect(listEvaluationModels(api)).toEqual([]);
+      setModelVisibilityMirror({ [`${agent}:xd:${id}`]: true });
+      expect(listEvaluationModels(api)).toMatchObject([{ id }]);
+    } finally {
+      clearModelVisibilityMirror();
+      activeCatalogForHostParity.setXdGatewayModels([...previousModels]);
+      setActiveCatalog(previous);
+    }
+  });
+
+  // #6768 unit regression: a hidden TTS route needs channel readiness in the
+  // actual provider-list wiring before its management switch can be used.
+  // Renderer tests inject that snapshot and could not catch missing Main wiring.
+  it('projects admitted hidden speech routes as manageable and clears readiness when their key is removed', async () => {
+    const previous = getActiveCatalog();
+    const provider = buildUserProvider({ id: 'speech-review', name: 'Speech review', runtimes: {
+      codex: { baseUrl: 'https://api.elevenlabs.io/v1', wireProtocol: 'openai-chat',
+        models: [{ id: 'eleven_v3', name: 'Later speech', mode: 'audio_speech', defaultEnabled: false }] },
+    } });
+    try {
+      setActiveCatalog({ ...BUNDLED_CATALOG, providers: [provider] });
+      h.speechKey = 'fake-speech-key';
+      const list = () => getDesktopProviderService().listProviders({ allowSideEffects: false, snapshotOnly: true });
+      expect((await list()).find(item => item.id === provider.id)?.availableMediaModelIds).toEqual(['eleven_v3']);
+      h.speechKey = null;
+      expect((await list()).find(item => item.id === provider.id)?.availableMediaModelIds).toEqual([]);
+    } finally {
+      h.speechKey = null;
+      setActiveCatalog(previous);
+    }
+  });
+  it('passes xAI rejection context into forced recovery and never replays the stale token', async () => {
+    h.getGrokAccessToken.mockReset();
+    h.recoverGrokAuthAfterRejection.mockReset();
+
+    h.getGrokAccessToken.mockResolvedValueOnce('ordinary-token');
+    await expect(__testing.readXaiProviderOAuthToken()).resolves.toBe('ordinary-token');
+    expect(h.recoverGrokAuthAfterRejection).not.toHaveBeenCalled();
+
+    h.recoverGrokAuthAfterRejection.mockResolvedValueOnce('refreshed');
+    h.getGrokAccessToken.mockResolvedValueOnce('fresh-token');
+    await expect(
+      __testing.readXaiProviderOAuthToken({
+        forceRefresh: true,
+        staleToken: 'rejected-token',
+      }),
+    ).resolves.toBe('fresh-token');
+    expect(h.recoverGrokAuthAfterRejection).toHaveBeenLastCalledWith('rejected-token', 'xai');
+
+    h.recoverGrokAuthAfterRejection.mockResolvedValueOnce('unchanged');
+    await expect(
+      __testing.readXaiProviderOAuthToken({
+        forceRefresh: true,
+        staleToken: 'rejected-token',
+      }),
+    ).resolves.toBeNull();
+    expect(h.getGrokAccessToken).toHaveBeenCalledTimes(2);
+
+    h.recoverGrokAuthAfterRejection.mockResolvedValueOnce('superseded');
+    h.getGrokAccessToken.mockResolvedValueOnce('replacement-token');
+    await expect(
+      __testing.readXaiProviderOAuthToken({
+        forceRefresh: true,
+        staleToken: 'rejected-token',
+      }),
+    ).resolves.toBe('replacement-token');
+
+    await expect(__testing.readXaiProviderOAuthToken({ forceRefresh: true })).resolves.toBeNull();
+    expect(h.recoverGrokAuthAfterRejection).toHaveBeenCalledTimes(3);
+  });
+
+  it('drops a stale owner custom-provider read and clears the current snapshot on failure', async () => {
+    const provider: CustomProviderConfig = {
+      id: 'owner-a-provider',
+      name: 'Owner A Provider',
+      runtimes: {
+        'claude-code': {
+          baseUrl: 'https://owner-a.example/anthropic',
+          models: [{ id: 'owner-a-model', name: 'Owner A Model' }],
+        },
+      },
+    };
+    let resolveOwnerA!: (configs: CustomProviderConfig[]) => void;
+    const ownerALoad = new Promise<CustomProviderConfig[]>((resolve) => {
+      resolveOwnerA = resolve;
+    });
+    h.customProviderRead.mockReturnValueOnce(ownerALoad);
+    let ownerAIsCurrent = true;
+    const staleRefresh = refreshCustomProvidersIntoCatalog(() => ownerAIsCurrent);
+
+    setCustomProviders([]);
+    ownerAIsCurrent = false;
+    resolveOwnerA([provider]);
+    await staleRefresh;
+    expect(getActiveCatalog().providers.some((entry) => entry.id === provider.id)).toBe(false);
+
+    setCustomProviders([buildUserProvider(provider)]);
+    h.customProviderRead.mockRejectedValueOnce(new Error('stale owner A DB read failed'));
+    await refreshCustomProvidersIntoCatalog(() => false);
+    expect(getActiveCatalog().providers.some((entry) => entry.id === provider.id)).toBe(true);
+
+    h.customProviderRead.mockRejectedValueOnce(new Error('owner B DB read failed'));
+    await refreshCustomProvidersIntoCatalog();
+    expect(getActiveCatalog().providers.some((entry) => entry.id === provider.id)).toBe(false);
+    h.customProviderRead.mockReset();
+  });
+
+  it('does not let an older OFF refresh overwrite a newer ON catalog and Host spawn snapshot', async () => {
+    const disabled: CustomProviderConfig = {
+      id: 'image-capability-race-provider',
+      name: 'Image capability race fixture',
+      runtimes: {
+        codex: {
+          baseUrl: 'https://provider.example/v1',
+          wireProtocol: 'openai-responses',
+          models: [{ id: 'chat-model', name: 'Chat model' }],
+        },
+      },
+    };
+    const enabled: CustomProviderConfig = {
+      ...disabled,
+      runtimes: {
+        codex: {
+          ...disabled.runtimes.codex!,
+          supportsImageGeneration: true,
+        },
+      },
+    };
+    let resolveOlderRefresh!: (configs: CustomProviderConfig[]) => void;
+    h.customProviderRead.mockReset();
+    h.customProviderRead
+      .mockReturnValueOnce(
+        new Promise<CustomProviderConfig[]>((resolve) => {
+          resolveOlderRefresh = resolve;
+        }),
+      )
+      .mockResolvedValueOnce([enabled]);
+
+    const olderRefresh = refreshCustomProvidersIntoCatalog();
+    await refreshCustomProvidersIntoCatalog();
+    resolveOlderRefresh([disabled]);
+    await olderRefresh;
+
+    const routes = deriveCodexCustomProviderRoutes(getActiveCatalog());
+    expect(routes).toHaveLength(1);
+    expect(routes[0]?.responseModels).toEqual(['chat-model']);
+    setCodexAppliedCustomProviderRoutes(routes);
+    expect(hasCodexAppliedCustomProviderCapability(disabled.id, 'imageGeneration')).toBe(true);
+    const spawn = buildCodexCustomProviderArgs('http://127.0.0.1:43210', 'env-key', routes);
+    expect(spawn.extraArgs.filter((arg) => arg.includes('.name='))).toHaveLength(1);
+    expect(spawn.extraArgs.join(' ')).toContain('x-openai-actor-authorization');
+
+    setCodexAppliedCustomProviderRoutes([]);
+    setCustomProviders([]);
+    h.customProviderRead.mockReset();
+  });
+
+  it('projects executable Imagine models onto the xAI API-key source', () => {
+    setCustomProviders([
+      buildUserProvider({
+        id: XAI_API_CUSTOM_PROVIDER_ID,
+        name: 'xAI API',
+        runtimes: {
+          codex: {
+            baseUrl: 'https://api.x.ai/v1',
+            wireProtocol: 'openai-chat',
+            models: [{ id: 'grok-4.6', name: 'Grok 4.6' }],
+          },
+        },
+      }),
+    ]);
+
+    const projected = getActiveCatalog().providers.find(
+      (provider) => provider.id === XAI_API_CUSTOM_PROVIDER_ID,
+    );
+    const bundledXai = BUNDLED_CATALOG.providers.find((provider) => provider.id === 'xai');
+    expect(projected?.imageModels).toEqual(bundledXai?.imageModels);
+
+    setCustomProviders([]);
+  });
+
+  it('does not publish a migrated snapshot after a failed CAS write', async () => {
+    const original: CustomProviderConfig = {
+      id: 'cas-provider',
+      name: 'Original',
+      runtimes: {
+        'claude-code': {
+          baseUrl: 'https://original.example/anthropic',
+          models: [{ id: 'original-model', name: 'Original Model' }],
+        },
+      },
+    };
+    const edited: CustomProviderConfig = {
+      ...original,
+      name: 'Edited by user',
+      runtimes: {
+        'claude-code': {
+          baseUrl: 'https://edited.example/anthropic',
+          models: [{ id: 'user-model', name: 'User Model' }],
+        },
+      },
+    };
+    const migrated: CustomProviderConfig = {
+      ...original,
+      runtimes: {
+        'claude-code': {
+          baseUrl: 'https://migrated.example/anthropic',
+          models: [{ id: 'stale-model', name: 'Stale Model' }],
+        },
+      },
+    };
+    h.migrateManaged.mockReset();
+    h.casUpdate.mockReset();
+    h.customProviderRead.mockReset();
+    h.migrateManaged.mockImplementation((config: unknown) =>
+      (config as CustomProviderConfig).id === original.id ? migrated : null,
+    );
+    h.casUpdate.mockResolvedValueOnce(false);
+    h.customProviderRead.mockResolvedValueOnce([original]).mockResolvedValueOnce([edited]);
+
+    await refreshCustomProvidersIntoCatalog();
+
+    expect(h.casUpdate).toHaveBeenCalled();
+    const published = getActiveCatalog().providers.find((entry) => entry.id === original.id);
+    expect(published?.name).toBe('Edited by user');
+    expect(published?.models['claude-code']?.[0]).toMatchObject({ id: 'user-model' });
+    expect(JSON.stringify(published)).not.toContain('stale-model');
+    expect(JSON.stringify(published)).not.toContain('migrated.example');
+    setCustomProviders([]);
+    h.migrateManaged.mockReset();
+    h.casUpdate.mockReset();
+    h.customProviderRead.mockReset();
+    h.migrateManaged.mockImplementation(() => null);
+    h.casUpdate.mockResolvedValue(true);
+  });
+
+  it('reprojects custom efforts once on Registry refresh and preserves the custom route', async () => {
+    const current = structuredClone(catalogNamed('custom-before', '2026-08-12T10:00:00.000Z'));
+    const currentEntry = current.modelRegistry?.models.find(
+      (entry) => entry.id === 'openai/gpt-5.6-sol',
+    );
+    if (!currentEntry) throw new Error('expected gpt-5.6-sol Registry entry');
+    current.modelRegistry!.models = [currentEntry];
+    current.modelRegistry!.baseModels!.find(
+      (model) => model.id === currentEntry.modelRef,
+    )!.defaults = { efforts: ['high'], defaultEffort: 'high' };
+    setActiveCatalog(current);
+
+    const config: CustomProviderConfig = {
+      id: 'registry-relay',
+      name: 'Registry Relay',
+      runtimes: {
+        codex: {
+          baseUrl: 'https://relay.example/v1',
+          models: [{ id: 'gpt-5.6-sol', name: 'GPT-5.6-Sol' }],
+        },
+      },
+    };
+    setCustomProviderConfigs([config]);
+
+    const next = structuredClone(catalogNamed('custom-after', '2026-08-12T11:00:00.000Z'));
+    const nextEntry = next.modelRegistry?.models.find((entry) => entry.id === 'openai/gpt-5.6-sol');
+    if (!nextEntry) throw new Error('expected gpt-5.6-sol Registry entry');
+    next.modelRegistry!.models = [nextEntry];
+    next.modelRegistry!.baseModels!.find((model) => model.id === nextEntry.modelRef)!.defaults = {
+      efforts: ['high', 'max', 'ultra'],
+      defaultEffort: 'high',
+    };
+
+    const events: number[] = [];
+    setActiveCatalogChangedListener((revision) => events.push(revision));
+    try {
+      setActiveCatalog(next);
+      const provider = getActiveCatalog().providers.find((entry) => entry.id === config.id);
+      expect(provider).toMatchObject({
+        id: config.id,
+        routing: { codex: { upstream: 'https://relay.example/v1' } },
+      });
+      expect(provider?.models.codex?.[0]).toMatchObject({
+        id: 'gpt-5.6-sol',
+        efforts: ['high', 'max', 'ultra'],
+        defaultEffort: 'high',
+      });
+      expect(events).toHaveLength(1);
+    } finally {
+      setActiveCatalogChangedListener(null);
+      setCustomProviders([]);
+    }
+  });
+
+  it('keeps the current custom projection when full or model-plane catalogs omit Registry', () => {
+    const current = structuredClone(catalogNamed('registry-bearing', '2026-08-12T12:00:00.000Z'));
+    const entry = current.modelRegistry?.models.find(
+      (candidate) => candidate.id === 'openai/gpt-5.6-sol',
+    );
+    if (!entry) throw new Error('expected gpt-5.6-sol Registry entry');
+    current.modelRegistry!.models = [entry];
+    current.modelRegistry!.baseModels!.find((model) => model.id === entry.modelRef)!.defaults = {
+      efforts: ['minimal', 'max'],
+      defaultEffort: 'minimal',
+    };
+    setActiveCatalog(current);
+    const config: CustomProviderConfig = {
+      id: 'registry-relay',
+      name: 'Registry Relay',
+      runtimes: {
+        codex: {
+          baseUrl: 'https://relay.example/v1',
+          models: [{ id: 'gpt-5.6-sol', name: 'GPT-5.6-Sol' }],
+        },
+      },
+    };
+    setCustomProviderConfigs([config]);
+
+    const withoutRegistry = structuredClone(current);
+    delete withoutRegistry.modelRegistry;
+    setActiveCatalog(withoutRegistry);
+    expect(
+      getActiveCatalog().providers.find((provider) => provider.id === config.id)?.models.codex?.[0],
+    ).toMatchObject({ efforts: ['minimal', 'max'], defaultEffort: 'minimal' });
+    expect(getActiveCatalog().modelRegistry).toBeUndefined();
+
+    setActiveCatalog(current);
+    commitModelPlaneFromCatalog(withoutRegistry);
+    expect(
+      getActiveCatalog().providers.find((provider) => provider.id === config.id)?.models.codex?.[0],
+    ).toMatchObject({ efforts: ['minimal', 'max'], defaultEffort: 'minimal' });
+    expect(getActiveCatalog().modelRegistry?.updatedAt).toBe('2026-08-12T12:00:00.000Z');
+    setCustomProviders([]);
+  });
+
+  it('does not revive cleared owner configs on a later Registry refresh', () => {
+    const config: CustomProviderConfig = {
+      id: 'old-owner-relay',
+      name: 'Old owner relay',
+      runtimes: {
+        codex: {
+          baseUrl: 'https://old-owner.example/v1',
+          models: [{ id: 'gpt-5.6-sol', name: 'GPT-5.6-Sol' }],
+        },
+      },
+    };
+    setCustomProviderConfigs([config]);
+    setCustomProviders([]);
+    setActiveCatalog(catalogNamed('next-owner-catalog', '2026-08-12T13:00:00.000Z'));
+    expect(getActiveCatalog().providers.some((provider) => provider.id === config.id)).toBe(false);
+  });
+
+  it('persists only a digest of a catalog scope that may contain URL credentials', () => {
+    const scope = 'https://catalog.example/models?access_token=do-not-persist';
+    const envelope = __testing.catalogLkgEnvelope(scope, '{"schemaVersion":1}');
+
+    expect(envelope).toMatchObject({
+      version: 2,
+      scopeHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+      catalog: '{"schemaVersion":1}',
+    });
+    expect(JSON.stringify(envelope)).not.toContain(scope);
+    expect(JSON.stringify(envelope)).not.toContain('do-not-persist');
+  });
+
+  it('uses a unique temporary path for every LKG write', () => {
+    const first = __testing.catalogLkgTemporaryPath('/catalog.json');
+    const second = __testing.catalogLkgTemporaryPath('/catalog.json');
+
+    expect(first).not.toBe(second);
+    expect(first).toMatch(/\/catalog\.json\.\d+\.[0-9a-f-]+\.tmp$/);
+    expect(second).toMatch(/\/catalog\.json\.\d+\.[0-9a-f-]+\.tmp$/);
+  });
+
+  it('serializes the complete LKG replacement transaction for the same scope', async () => {
+    const events: string[] = [];
+    let finishFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => {
+      finishFirst = resolve;
+    });
+    const first = __testing.serializeCatalogLkgWrite('/same-catalog.json', async () => {
+      events.push('first:start');
+      await firstGate;
+      events.push('first:end');
+    });
+    await vi.waitFor(() => expect(events).toEqual(['first:start']));
+
+    const second = __testing.serializeCatalogLkgWrite('/same-catalog.json', async () => {
+      events.push('second:start');
+      events.push('second:end');
+    });
+    await Promise.resolve();
+    expect(events).toEqual(['first:start']);
+
+    finishFirst();
+    await Promise.all([first, second]);
+    expect(events).toEqual(['first:start', 'first:end', 'second:start', 'second:end']);
+  });
+
+  it('keeps a newer LKG when an older response queues behind it for the same scope', async () => {
+    const scope = `https://catalog.example.test/${randomUUID()}`;
+    const file = __testing.catalogLkgPath(scope);
+    const older = JSON.stringify(catalogNamed('OLDER', '2026-07-30T00:00:00.000Z'));
+    const newer = JSON.stringify(catalogNamed('NEWER', '2026-08-01T00:00:00.000Z'));
+
+    try {
+      await __testing.writeCatalogLkg(scope, older);
+      const newerCommit = __testing.writeCatalogLkg(scope, newer);
+      const staleCommit = __testing.writeCatalogLkg(scope, older);
+
+      await expect(newerCommit).resolves.toBe(newer);
+      await expect(staleCommit).resolves.toBe(newer);
+      await expect(__testing.readCatalogLkg(scope)).resolves.toBe(newer);
+    } finally {
+      await fsp.rm(file, { force: true });
+      await fsp.rm(`${file}.bak`, { force: true });
+    }
+  });
+
+  it('keeps the LKG when the same registry revision is republished with different content', () => {
+    const updatedAt = '2026-08-01T00:00:00.000Z';
+    const currentCatalog = catalogNamed('CURRENT', updatedAt);
+    const incomingCatalog = structuredClone(currentCatalog);
+    const registryEntry = incomingCatalog.modelRegistry?.models[0];
+    if (!registryEntry) throw new Error('expected bundled model registry entry');
+    registryEntry.name = `${registryEntry.name} (republished)`;
+    const current = JSON.stringify(currentCatalog);
+    const incoming = JSON.stringify(incomingCatalog);
+
+    expect(__testing.selectCatalogLkgSnapshot(incoming, current)).toBe(current);
+  });
+
+  it('keeps a Registry-bearing LKG when a later serialized write omits Registry', () => {
+    const currentCatalog = catalogNamed('CURRENT', '2026-08-01T00:00:00.000Z');
+    const incomingCatalog = structuredClone(currentCatalog);
+    delete incomingCatalog.modelRegistry;
+    const current = JSON.stringify(currentCatalog);
+    const incoming = JSON.stringify(incomingCatalog);
+
+    expect(__testing.selectCatalogLkgSnapshot(incoming, current)).toBe(current);
+  });
+
+  it('replaces an existing LKG through a Windows-safe backup path', async () => {
+    const files = new Set(['/catalog.json', '/catalog.tmp']);
+    const calls: Array<[string, string]> = [];
+    let firstReplace = true;
+    const fileIo = {
+      async rename(from: string, to: string) {
+        calls.push([from, to]);
+        if (firstReplace && from === '/catalog.tmp' && to === '/catalog.json') {
+          firstReplace = false;
+          throw Object.assign(new Error('destination exists'), { code: 'EEXIST' });
+        }
+        if (!files.has(from)) throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+        files.delete(from);
+        files.add(to);
+      },
+      async rm(target: string) {
+        files.delete(target);
+      },
+    };
+
+    await __testing.replaceCatalogLkgFile('/catalog.tmp', '/catalog.json', fileIo);
+
+    expect(calls).toEqual([
+      ['/catalog.tmp', '/catalog.json'],
+      ['/catalog.json', '/catalog.json.bak'],
+      ['/catalog.tmp', '/catalog.json'],
+    ]);
+    expect(files).toEqual(new Set(['/catalog.json']));
+  });
+
+  it('restores the previous LKG if the replacement still fails', async () => {
+    const files = new Set(['/catalog.json', '/catalog.tmp']);
+    let temporaryAttempts = 0;
+    const fileIo = {
+      async rename(from: string, to: string) {
+        if (from === '/catalog.tmp') {
+          temporaryAttempts += 1;
+          throw Object.assign(new Error('locked'), {
+            code: temporaryAttempts === 1 ? 'EPERM' : 'EBUSY',
+          });
+        }
+        if (!files.has(from)) throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+        files.delete(from);
+        files.add(to);
+      },
+      async rm(target: string) {
+        files.delete(target);
+      },
+    };
+
+    await expect(
+      __testing.replaceCatalogLkgFile('/catalog.tmp', '/catalog.json', fileIo),
+    ).rejects.toMatchObject({ code: 'EBUSY' });
+    expect(files.has('/catalog.json')).toBe(true);
+    expect(files.has('/catalog.json.bak')).toBe(false);
+  });
+
+  it('invalidates the old realm immediately and ignores a stale cross-realm response', async () => {
+    const initial = ensureActiveCatalogLoaded();
+    expect(h.loads[0]?.source).toMatchObject({
+      baseUrl: 'https://model.cn.example',
+      fallbackBaseUrl: 'https://legacy-build-cdn.example',
+    });
+    h.loads[0]!.resolve(catalogNamed('catalog-cn-initial'), 'current', ['embedding']);
+    await initial;
+    expect(activeMarker()).toBe('catalog-cn-initial');
+    const startupXd = getDesktopSelectableCatalog().providers.find(
+      (provider) => provider.id === 'xd',
+    );
+    expect(startupXd?.imageModels).toEqual([]);
+    expect(startupXd?.videoModels).toEqual([]);
+    expect(startupXd?.embeddingModels).toEqual([]);
+
+    h.endpoint = 'https://model.global.example';
+    const globalReload = reloadActiveCatalogForEndpointChange();
+    // Endpoint activation must synchronously remove the CN catalog before any await.
+    expect(activeMarker()).not.toBe('catalog-cn-initial');
+    expect(h.loads[1]?.source).toMatchObject({
+      baseUrl: 'https://model.global.example',
+    });
+    expect(h.loads[1]?.source.fallbackBaseUrl).toBeUndefined();
+
+    // A quick switch back to CN supersedes the still-pending Global request.
+    h.endpoint = 'https://model.cn.example';
+    const cnReload = reloadActiveCatalogForEndpointChange();
+    h.loads[1]!.resolve(catalogNamed('catalog-global-stale'));
+    await globalReload;
+    expect(activeMarker()).not.toBe('catalog-global-stale');
+
+    h.loads[2]!.resolve(catalogNamed('catalog-cn-latest'));
+    await cnReload;
+    expect(activeMarker()).toBe('catalog-cn-latest');
+  });
+
+  it('keeps bundled/LKG/waiting catalogs region-safe without hiding discovered xAI media', async () => {
+    const catalogWithXaiMedia = structuredClone(catalogNamed('catalog-with-xai-media'));
+    const xai = catalogWithXaiMedia.providers.find((provider) => provider.id === 'xai');
+    if (!xai) throw new Error('expected xAI provider');
+    xai.imageModels = [{ id: 'xai/grok-imagine-image', name: 'Grok Imagine Image' }];
+    xai.imageDefaults = { standard: 'xai/grok-imagine-image' };
+    xai.videoModels = [
+      { id: 'xai/grok-imagine-video', name: 'Grok Imagine Video' },
+      { id: 'xai/grok-imagine-video-1.5', name: 'Grok Imagine Video 1.5' },
+    ];
+    xai.videoDefaults = { standard: 'xai/grok-imagine-video' };
+
+    h.endpoint = 'https://model.cn-fallback.example';
+    const fallbackReload = reloadActiveCatalogForEndpointChange();
+
+    // The endpoint-switch window uses bundled data, but it cannot advertise Global XD media.
+    const waitingXd = getDesktopSelectableCatalog().providers.find(
+      (provider) => provider.id === 'xd',
+    );
+    expect(waitingXd?.imageModels).toEqual([]);
+    expect(waitingXd?.embeddingModels).toEqual([]);
+    expect(waitingXd?.videoModels?.map((model) => model.id)).not.toContain('happyhorse');
+
+    h.loads.at(-1)!.resolve(catalogWithXaiMedia, 'fallback');
+    await fallbackReload;
+
+    const fallbackCatalog = getDesktopSelectableCatalog();
+    const fallbackXd = fallbackCatalog.providers.find((provider) => provider.id === 'xd');
+    expect(fallbackXd?.imageModels).toEqual([]);
+    expect(fallbackXd?.embeddingModels).toEqual([]);
+    expect(fallbackXd?.videoModels?.map((model) => model.id)).not.toContain('happyhorse');
+    expect(
+      fallbackCatalog.providers
+        .find((provider) => provider.id === 'xai')
+        ?.videoModels?.map((model) => model.id),
+    ).toEqual(['xai/grok-imagine-video', 'xai/grok-imagine-video-1.5']);
+    expect(deriveCindyMediaConfig(fallbackCatalog.providers, 'embed')).toEqual({
+      models: [],
+      defaults: null,
+    });
+    expect(
+      deriveCindyMediaConfig(fallbackCatalog.providers, 'video').models.map((model) => model.id),
+    ).toContain('xai/grok-imagine-video-1.5');
+
+    h.endpoint = 'https://model.cn-current.example';
+    const currentReload = reloadActiveCatalogForEndpointChange();
+    expect(
+      getDesktopSelectableCatalog()
+        .providers.find((provider) => provider.id === 'xd')
+        ?.videoModels?.map((model) => model.id),
+    ).not.toContain('happyhorse');
+    const currentCatalogWithExplicitXd = structuredClone(catalogWithXaiMedia);
+    const explicitXd = currentCatalogWithExplicitXd.providers.find(
+      (provider) => provider.id === 'xd',
+    );
+    if (!explicitXd) throw new Error('expected XD provider');
+    explicitXd.imageModels = [];
+    delete explicitXd.imageDefaults;
+    explicitXd.embeddingModels = [];
+    delete explicitXd.embeddingDefaults;
+    explicitXd.videoModels = [{ id: 'seedance-fast', name: 'Seedance Fast' }];
+    explicitXd.videoDefaults = { standard: 'seedance-fast' };
+    h.loads.at(-1)!.resolve(currentCatalogWithExplicitXd, 'current');
+    await currentReload;
+
+    const currentCatalog = getDesktopSelectableCatalog();
+    const currentXd = currentCatalog.providers.find((provider) => provider.id === 'xd');
+    expect(currentXd?.imageModels).toEqual([]);
+    expect(currentXd?.embeddingModels).toEqual([]);
+    expect(currentXd?.videoModels).toEqual([]);
+    expect(deriveCindyMediaConfig(currentCatalog.providers, 'embed')).toEqual({
+      models: [],
+      defaults: null,
+    });
+    expect(
+      currentCatalog.providers
+        .find((provider) => provider.id === 'xai')
+        ?.videoModels?.map((model) => model.id),
+    ).toEqual(['xai/grok-imagine-video', 'xai/grok-imagine-video-1.5']);
+
+    // Restore the baseline expected by the following realm-race tests.
+    h.endpoint = 'https://model.cn.example';
+    const reset = reloadActiveCatalogForEndpointChange();
+    h.loads.at(-1)!.resolve(catalogNamed('catalog-cn-latest'));
+    await reset;
+  });
+
+  it('keeps bundled XD backfill field-scoped across endpoint reload and refresh', async () => {
+    const inheritedAll = structuredClone(catalogNamed('current-with-bundled-xd'));
+    const inheritedXai = inheritedAll.providers.find((provider) => provider.id === 'xai');
+    if (!inheritedXai) throw new Error('expected xAI provider');
+    inheritedXai.imageModels = [{ id: 'xai/grok-imagine-image', name: 'Grok Imagine Image' }];
+    inheritedXai.videoModels = [{ id: 'xai/grok-imagine-video', name: 'Grok Imagine Video' }];
+
+    h.endpoint = 'https://model.cn-primary-missing-xd.example';
+    const reload = reloadActiveCatalogForEndpointChange();
+    h.loads.at(-1)!.resolve(inheritedAll, 'current', ['image', 'video', 'embedding']);
+    await reload;
+
+    const projectedAll = getDesktopSelectableCatalog();
+    const projectedAllXd = projectedAll.providers.find((provider) => provider.id === 'xd');
+    expect(projectedAllXd?.imageModels).toEqual([]);
+    expect(projectedAllXd?.embeddingModels).toEqual([]);
+    expect(projectedAllXd?.videoModels?.map((model) => model.id)).not.toContain('happyhorse');
+    expect(projectedAll.providers.find((provider) => provider.id === 'xai')?.videoModels?.map(({ id, name }) => ({ id, name }))).toEqual(
+      inheritedXai.videoModels?.map(({ id, name }) => ({ id, name })),
+    );
+
+    const inheritedEmbedding = structuredClone(inheritedAll);
+    const inheritedEmbeddingXd = inheritedEmbedding.providers.find(
+      (provider) => provider.id === 'xd',
+    );
+    if (!inheritedEmbeddingXd) throw new Error('expected XD provider');
+    inheritedEmbeddingXd.imageModels = [
+      { id: 'gateway-current-image', name: 'Gateway Current Image' },
+    ];
+    inheritedEmbeddingXd.videoModels = [
+      { id: 'gateway-current-video', name: 'Gateway Current Video' },
+    ];
+
+    const partialRefresh = refreshActiveCatalogFromSource();
+    await Promise.resolve();
+    h.refreshLoads.at(-1)!.resolve({
+      catalog: inheritedEmbedding,
+      source: 'remote',
+      capabilityEvidence: 'current',
+      unverifiedXdMediaKinds: ['embedding'],
+    });
+    await partialRefresh;
+
+    const projectedEmbedding = getDesktopSelectableCatalog().providers.find(
+      (provider) => provider.id === 'xd',
+    );
+    expect(projectedEmbedding?.imageModels).toEqual([]);
+    expect(projectedEmbedding?.videoModels).toEqual([]);
+    expect(projectedEmbedding?.embeddingModels).toEqual([]);
+
+    const evidenceUpgrade = refreshActiveCatalogFromSource();
+    await Promise.resolve();
+    h.refreshLoads.at(-1)!.resolve({
+      catalog: structuredClone(inheritedEmbedding),
+      source: 'remote',
+      capabilityEvidence: 'current',
+      unverifiedXdMediaKinds: [],
+    });
+    await evidenceUpgrade;
+
+    expect(
+      getDesktopSelectableCatalog().providers.find((provider) => provider.id === 'xd')
+        ?.embeddingModels,
+    ).toEqual(inheritedEmbeddingXd.embeddingModels);
+
+    h.endpoint = 'https://model.cn.example';
+    const reset = reloadActiveCatalogForEndpointChange();
+    h.loads.at(-1)!.resolve(catalogNamed('catalog-cn-latest'));
+    await reset;
+  });
+
+  it('ignores an automatic refresh response from a superseded realm', async () => {
+    const staleRefreshIndex = h.refreshLoads.length;
+    const staleRefresh = refreshActiveCatalogFromSource();
+    await Promise.resolve();
+    expect(h.refreshLoads[staleRefreshIndex]?.source).toMatchObject({
+      baseUrl: 'https://model.cn.example',
+    });
+
+    h.endpoint = 'https://model.global.example';
+    const globalReloadIndex = h.loads.length;
+    const globalReload = reloadActiveCatalogForEndpointChange();
+    h.loads[globalReloadIndex]!.resolve(
+      catalogNamed('catalog-global-current', '2026-07-31T12:00:00.000Z'),
+    );
+    await globalReload;
+
+    const currentRefreshIndex = h.refreshLoads.length;
+    const currentRefresh = refreshActiveCatalogFromSource();
+    await Promise.resolve();
+    expect(h.refreshLoads[currentRefreshIndex]?.source).toMatchObject({
+      baseUrl: 'https://model.global.example',
+    });
+    h.refreshLoads[currentRefreshIndex]!.resolve({
+      catalog: catalogNamed('catalog-global-refreshed', '2026-07-31T12:30:00.000Z'),
+      source: 'remote',
+    });
+    await currentRefresh;
+
+    h.refreshLoads[staleRefreshIndex]!.resolve({
+      catalog: catalogNamed('catalog-cn-stale', '2026-07-31T13:00:00.000Z'),
+      source: 'remote',
+    });
+    await staleRefresh;
+
+    expect(activeMarker()).toBe('catalog-global-refreshed');
+    expect(getActiveCatalog().modelRegistry?.updatedAt).toBe('2026-07-31T12:30:00.000Z');
+  });
+
+  it('does not downgrade the active catalog when refresh falls back to an older cache', async () => {
+    const activeXaiModels = getActiveCatalog().providers.find((provider) => provider.id === 'xai')
+      ?.models.codex;
+    const staleCatalog = structuredClone(
+      catalogNamed('catalog-global-cached', '2026-07-31T11:00:00.000Z'),
+    );
+    const staleXai = staleCatalog.providers.find((provider) => provider.id === 'xai');
+    if (!staleXai) throw new Error('expected bundled xai provider');
+    staleXai.models.codex = [
+      {
+        id: 'xai/stale-cache-only',
+        name: 'Stale cache only',
+        contextWindow: 1,
+        efforts: [],
+        defaultEffort: null,
+      },
+    ];
+    const refresh = refreshActiveCatalogFromSource();
+    await Promise.resolve();
+    const load = h.refreshLoads.at(-1)!;
+    load.resolve({
+      catalog: staleCatalog,
+      source: 'cache',
+    });
+    await refresh;
+
+    expect(getActiveCatalog().modelRegistry?.updatedAt).toBe('2026-07-31T12:30:00.000Z');
+    expect(
+      getActiveCatalog().providers.find((provider) => provider.id === 'xai')?.models.codex,
+    ).toEqual(activeXaiModels);
+  });
+
+  it('installs a same-registry fallback snapshot and propagates evidence atomically', async () => {
+    const current = structuredClone(
+      catalogNamed('catalog-current-before-same-registry-fallback', '2026-07-31T12:30:00.000Z'),
+    );
+    setActiveCatalog(current, { capabilityEvidence: 'current' });
+
+    const fallback = structuredClone(current);
+    fallback.providers[0] = {
+      ...fallback.providers[0]!,
+      name: 'catalog-fallback-same-registry',
+    };
+    const fallbackXd = fallback.providers.find((provider) => provider.id === 'xd');
+    const fallbackXai = fallback.providers.find((provider) => provider.id === 'xai');
+    if (!fallbackXd || !fallbackXai) throw new Error('expected fallback providers');
+    fallbackXd.imageModels = [{ id: 'fallback-image', name: 'Fallback Image' }];
+    fallbackXd.videoModels = [{ id: 'fallback-video', name: 'Fallback Video' }];
+    fallbackXd.embeddingModels = [{ id: 'fallback-embedding', name: 'Fallback Embedding' }];
+    fallbackXai.videoModels = [
+      { id: 'xai/grok-imagine-video-1.5', name: 'Grok Imagine Video 1.5' },
+    ];
+
+    const events: number[] = [];
+    setActiveCatalogChangedListener((revision) => events.push(revision));
+    try {
+      const refresh = refreshActiveCatalogFromSource();
+      await Promise.resolve();
+      h.refreshLoads.at(-1)!.resolve({
+        catalog: fallback,
+        source: 'cache',
+        capabilityEvidence: 'fallback',
+      });
+      await refresh;
+
+      expect(activeMarker()).toBe('catalog-fallback-same-registry');
+      const projected = getDesktopSelectableCatalog();
+      expect(projected.providers.find((provider) => provider.id === 'xd')).toMatchObject({
+        imageModels: [],
+        videoModels: [],
+        embeddingModels: [],
+      });
+      expect(projected.providers.find((provider) => provider.id === 'xai')?.videoModels?.map(({ id, name }) => ({ id, name }))).toEqual(
+        fallbackXai.videoModels?.map(({ id, name }) => ({ id, name })),
+      );
+      expect(events).toHaveLength(1);
+
+      const exactFallbackRepeat = refreshActiveCatalogFromSource();
+      await Promise.resolve();
+      h.refreshLoads.at(-1)!.resolve({
+        catalog: structuredClone(fallback),
+        source: 'cache',
+        capabilityEvidence: 'fallback',
+      });
+      await exactFallbackRepeat;
+
+      expect(events).toHaveLength(1);
+
+      const evidenceUpgrade = refreshActiveCatalogFromSource();
+      await Promise.resolve();
+      h.refreshLoads.at(-1)!.resolve({
+        catalog: structuredClone(fallback),
+        source: 'remote',
+        capabilityEvidence: 'current',
+        unverifiedXdMediaKinds: ['image'],
+      });
+      await evidenceUpgrade;
+
+      expect(
+        getDesktopSelectableCatalog().providers.find((provider) => provider.id === 'xd'),
+      ).toMatchObject({
+        imageModels: [],
+        videoModels: [],
+        embeddingModels: fallbackXd.embeddingModels,
+      });
+      expect(events).toHaveLength(2);
+
+      const exactRepeat = refreshActiveCatalogFromSource();
+      await Promise.resolve();
+      h.refreshLoads.at(-1)!.resolve({
+        catalog: structuredClone(fallback),
+        source: 'remote',
+        capabilityEvidence: 'current',
+        unverifiedXdMediaKinds: ['image'],
+      });
+      await exactRepeat;
+
+      expect(events).toHaveLength(2);
+    } finally {
+      setActiveCatalogChangedListener(null);
+    }
+  });
+
+  it('projects a newer fallback refresh, then promotes identical current evidence', async () => {
+    const current = structuredClone(
+      catalogNamed('catalog-current-before-fallback-refresh', '2026-07-31T12:30:00.000Z'),
+    );
+    setActiveCatalog(current, { capabilityEvidence: 'current' });
+    expect(
+      getDesktopSelectableCatalog()
+        .providers.find((provider) => provider.id === 'xd')
+        ?.embeddingModels?.map((model) => model.id),
+    ).toContain('voyage/voyage-4');
+
+    const fallback = structuredClone(
+      catalogNamed('catalog-fallback-refresh', '2026-07-31T13:00:00.000Z'),
+    );
+    const xai = fallback.providers.find((provider) => provider.id === 'xai');
+    if (!xai) throw new Error('expected xAI provider');
+    xai.imageModels = [{ id: 'xai/grok-imagine-image', name: 'Grok Imagine Image' }];
+    xai.videoModels = [
+      { id: 'xai/grok-imagine-video', name: 'Grok Imagine Video' },
+      { id: 'xai/grok-imagine-video-1.5', name: 'Grok Imagine Video 1.5' },
+    ];
+
+    const refresh = refreshActiveCatalogFromSource();
+    await Promise.resolve();
+    h.refreshLoads.at(-1)!.resolve({
+      catalog: fallback,
+      source: 'cache',
+      capabilityEvidence: 'fallback',
+    });
+    await refresh;
+
+    const projected = getDesktopSelectableCatalog();
+    const xd = projected.providers.find((provider) => provider.id === 'xd');
+    expect(xd?.imageModels).toEqual([]);
+    expect(xd?.embeddingModels).toEqual([]);
+    expect(xd?.videoModels?.map((model) => model.id)).not.toContain('happyhorse');
+    expect(projected.providers.find((provider) => provider.id === 'xai')?.videoModels?.map(({ id, name }) => ({ id, name }))).toEqual(
+      xai.videoModels?.map(({ id, name }) => ({ id, name })),
+    );
+
+    const recoveredCatalog = structuredClone(fallback);
+    recoveredCatalog.providers[0] = {
+      ...recoveredCatalog.providers[0]!,
+      name: 'catalog-current-same-registry',
+    };
+    const recoveredXd = recoveredCatalog.providers.find((provider) => provider.id === 'xd');
+    const recoveredXai = recoveredCatalog.providers.find((provider) => provider.id === 'xai');
+    if (!recoveredXd || !recoveredXai) throw new Error('expected recovered providers');
+    recoveredXd.imageModels = [];
+    delete recoveredXd.imageDefaults;
+    recoveredXd.embeddingModels = [];
+    delete recoveredXd.embeddingDefaults;
+    recoveredXd.videoModels = [{ id: 'seedance-fast', name: 'Seedance Fast' }];
+    recoveredXd.videoDefaults = { standard: 'seedance-fast' };
+    recoveredXai.videoModels = [
+      { id: 'xai/grok-imagine-video-1.5', name: 'Grok Imagine Video 1.5' },
+    ];
+
+    const recovered = refreshActiveCatalogFromSource();
+    await Promise.resolve();
+    h.refreshLoads.at(-1)!.resolve({
+      catalog: recoveredCatalog,
+      source: 'remote',
+      capabilityEvidence: 'current',
+    });
+    await recovered;
+
+    const promoted = getDesktopSelectableCatalog();
+    const promotedXd = promoted.providers.find((provider) => provider.id === 'xd');
+    expect(activeMarker()).toBe('catalog-current-same-registry');
+    expect(promotedXd?.imageModels).toEqual([]);
+    expect(promotedXd?.embeddingModels).toEqual([]);
+    expect(promotedXd?.videoModels).toEqual([]);
+    expect(promoted.providers.find((provider) => provider.id === 'xai')?.videoModels?.map(({ id, name }) => ({ id, name }))).toEqual(
+      recoveredXai.videoModels,
+    );
+  });
+
+  it('按时间语义守卫 offset/Z 等价 revision,拒收真实旧值和坏值,接受真实新值', async () => {
+    setActiveCatalog(catalogNamed('current-offset', '2026-08-02T10:00:00+08:00'));
+    h.warn.mockClear();
+
+    const refreshWith = async (name: string, updatedAt: string): Promise<void> => {
+      const refresh = refreshActiveCatalogFromSource();
+      await Promise.resolve();
+      h.refreshLoads.at(-1)!.resolve({ catalog: catalogNamed(name, updatedAt), source: 'remote' });
+      await refresh;
+    };
+
+    try {
+      // 同一时刻仅 ISO 表示不同：Registry 关系仍为 same；完整 Catalog 快照不同则
+      // 原子安装 incoming，但不应误报同 revision 冲突。
+      await refreshWith('equivalent-z', '2026-08-02T02:00:00.000Z');
+      expect(activeMarker()).toBe('equivalent-z');
+      expect(getActiveCatalog().modelRegistry?.updatedAt).toBe('2026-08-02T02:00:00.000Z');
+      expect(h.warn).not.toHaveBeenCalled();
+
+      await refreshWith('actually-older', '2026-08-02T01:59:59.000Z');
+      expect(getActiveCatalog().modelRegistry?.updatedAt).toBe('2026-08-02T02:00:00.000Z');
+
+      await refreshWith('actually-newer', '2026-08-02T03:00:00.000Z');
+      expect(getActiveCatalog().modelRegistry?.updatedAt).toBe('2026-08-02T03:00:00.000Z');
+
+      await refreshWith('invalid-revision', 'not-a-timestamp');
+      expect(getActiveCatalog().modelRegistry?.updatedAt).toBe('2026-08-02T03:00:00.000Z');
+      expect(h.warn).toHaveBeenCalledWith('model registry updatedAt is invalid; rejecting', {
+        incomingUpdatedAt: 'not-a-timestamp',
+        currentUpdatedAt: '2026-08-02T03:00:00.000Z',
+      });
+    } finally {
+      setActiveCatalog(catalogNamed('catalog-global-refreshed', '2026-07-31T12:30:00.000Z'));
+    }
+  });
+
+  it('原子模型平面:成功刷新恰 1 revision;同 updatedAt 同 digest=no-op、异 digest=拒收,均 0 revision', async () => {
+    const events: number[] = [];
+    setActiveCatalogChangedListener((revision) => {
+      events.push(revision);
+    });
+    try {
+      // 更高 updatedAt:xai 清单 + registry 单次 swap → 恰 1 次 markChanged(旧实现是
+      // 2 个 setter + wrapper 广播 = 3 次可观测通知,本用例是 3→1 收敛的回归门)。
+      const next = structuredClone(catalogNamed('catalog-plane-v3', '2026-07-31T15:00:00.000Z'));
+      const refresh = refreshActiveCatalogFromSource();
+      await Promise.resolve();
+      h.refreshLoads.at(-1)!.resolve({ catalog: next, source: 'remote' });
+      await refresh;
+      expect(events).toHaveLength(1);
+
+      // 同 updatedAt 同 digest → 纯 no-op,零 revision 零广播。
+      const noop = refreshActiveCatalogFromSource();
+      await Promise.resolve();
+      h.refreshLoads.at(-1)!.resolve({ catalog: structuredClone(next), source: 'remote' });
+      await noop;
+      expect(events).toHaveLength(1);
+
+      // 同 updatedAt 异 digest = 非法重发 → 拒收保当前快照,零 revision。
+      const mutated = structuredClone(next);
+      mutated.modelRegistry!.models = mutated.modelRegistry!.models.slice(1);
+      const rejected = refreshActiveCatalogFromSource();
+      await Promise.resolve();
+      h.refreshLoads.at(-1)!.resolve({ catalog: mutated, source: 'remote' });
+      await rejected;
+      expect(events).toHaveLength(1);
+      expect(getActiveCatalog().modelRegistry?.models).toHaveLength(
+        next.modelRegistry!.models.length,
+      );
+    } finally {
+      setActiveCatalogChangedListener(null);
+    }
+  });
+
+  it('owner 切换即使 endpoint 未变也会清掉上一账号的本地模型 override', async () => {
+    const root = path.join(os.tmpdir(), 'provider-catalog-realm-reload');
+    h.owner = 'owner-a';
+    const ownerAFile = path.join(root, h.owner, 'model-catalog-overrides.json');
+    await fsp.mkdir(path.dirname(ownerAFile), { recursive: true });
+    await fsp.writeFile(
+      ownerAFile,
+      JSON.stringify({
+        version: 1,
+        additions: {
+          'openai:owner-a-only': {
+            agents: ['codex'],
+            base: {
+              name: 'Owner A only',
+              contextWindow: 32_000,
+              efforts: ['high'],
+              defaultEffort: 'high',
+            },
+          },
+        },
+      }),
+      'utf8',
+    );
+
+    try {
+      syncLocalCatalogOverridesIntoActiveCatalog();
+      expect(
+        getActiveCatalog()
+          .providers.find((provider) => provider.id === 'openai')
+          ?.models.codex?.some((model) => model.id === 'owner-a-only'),
+      ).toBe(true);
+
+      h.owner = 'owner-b';
+      await reloadActiveCatalogForEndpointChange();
+      expect(
+        getActiveCatalog()
+          .providers.find((provider) => provider.id === 'openai')
+          ?.models.codex?.some((model) => model.id === 'owner-a-only'),
+      ).toBe(false);
+    } finally {
+      h.owner = 'owner-default';
+      await fsp.rm(root, { recursive: true, force: true });
+      syncLocalCatalogOverridesIntoActiveCatalog();
+    }
+  });
+
+  it.each([false, true])('recomputes Images API mode after a same-endpoint owner commit (outgoing key: %s)', async (outgoingHasKey) => {
+    const originalOwner = h.owner;
+    const loadsBefore = h.loads.length;
+    const images = () => getActiveCatalog().providers.find((provider) => provider.id === 'openai')!.imageModels!;
+    const expectMode = (hasKey: boolean) => {
+      expect(images().map((model) => model.id)).toEqual(hasKey
+        ? ['openai/gpt-image-2.6-sunburst', 'openai/gpt-image-2.6-flare', 'openai/gpt-image-2.5-sunburst', 'openai/gpt-image-2.5-flare', 'openai/gpt-image-2']
+        : ['openai/gpt-image-2']);
+      expect(images().find((model) => model.id === 'openai/gpt-image-2')?.name)
+        .toBe(hasKey ? 'GPT Image 2' : 'GPT Image Gen');
+    };
+    try {
+      h.owner = 'outgoing-owner';
+      h.imageKeys.set(outgoingHasKey ? h.owner : 'local-owner', 'fixture-image-key');
+      // enterLocalMode invalidates caches before committing the next owner.
+      getProviderSecretStore().invalidateCaches();
+      expectMode(outgoingHasKey);
+      h.owner = 'local-owner';
+      const reload = reloadActiveCatalogForEndpointChange();
+      // Correct the projection synchronously, even if background discovery fails.
+      expectMode(!outgoingHasKey);
+      await reload;
+      expectMode(!outgoingHasKey);
+      expect(h.loads).toHaveLength(loadsBefore);
+    } finally {
+      h.imageKeys.clear();
+      h.owner = originalOwner;
+      getProviderSecretStore().invalidateCaches();
+      await reloadActiveCatalogForEndpointChange();
+    }
+  });
+
+  it('XDT_DISABLE_MODELS_FETCH=1 时手动刷新不发请求,抛 MODEL_CATALOG_FETCH_DISABLED 而非伪装的网络失败', async () => {
+    const savedUrl = process.env.XDT_MODELS_URL;
+    const savedPath = process.env.XDT_MODELS_PATH;
+    const savedForceOff = process.env.XDT_DISABLE_MODELS_FETCH;
+    delete process.env.XDT_MODELS_URL;
+    delete process.env.XDT_MODELS_PATH;
+    process.env.XDT_DISABLE_MODELS_FETCH = '1';
+    try {
+      const loadsBefore = h.refreshLoads.length;
+      await expect(refreshActiveCatalogFromSource()).rejects.toMatchObject({
+        code: 'MODEL_CATALOG_FETCH_DISABLED',
+      });
+      expect(h.refreshLoads).toHaveLength(loadsBefore);
+    } finally {
+      if (savedUrl === undefined) delete process.env.XDT_MODELS_URL;
+      else process.env.XDT_MODELS_URL = savedUrl;
+      if (savedPath === undefined) delete process.env.XDT_MODELS_PATH;
+      else process.env.XDT_MODELS_PATH = savedPath;
+      if (savedForceOff === undefined) delete process.env.XDT_DISABLE_MODELS_FETCH;
+      else process.env.XDT_DISABLE_MODELS_FETCH = savedForceOff;
+    }
+  });
+
+  it('aborts a non-200 catalog body before dropping its timeout', async () => {
+    if (!h.catalogIo) {
+      const loading = ensureActiveCatalogLoaded();
+      h.loads.at(-1)!.resolve(BUNDLED_CATALOG);
+      await loading;
+    }
+    const response = Object.assign(new EventEmitter(), { statusCode: 404 });
+    const request = Object.assign(new EventEmitter(), {
+      setHeader: vi.fn(),
+      end: vi.fn(() => request.emit('response', response)),
+      abort: vi.fn(() => response.emit('error', new Error('cancelled'))),
+    });
+    h.request.mockReturnValueOnce(request);
+    await expect(h.catalogIo!.fetchText!('https://catalog.example.test', 100)).rejects.toThrow('HTTP 404');
+    expect(request.abort).toHaveBeenCalledTimes(1);
+  });
+});
+
+// Preserve the existing test owner/path contract after storage ports were extracted.
+vi.mock('../../ownerContext.js', () => ({
+  activeDataOwnerId: () => h.owner,
+  ownerGeneration: () => 0,
+  isOwnerBoundaryPending: () => false,
+  hasCommittedOwner: () => Boolean(h.owner),
+  ownerScopedPath: (...parts: string[]) => path.join(os.tmpdir(), 'provider-catalog-realm-reload', h.owner, ...parts),
+}));

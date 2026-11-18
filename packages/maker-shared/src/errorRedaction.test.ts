@@ -1,0 +1,468 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import {
+  canOfferCodexHistoryRecovery,
+  extractNonSecretErrorSignals,
+  GATEWAY_PROXY_TOKEN_INVALID_REASON,
+  isCindyGatewayProxyTokenInvalidError,
+  isGatewayProxyTokenInvalidError,
+  isResponsesLiteParallelToolCallsError,
+  matchesDeterministicUsageExhaustionText,
+  redactSensitiveText,
+  redactSensitiveTextDeep,
+  parseAgentErrorCode,
+  requiresAgentErrorConfigurationChange,
+  localizeSubscriptionAccountError,
+} from './errorRedaction.js';
+
+// #10187: unit coverage for the host's explicit guest resume refusal. Existing
+// code-only cases cannot distinguish it from other REMOTE_AGENT_INVALID errors.
+// Pi's casing/punctuation variant shares presentation only, never automatic replay.
+describe('guest resume rejection guidance', () => {
+  const refusal = '[REMOTE_AGENT_INVALID] this conversation cannot be resumed on this computer';
+  it.each([
+    refusal,
+    '[REMOTE_AGENT_INVALID] This conversation cannot be resumed on this computer.',
+    '[REMOTE_AGENT_INVALID] this conversation cannot be resumed on this computer.',
+    `LAZY_CREATE_FAILED: ${refusal}`,
+    `Error invoking remote method 'maker:send': Error: [IPC_ERROR] LAZY_CREATE_FAILED: ${refusal}`,
+  ])('does not offer unchanged continuation for %s', message => {
+    expect(parseAgentErrorCode(message)?.code).toBe('REMOTE_AGENT_RESUME_UNAVAILABLE');
+    expect(requiresAgentErrorConfigurationChange(message)).toBe(true);
+  });
+  it.each([
+    '[REMOTE_AGENT_INVALID] invalid request',
+    '[REMOTE_AGENT_UNAUTHORIZED] this conversation cannot be resumed on this computer',
+    '[REMOTE_AGENT_OFFLINE] connection timed out',
+    '[REMOTE_FUTURE] this conversation cannot be resumed on this computer',
+    'this conversation cannot be resumed on this computer',
+  ])('preserves the existing fallback for other refusals and network errors: %s', message => {
+    expect(requiresAgentErrorConfigurationChange(message)).toBe(false);
+  });
+});
+
+describe('explicit Codex history recovery offer', () => {
+  const message = 'stream disconnected before completion: stream closed before response.completed';
+  it('offers recovery for the terminal close without classifying it as encryption failure', () => {
+    expect(canOfferCodexHistoryRecovery({ message, agentKind: 'codex' })).toBe(true);
+  });
+  it.each([
+    { running: true }, { remoteHostId: 'ssh' }, { agentDeviceId: 'worker' },
+    { agentKind: 'cc' }, { message: 'Connection reset' },
+    { message: 'stream disconnected before completion: timeout' },
+  ])('does not offer unsupported or unrelated recovery: %s', overrides => {
+    expect(canOfferCodexHistoryRecovery({ message, agentKind: 'codex', ...overrides })).toBe(false);
+  });
+});
+
+describe('Responses Lite request error classification', () => {
+  it('recognizes the upstream error inside a JSON envelope', () => {
+    expect(isResponsesLiteParallelToolCallsError(JSON.stringify({ error: {
+      message: 'X-OpenAI-Internal-Codex-Responses-Lite requires `parallel_tool_calls` to be false.',
+      type: 'invalid_request_error', param: 'parallel_tool_calls', code: 'unsupported_value',
+    } }))).toBe(true);
+  });
+  it.each(['Invalid API key', 'Unsupported effort value', 'parallel_tool_calls is unsupported', ''])('does not misclassify unrelated errors: %s', message => {
+    expect(isResponsesLiteParallelToolCallsError(message)).toBe(false);
+  });
+});
+
+describe('matchesDeterministicUsageExhaustionText', () => {
+  it.each([
+    'insufficient_quota',
+    'insufficient credit balance',
+    'insufficient balance',
+    '{"type":"insufficient_balance_error"}',
+    'insufficient funds',
+    'quota exhausted for this key',
+    'Your quota has been exceeded',
+    'You exceeded your current quota',
+    'usage limit',
+    'account budget exhausted',
+    'session budget exhausted',
+    'usage budget has been exceeded',
+    'ExceededBudget',
+    'budget_exceeded',
+    'exceeded_budget',
+    '账户余额不足，请充值',
+    '账户欠费',
+    'You hit your spend cap set by the owner of your workspace. Ask them to raise it.',
+  ])('recognizes deterministic usage exhaustion: %s', (message) => {
+    expect(matchesDeterministicUsageExhaustionText(message)).toBe(true);
+  });
+
+  it.each([
+    '429',
+    'HTTP 429 Too Many Requests',
+    'Too Many Requests',
+    'rate limit exceeded',
+    'retry budget exhausted',
+    'retry budget exceeded',
+    'exhausted daemon retry budget',
+    'exceeded retry limit, last status: 429 Too Many Requests',
+  ])('does not treat transient or retry exhaustion as usage exhaustion: %s', (message) => {
+    expect(matchesDeterministicUsageExhaustionText(message)).toBe(false);
+  });
+});
+
+describe('redactSensitiveText', () => {
+  it('redacts LiteLLM credential fields and bearer tokens while preserving context', () => {
+    const input =
+      'Invalid proxy server token passed; Received API Key = sk-live-123456789; Key Hash (Token) = hash-abc; Authorization: Bearer secret-token; status=401';
+    const output = redactSensitiveText(input);
+
+    expect(output).not.toContain('sk-live-123456789');
+    expect(output).not.toContain('secret-token');
+    expect(output).not.toContain('hash-abc');
+    expect(output).toContain('status=401');
+    expect(output).toContain('[REDACTED]');
+  });
+
+  it('redacts JSON and query-string token fields', () => {
+    const output = redactSensitiveText(
+      '{"api_key":"abc","access_token":"def","refresh_token":"ghi"} https://example.test?token=xyz',
+    );
+
+    expect(output).not.toMatch(/abc|def|ghi|token=xyz/);
+    expect(output).toContain('"api_key":[REDACTED]');
+    expect(output).toContain('token=[REDACTED]');
+  });
+
+  it('redacts complete non-Bearer Authorization values', () => {
+    const output = redactSensitiveText('Authorization: Basic dXNlcjpwYXNz');
+
+    expect(output).toBe('Authorization: [REDACTED]');
+    expect(output).not.toContain('dXNlcjpwYXNz');
+  });
+
+  it('redacts Cookie and Set-Cookie header values', () => {
+    const output = redactSensitiveText(
+      'Cookie: session=abc123; refresh=def456\nSet-Cookie: sid=ghi789; HttpOnly',
+    );
+
+    expect(output).toBe('Cookie: [REDACTED]\nSet-Cookie: [REDACTED]');
+    expect(output).not.toMatch(/abc123|def456|ghi789/);
+  });
+
+  it('redacts Proxy-Authorization header values', () => {
+    const output = redactSensitiveText('Proxy-Authorization: Basic dXNlcjpwYXNz');
+
+    expect(output).toBe('Proxy-Authorization: [REDACTED]');
+    expect(output).not.toContain('dXNlcjpwYXNz');
+  });
+
+  // #9836: provider 403 must survive redaction; opaque credential digits must not become routing signals.
+  it.each([
+    ['HTTP 403: The caller does not have permission', 403],
+    ['{"status":403,"message":"Forbidden"}', 403],
+    ['Request rejected (403): Forbidden', 403],
+    ['Authorization: Bearer tok-403-x', undefined],
+    ['HTTP 4030: unrelated code', undefined],
+    ['Permission denied: HTTP 403', undefined],
+    ['HTTP 403: Permission denied', undefined],
+  ])('preserves an explicit provider access status in %s', (input, errorStatus) => {
+    expect(extractNonSecretErrorSignals(input)).toEqual({
+      ...(errorStatus === undefined ? {} : { errorStatus }), usageLimit: false,
+    });
+  });
+
+  it('preserves only explicit status and quota signals', () => {
+    expect(extractNonSecretErrorSignals('Authorization: Bearer tok-401-x; upstream 500')).toEqual({
+      usageLimit: false,
+    });
+    expect(
+      extractNonSecretErrorSignals('Authorization: Bearer secret-token, quota exhausted, status=429'),
+    ).toEqual({ errorStatus: 429, usageLimit: true });
+    expect(
+      extractNonSecretErrorSignals(
+        'Authorization: Bearer secret-token, "status":"401", "http_status":"429"',
+      ),
+    ).toEqual({ errorStatus: 401, usageLimit: false });
+    expect(
+      extractNonSecretErrorSignals('Authorization: Bearer secret-token, HTTP 401 Unauthorized'),
+    ).toEqual({ errorStatus: 401, usageLimit: false });
+    expect(
+      extractNonSecretErrorSignals('Authorization: Bearer secret-token, HTTP 401: Unauthorized'),
+    ).toEqual({ errorStatus: 401, usageLimit: false });
+    expect(
+      extractNonSecretErrorSignals('Authorization: Bearer secret-token, code 429'),
+    ).toEqual({ errorStatus: 429, usageLimit: false });
+    expect(
+      extractNonSecretErrorSignals(
+        'Authorization: Bearer secret-token, code=rate_limit_exceeded',
+      ),
+    ).toEqual({ usageLimit: true });
+    expect(extractNonSecretErrorSignals('{"type":"insufficient_quota"}')).toEqual({
+      usageLimit: true,
+    });
+  });
+
+  it('redacts comma-delimited Authorization parameters without leaking signatures', () => {
+    const output = redactSensitiveText(
+      'Authorization: AWS4-HMAC-SHA256 Credential=abc, SignedHeaders=host, Signature=secret; status=401',
+    );
+
+    expect(output).toBe('Authorization: [REDACTED]; status=401');
+    expect(output).not.toMatch(/Credential=abc|Signature=secret/);
+  });
+
+  it('redacts opaque custom-provider key fields', () => {
+    const output = redactSensitiveText('provider failed: key=abcd1234secret');
+
+    expect(output).toBe('provider failed: key=[REDACTED]');
+    expect(output).not.toContain('abcd1234secret');
+  });
+
+  it('redacts OAuth client secret fields', () => {
+    const output = redactSensitiveText('oauth client_secret=abc123 clientSecret: def456 secret=ghi789');
+
+    expect(output).toBe('oauth client_secret=[REDACTED] clientSecret: [REDACTED] secret=[REDACTED]');
+    expect(output).not.toMatch(/abc123|def456|ghi789/);
+  });
+
+  it('redacts password fields', () => {
+    const output = redactSensitiveText('proxy password=abc123 password: def456 passwd=ghi789');
+
+    expect(output).toBe('proxy password=[REDACTED] password: [REDACTED] passwd=[REDACTED]');
+    expect(output).not.toMatch(/abc123|def456|ghi789/);
+  });
+
+  it('redacts gateway principals while keeping surrounding diagnostics', () => {
+    const output = redactSensitiveText(
+      '{"error":"ExceededBudget","principal":"aigw:v1:cindy:usr_a1b2c3","spend":12.34,"budget":10}',
+    );
+
+    expect(output).not.toContain('usr_a1b2c3');
+    expect(output).toContain('aigw:[REDACTED]');
+    expect(output).toContain('ExceededBudget');
+    expect(output).toContain('"spend":12.34');
+
+    const inline = redactSensitiveText('Request rejected (429): budget check failed for aigw:v1:cindy:usr_a1b2c3, retry later');
+    expect(inline).not.toContain('usr_a1b2c3');
+    expect(inline).toContain('aigw:[REDACTED], retry later');
+  });
+
+  it('keeps gateway principal redaction idempotent (review 反馈)', () => {
+    // 没有 negative lookahead 时第二遍会匹配 `aigw:[REDACTED`(`]` 在排除集里),
+    // 每跑一遍多长出一个 `]`;多路径重复调用 redactSensitiveText 是常态。
+    const once = redactSensitiveText('aigw:v1:cindy:usr_a1b2c3');
+    expect(once).toBe('aigw:[REDACTED]');
+    expect(redactSensitiveText(once)).toBe('aigw:[REDACTED]');
+    expect(redactSensitiveText(redactSensitiveText(once))).toBe('aigw:[REDACTED]');
+    const inJson = redactSensitiveText(redactSensitiveText('{"principal":"aigw:v1:cindy:usr_a1b2c3"}'));
+    expect(inJson).toContain('"aigw:[REDACTED]"');
+  });
+
+  it('recognizes gateway budget-exhaustion signals', () => {
+    expect(
+      extractNonSecretErrorSignals('Request rejected (429): ExceededBudget for aigw:v1:cindy:usr_a1b2c3'),
+    ).toEqual({ errorStatus: 429, usageLimit: true });
+    expect(extractNonSecretErrorSignals('{"code":"ExceededBudget"}')).toEqual({
+      usageLimit: true,
+    });
+    // 网关结构化错误也常用 error / message 字段承载额度码(review 反馈:只认
+    // code|type 会把 {"error":"ExceededBudget"} 判成普通错误进 blocked)。
+    expect(extractNonSecretErrorSignals('{"error":"ExceededBudget","spend":12.3}')).toEqual({
+      usageLimit: true,
+    });
+    expect(extractNonSecretErrorSignals('{"message":"budget_exceeded"}')).toEqual({
+      usageLimit: true,
+    });
+    expect(extractNonSecretErrorSignals('upstream said budget_exceeded, status=429')).toEqual({
+      errorStatus: 429,
+      usageLimit: true,
+    });
+    // A 504 gateway timeout is not a quota signal and carries no supported status.
+    expect(
+      extractNonSecretErrorSignals('{"code":"origin_gateway_timeout","status":504}'),
+    ).toEqual({ usageLimit: false });
+  });
+
+  it('keeps redaction idempotent for existing placeholders', () => {
+    const output = 'access_token=[REDACTED] key=[REDACTED_KEY]';
+
+    expect(redactSensitiveText(output)).toBe(output);
+    expect(redactSensitiveText(redactSensitiveText('access_token=secret key=opaque-secret'))).toBe(
+      'access_token=[REDACTED] key=[REDACTED]',
+    );
+  });
+});
+
+describe('redactSensitiveTextDeep', () => {
+  const SK = 'sk-live-abcdef123456';
+  const BEARER = 'Bearer eyJhbGciOiJIUzI1NiJ9.payload';
+  const AIGW = 'aigw:user-9f3a2b';
+  const PASSWORD = 'password=hunter2';
+
+  it('redacts every string leaf of a nested object and preserves the shape', () => {
+    expect(
+      redactSensitiveTextDeep({
+        message: `provider refused key=${SK}`,
+        nested: { deep: { sdkError: `unauthorized ${BEARER}` } },
+        reason: `principal ${AIGW} rejected`,
+        sibling: 'plain diagnostic text',
+      }),
+    ).toEqual({
+      message: 'provider refused key=[REDACTED_KEY]',
+      nested: { deep: { sdkError: 'unauthorized Bearer [REDACTED]' } },
+      reason: 'principal aigw:[REDACTED] rejected',
+      sibling: 'plain diagnostic text',
+    });
+    // 顶层字符串本身也走同一条规则。
+    expect(redactSensitiveTextDeep(SK)).toBe('[REDACTED_KEY]');
+  });
+
+  it('walks arrays and the objects nested inside them', () => {
+    expect(redactSensitiveTextDeep([SK, { reason: AIGW }, [`x ${PASSWORD}`]])).toEqual([
+      '[REDACTED_KEY]',
+      { reason: 'aigw:[REDACTED]' },
+      ['x password=[REDACTED]'],
+    ]);
+  });
+
+  it('returns non-string leaves untouched', () => {
+    // 不要用 new Date() 当样本:deep 走 Object.entries, Date 没有自有可枚举属性,
+    // 会被重建成空对象 {}。用 number / boolean / null / undefined。
+    const output = redactSensitiveTextDeep({
+      code: 42,
+      ok: true,
+      nil: null,
+      missing: undefined,
+    });
+    expect(output).toStrictEqual({ code: 42, ok: true, nil: null, missing: undefined });
+    expect(Object.keys(output as Record<string, unknown>)).toEqual([
+      'code',
+      'ok',
+      'nil',
+      'missing',
+    ]);
+  });
+
+  it('does not mutate the input', () => {
+    const input = { message: `key=${SK}`, nested: [{ reason: AIGW }] };
+    const snapshot = structuredClone(input);
+
+    const output = redactSensitiveTextDeep(input) as typeof input;
+
+    expect(input).toEqual(snapshot);
+    expect(output).not.toBe(input);
+    expect(output.nested).not.toBe(input.nested);
+  });
+
+  it('is idempotent across repeated passes', () => {
+    const first = redactSensitiveTextDeep({
+      message: `key=${SK} ${BEARER}`,
+      reason: AIGW,
+      list: [PASSWORD],
+    });
+    const second = redactSensitiveTextDeep(first);
+
+    expect(second).toEqual(first);
+    const serialized = JSON.stringify(second);
+    // 占位符不能被第二轮再吃一遍(撑成 [REDACTED]])。
+    expect(serialized).not.toContain('[REDACTED]]');
+    expect(serialized).not.toContain('abcdef123456');
+    expect(serialized).not.toContain('hunter2');
+  });
+});
+
+describe('isGatewayProxyTokenInvalidError', () => {
+  it('matches LiteLLM invalid proxy-token 401 copy after redaction', () => {
+    expect(
+      isGatewayProxyTokenInvalidError(
+        'Failed to authenticate. API Error: 401 Authentication Error, Invalid proxy server token passed. Received API Key = [REDACTED], Key Hash (Token) =[REDACTED] Unable to find token in cache or `LiteLLM_VerificationTokenTable`',
+      ),
+    ).toBe(true);
+    expect(isGatewayProxyTokenInvalidError('Invalid proxy server token passed')).toBe(true);
+    expect(GATEWAY_PROXY_TOKEN_INVALID_REASON).toBe('gateway-proxy-token-invalid');
+  });
+
+  it('does not treat generic 401 or Claude.ai auth failures as gateway token loss', () => {
+    expect(isGatewayProxyTokenInvalidError('401 Unauthorized')).toBe(false);
+    expect(isGatewayProxyTokenInvalidError('authentication_failed')).toBe(false);
+    expect(isGatewayProxyTokenInvalidError('Missing bearer')).toBe(false);
+    expect(isGatewayProxyTokenInvalidError('')).toBe(false);
+  });
+
+  it('scopes Cindy gateway classification away from custom LiteLLM providers', () => {
+    const message = 'Invalid proxy server token; LiteLLM_VerificationTokenTable';
+    expect(
+      isCindyGatewayProxyTokenInvalidError({ reason: GATEWAY_PROXY_TOKEN_INVALID_REASON }),
+    ).toBe(true);
+    expect(isCindyGatewayProxyTokenInvalidError({ message, providerId: null })).toBe(true);
+    expect(isCindyGatewayProxyTokenInvalidError({ message, providerId: 'xd' })).toBe(true);
+    expect(isCindyGatewayProxyTokenInvalidError({ message, providerId: 'custom-litellm' })).toBe(
+      false,
+    );
+  });
+});
+
+
+describe('agent error envelopes shared by desktop and mobile', () => {
+  it.each(['REMOTE_LOCAL_ONLY_PROVIDER', 'DEVICE_LINK_MEDIA_TRANSFER_FAILED', 'DEVICE_LINK_MEDIA_ACCESS_DENIED', 'DEVICE_LINK_BUSY', 'MCP_APPROVAL_CONFIRMATION_TIMEOUT', 'AUTO_REVIEW_UNAVAILABLE', 'SSH_HARNESS_SWITCH_UNSUPPORTED', 'MODEL_SELECTION_UNAVAILABLE', 'HARNESS_SWITCH_NOT_READY', 'SUBSCRIPTION_ACCOUNTS_FULL'])(
+    'parses %s directly and inside an IPC error', code => {
+      for (const prefix of ['', '[IPC_ERROR] ', "Error invoking remote method 'maker:send': Error: ", 'LAZY_CREATE_FAILED: ']) {
+        expect(parseAgentErrorCode(`${prefix}[${code}] first line\nsecond line`)).toEqual({ code, fallback: 'first line\nsecond line' });
+      }
+    },
+  );
+  it('preserves the legacy unknown-REMOTE fallback without treating arbitrary bracket text as a code', () => {
+    expect(parseAgentErrorCode('[REMOTE_FUTURE] diagnostic')).toEqual({ code: 'REMOTE_FUTURE', fallback: 'diagnostic' });
+    expect(parseAgentErrorCode('[REMOTE_FUTURE]')).toEqual({ code: 'REMOTE_FUTURE', fallback: '[REMOTE_FUTURE]' });
+    expect(parseAgentErrorCode('[CUSTOM_ERROR] diagnostic')).toBeNull();
+    expect(parseAgentErrorCode('prose containing [REMOTE_FUTURE] diagnostic')).toBeNull();
+  });
+});
+
+// Unit regression: startup envelopes previously fell back to "reply failed".
+// The public presenter must preserve cause and trusted time across IPC wrappers.
+describe('subscription account startup guidance', () => {
+  beforeEach(() => { vi.spyOn(Date, 'now').mockReturnValue(1899999999000); });
+  afterEach(() => { vi.restoreAllMocks(); });
+  const t = (key: string, options?: { resetAt: string }) => key + (options ? ` ${options.resetAt}` : '');
+  // Unit: reopening a saved error at/after reset must not present an expired
+  // timestamp as a future wait, regardless of which client renders it.
+  it.each([-1, 0])('omits a reset timestamp %i ms from now', offset => {
+    const message = `[SUBSCRIPTION_ACCOUNT_LIMITED] diagnostic\nresetAtMs=${Date.now() + offset}`;
+    expect(localizeSubscriptionAccountError(message, t, 'zh-CN')).toBe('chat.subscriptionAccountError.limited');
+  });
+  it.each(['', 'LAZY_CREATE_FAILED: ', "Error invoking remote method 'send': Error: [IPC_ERROR] LAZY_CREATE_FAILED: "])(
+    'keeps the limit and reset time through %s', prefix => {
+      const text = localizeSubscriptionAccountError(`${prefix}[SUBSCRIPTION_ACCOUNT_LIMITED] diagnostic\nresetAtMs=1900000000000`, t, 'zh-CN');
+      expect(text).toContain('chat.subscriptionAccountError.limitedUntil');
+      expect(text).toContain(new Intl.DateTimeFormat('zh-CN', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(1900000000000)));
+    });
+  it.each(['', '\nresetAtMs=NaN', '\nresetAtMs=-1', '\nresetAtMs=9999999999999999'])(
+    'does not invent a reset time for %s', metadata => {
+      expect(localizeSubscriptionAccountError(`[SUBSCRIPTION_ACCOUNT_LIMITED] diagnostic${metadata}`, t)).toBe('chat.subscriptionAccountError.limited');
+    });
+  it('keeps old ambiguous failures cause-neutral and rejects unrelated messages', () => {
+    expect(localizeSubscriptionAccountError('LAZY_CREATE_FAILED: The task subscription account requires login or quota reset', t)).toBe('chat.subscriptionAccountError.legacy');
+    expect(localizeSubscriptionAccountError('An upstream diagnostic mentions quota reset', t)).toBeNull();
+    expect(localizeSubscriptionAccountError('[REMOTE_FUTURE] quota reset', t)).toBeNull();
+  });
+});
+
+// #10187: released hosts reject an unowned native resume before starting an
+// Agent. Presentation must offer a route change, not an endless resend (unit).
+describe('remote native resume rejection', () => {
+  it.each([
+    '[REMOTE_AGENT_INVALID] this conversation cannot be resumed on this computer',
+    'LAZY_CREATE_FAILED: [REMOTE_AGENT_INVALID] this conversation cannot be resumed on this computer',
+    'REHYDRATE_FAILED: [REMOTE_AGENT_INVALID] This conversation cannot be resumed on this computer.',
+    "Error invoking remote method 'maker:send': Error: [IPC_ERROR] LAZY_CREATE_FAILED: [REMOTE_AGENT_INVALID] this conversation cannot be resumed on this computer",
+  ])('classifies the released-host error through %s', message => {
+    expect(parseAgentErrorCode(message)?.code).toBe('REMOTE_AGENT_RESUME_UNAVAILABLE');
+    expect(requiresAgentErrorConfigurationChange(message)).toBe(true);
+  });
+  it.each([
+    '[REMOTE_AGENT_INVALID] invalid remote agent request',
+    '[REMOTE_AGENT_INVALID] this shared task is not authorized on this computer',
+    '[REMOTE_AGENT_INVALID] this conversation cannot be forked on this computer',
+    '[REMOTE_AGENT_UNAVAILABLE] this conversation cannot be resumed on this computer',
+    'this conversation cannot be resumed on this computer',
+  ])('does not reinterpret a different rejection: %s', message => {
+    expect(parseAgentErrorCode(message)?.code).not.toBe('REMOTE_AGENT_RESUME_UNAVAILABLE');
+    expect(requiresAgentErrorConfigurationChange(message)).toBe(false);
+  });
+});

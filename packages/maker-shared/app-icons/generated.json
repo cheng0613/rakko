@@ -1,0 +1,9 @@
+{
+  "sources": {
+    "packages/maker-shared/app-icons/manifest.json": "4390a0db816a46596b9fe153b1e85427f871749777a02dc06d23e6e0c2ecd030",
+    "apps/mobile/assets/icon.png": "f954fa4b955bdb828f0c18745123175d9244f5a0337091ddf51e7922f08ecc42"
+  },
+  "outputs": {
+    "apps/mobile/assets/app-icons/default.png": "0aa1f0e2245fa7f75a9f5f6bdf0d5033e51b6f22da32ebec77be246a5f97b931"
+  }
+}

@@ -1,0 +1,475 @@
+/**
+ * 客户端说明(远程设备):来源判据(体验分流用,**非**安全边界 —— 平台值由对端自报,见
+ * device-link/invoke-context 的可信度说明)、设备盖章、wire 注入形态、以及「只进喂给
+ * agent 的内容、不进落库原话」这条不变量的源码级守卫。
+ */
+import { describe, it, expect, beforeEach } from 'vitest';
+
+import {
+  clearControllerPlatforms,
+  getControllerPlatform,
+  isMobilePlatform,
+  setControllerPlatform,
+} from '../device-link/controllerPlatform';
+import {
+  isDeviceLinkInvoke,
+  isMobileControllerInvoke,
+  readDeviceLinkInvokeSourceDevice,
+  runDeviceLinkInvokeContext,
+} from '../device-link/invoke-context';
+import type { SharedTaskPeerCapture } from '../device-link/sharedTaskDispatch';
+import {
+  prependHandoffToUserMessage,
+  prependNoteToWireUserMessage,
+} from '../maker-ipc/agentHandoff';
+import {
+  attachMainOwnedInputBoundary,
+  buildClientEnvironmentNote,
+  buildMobileClientPromptNote,
+  shouldPrependMobileClientPromptNote,
+  stampDirectSendSourceDevice,
+  stampMobileClientOrigin,
+  stripMainOnlySendOpts,
+} from '../maker-ipc/mobileClientPromptNote';
+
+describe('isMobilePlatform(平台判据)', () => {
+  it('手机平台为真', () => {
+    expect(isMobilePlatform('ios')).toBe(true);
+    expect(isMobilePlatform('android')).toBe(true);
+  });
+
+  it('桌面平台为假', () => {
+    expect(isMobilePlatform('darwin')).toBe(false);
+    expect(isMobilePlatform('win32')).toBe(false);
+    expect(isMobilePlatform('linux')).toBe(false);
+  });
+
+  it('未知 / 缺失一律为假(fail-closed,不能靠 !isDesktopPlatform 取反)', () => {
+    // presence 未到、旧客户端报了别的字符串时,平台是「未知」而不是「手机」。
+    expect(isMobilePlatform(undefined)).toBe(false);
+    expect(isMobilePlatform(null)).toBe(false);
+    expect(isMobilePlatform('')).toBe(false);
+    expect(isMobilePlatform('freebsd')).toBe(false);
+    expect(isMobilePlatform('iOS')).toBe(false); // 大小写敏感,presence 报的是小写
+  });
+});
+
+describe('控制端平台登记表', () => {
+  beforeEach(() => {
+    clearControllerPlatforms();
+  });
+
+  it('登记后可按 deviceId 查回;未登记为 undefined', () => {
+    setControllerPlatform('dev-phone', 'ios');
+    expect(getControllerPlatform('dev-phone')).toBe('ios');
+    expect(getControllerPlatform('dev-unknown')).toBeUndefined();
+  });
+
+  it('清空后不残留(账号切换 / 连接重置)', () => {
+    setControllerPlatform('dev-phone', 'ios');
+    clearControllerPlatforms();
+    expect(getControllerPlatform('dev-phone')).toBeUndefined();
+  });
+});
+
+describe('isMobileControllerInvoke(来源判据)', () => {
+  it('本机 renderer(无 device-link 上下文)为假', () => {
+    expect(isDeviceLinkInvoke()).toBe(false);
+    expect(isMobileControllerInvoke()).toBe(false);
+  });
+
+  it('手机控制端为真', () => {
+    const seen = runDeviceLinkInvokeContext(
+      { controllerDeviceId: 'dev-phone', channel: 'maker:send', controllerPlatform: 'android' },
+      () => isMobileControllerInvoke(),
+    );
+    expect(seen).toBe(true);
+  });
+
+  it('另一台桌面作控制端为假(远控不等于手机)', () => {
+    const seen = runDeviceLinkInvokeContext(
+      { controllerDeviceId: 'dev-mac', channel: 'maker:send', controllerPlatform: 'darwin' },
+      () => isMobileControllerInvoke(),
+    );
+    expect(seen).toBe(false);
+  });
+
+  it('platform 未知为假,但仍算 device-link 调用(两个判据互不干扰)', () => {
+    const seen = runDeviceLinkInvokeContext(
+      { controllerDeviceId: 'dev-x', channel: 'maker:send' },
+      () => ({ mobile: isMobileControllerInvoke(), remote: isDeviceLinkInvoke() }),
+    );
+    expect(seen).toEqual({ mobile: false, remote: true });
+  });
+
+  it('跨 await 后仍成立 —— send 路径外面套了串行锁,上下文必须能穿过它', async () => {
+    const seen = await runDeviceLinkInvokeContext(
+      { controllerDeviceId: 'dev-phone', channel: 'maker:send', controllerPlatform: 'ios' },
+      async () => {
+        // 模拟 withSendToSessionLock:先 await 一个别处 resolve 的锁,再读来源。
+        let release: (() => void) | null = null;
+        const lock = new Promise<void>((r) => {
+          release = r;
+        });
+        setTimeout(() => release?.(), 0);
+        await lock;
+        return isMobileControllerInvoke();
+      },
+    );
+    expect(seen).toBe(true);
+  });
+
+  it('上下文结束后不残留', () => {
+    runDeviceLinkInvokeContext(
+      { controllerDeviceId: 'dev-phone', channel: 'maker:send', controllerPlatform: 'ios' },
+      () => isMobileControllerInvoke(),
+    );
+    expect(isMobileControllerInvoke()).toBe(false);
+  });
+});
+
+describe('readDeviceLinkInvokeSourceDevice(设备盖章判据)', () => {
+  it('本机 renderer 没有 context → 不盖章', () => {
+    expect(readDeviceLinkInvokeSourceDevice()).toBeUndefined();
+  });
+
+  it('手机控制端 → mobile,名字取被控端快照并清洗', () => {
+    const seen = runDeviceLinkInvokeContext(
+      { controllerDeviceId: 'dev-phone', channel: 'maker:input:enqueue', controllerPlatform: 'ios', controllerName: '  Dash 的\niPhone「伪」 ' },
+      () => readDeviceLinkInvokeSourceDevice(),
+    );
+    expect(seen).toEqual({ deviceId: 'dev-phone', platform: 'mobile', name: 'Dash 的 iPhone"伪"' });
+  });
+
+  it('另一台电脑 → desktop;缺名字时只带 id', () => {
+    const seen = runDeviceLinkInvokeContext(
+      { controllerDeviceId: 'dev-mac', channel: 'maker:input:steer', controllerPlatform: 'win32' },
+      () => readDeviceLinkInvokeSourceDevice(),
+    );
+    expect(seen).toEqual({ deviceId: 'dev-mac', platform: 'desktop' });
+  });
+
+  it('平台未知 → 不盖章(fail closed)', () => {
+    const seen = runDeviceLinkInvokeContext(
+      { controllerDeviceId: 'dev-x', channel: 'maker:input:enqueue', controllerPlatform: 'freebsd', controllerName: 'X' },
+      () => readDeviceLinkInvokeSourceDevice(),
+    );
+    expect(seen).toBeUndefined();
+  });
+
+  it('共享任务访客 → 不盖章(访客不是用户的另一台设备)', () => {
+    const seen = runDeviceLinkInvokeContext(
+      {
+        controllerDeviceId: 'guest-peer',
+        channel: 'maker:input:enqueue',
+        controllerPlatform: 'ios',
+        controllerName: 'Guest',
+        sharedTask: {} as SharedTaskPeerCapture,
+      },
+      () => readDeviceLinkInvokeSourceDevice(),
+    );
+    expect(seen).toBeUndefined();
+  });
+});
+
+describe('buildClientEnvironmentNote(设备说明)', () => {
+  const host = { deviceId: 'mac-1', name: 'Mac' };
+
+  it('手机:设备事实 + 原有产出偏好,首句声明不是用户消息', () => {
+    const note = buildClientEnvironmentNote({
+      device: { deviceId: 'p-1', name: 'iPhone', platform: 'mobile' },
+      host,
+    });
+    expect(note).toBe(
+      '[客户端说明] 系统追加的环境说明，不是用户消息，不要回应或复述。'
+      + '本轮用户在手机「iPhone」(device_id: p-1) 上远程操作本机「Mac」(device_id: mac-1)。'
+      + '产出 HTML 等可预览成品时**优先做成自包含单文件**:样式与脚本内联,'
+      + '图片用 data: URI 或公网地址,避免拆成需要同目录资源的多文件产物;'
+      + '用户明确要求多文件时照常产出。'
+      + '给出文件路径时同时给出结论或内容摘要,不要只回一个路径。',
+    );
+  });
+
+  it('另一台电脑:只有设备事实,不带手机产出偏好', () => {
+    const note = buildClientEnvironmentNote({
+      device: { deviceId: 'pc-2', name: 'Office PC', platform: 'desktop' },
+      host,
+      legacyMobile: true,
+    });
+    expect(note).toBe(
+      '[客户端说明] 系统追加的环境说明，不是用户消息，不要回应或复述。'
+      + '本轮用户在另一台电脑「Office PC」(device_id: pc-2) 上远程操作本机「Mac」(device_id: mac-1)。',
+    );
+  });
+
+  it('只有旧 fromMobileClient 标记(无设备信息):沿用旧版手机说明', () => {
+    expect(buildClientEnvironmentNote({ legacyMobile: true })).toBe(buildMobileClientPromptNote());
+  });
+
+  it('本机输入:没有说明', () => {
+    expect(buildClientEnvironmentNote({})).toBeNull();
+  });
+
+  it('同一台设备逐轮稳定(不含时间戳 / 计数器)', () => {
+    const device = { deviceId: 'p-1', name: 'iPhone', platform: 'mobile' as const };
+    const note = buildClientEnvironmentNote({ device, host });
+    expect(buildClientEnvironmentNote({ device: { ...device }, host: { ...host } })).toBe(note);
+    expect(note).not.toMatch(/\d{4}-\d{2}-\d{2}/);
+  });
+});
+
+describe('buildMobileClientPromptNote(送进模型的文本)', () => {
+  const note = buildMobileClientPromptNote();
+
+  it('首句声明这不是用户消息(否则模型会当请求回应或复述)', () => {
+    expect(note.startsWith('[客户端说明]')).toBe(true);
+    expect(note).toContain('不是用户发来的消息');
+    expect(note).toContain('不要把它当作用户的请求');
+  });
+
+  it('给出自包含单文件的产出偏好', () => {
+    expect(note).toContain('手机客户端');
+    expect(note).toContain('自包含单文件');
+  });
+
+  it('是偏好不是禁令:用户明确要多文件时不被挡住', () => {
+    expect(note).toContain('优先');
+    expect(note).toContain('明确要求多文件时照常产出');
+    expect(note).not.toContain('必须做成');
+    expect(note).not.toContain('禁止');
+  });
+
+  it('不写「不要给本地路径」—— 手机端本就能打开路径,那样写会和已有能力打架', () => {
+    // 路径在手机上可点、可渲染、同目录资源会被取回(见 mobile 的 HtmlFileReader /
+    // htmlLocalResources)。这里只要求「别只回一个路径」,不否定给路径本身。
+    expect(note).not.toContain('不要给出路径');
+    expect(note).not.toContain('不要给本地路径');
+    expect(note).toContain('不要只回一个路径');
+  });
+
+  it('逐字节稳定(同一台设备逐轮不变):不含时间戳 / 随机量等易变内容', () => {
+    expect(buildMobileClientPromptNote()).toBe(note);
+    expect(note).not.toMatch(/\d{4}-\d{2}-\d{2}/);
+    expect(note).not.toMatch(/\d{10,}/);
+  });
+});
+
+describe('prependNoteToWireUserMessage(wire 注入形态)', () => {
+  it('string 形态直接前拼', () => {
+    expect(prependNoteToWireUserMessage('原话', 'NOTE')).toBe('NOTE\n\n原话');
+  });
+
+  it('content 为 string 的对象形态', () => {
+    expect(prependNoteToWireUserMessage({ type: 'user', content: '原话' }, 'NOTE'))
+      .toEqual({ type: 'user', content: 'NOTE\n\n原话' });
+  });
+
+  it('blocks 形态前插独立 text block,原 blocks 不变', () => {
+    const blocks = [{ type: 'image', url: 'x' }, { type: 'text', text: '原话' }];
+    expect(prependNoteToWireUserMessage({ type: 'user', content: blocks }, 'NOTE'))
+      .toEqual({ type: 'user', content: [{ type: 'text', text: 'NOTE' }, ...blocks] });
+    // 不原地改入参(调用方还要用 normalized 去落库)。
+    expect(blocks[0]).toEqual({ type: 'image', url: 'x' });
+  });
+
+  it('交接前缀仍走同一份实现(向后兼容)', () => {
+    expect(prependHandoffToUserMessage('原话', 'HANDOFF')).toBe('HANDOFF\n\n原话');
+  });
+
+  it('说明 + 交接叠加时说明在最前(交接自带结束标记,必须收尾在后)', () => {
+    const withHandoff = prependHandoffToUserMessage('原话', 'HANDOFF');
+    expect(prependNoteToWireUserMessage(withHandoff, 'NOTE')).toBe('NOTE\n\nHANDOFF\n\n原话');
+  });
+});
+
+describe('shouldPrependMobileClientPromptNote(内置命令旁路)', () => {
+  it('Claude Code /compact 保持在消息开头，含可选指令也旁路', () => {
+    expect(shouldPrependMobileClientPromptNote('/compact', 'claude-code')).toBe(false);
+    expect(shouldPrependMobileClientPromptNote('/compact focus on decisions', 'claude-code'))
+      .toBe(false);
+    expect(shouldPrependMobileClientPromptNote(
+      { type: 'user', content: '/compact\nkeep the API contract' },
+      'claude-code',
+    )).toBe(false);
+    expect(shouldPrependMobileClientPromptNote(
+      { type: 'user', content: [{ type: 'text', text: '/compact' }] },
+      'claude-code',
+    )).toBe(false);
+  });
+
+  it('不把相似文本、带附件消息或其他 Agent 的输入误判成 Claude 命令', () => {
+    expect(shouldPrependMobileClientPromptNote('/compactness', 'claude-code')).toBe(true);
+    expect(shouldPrependMobileClientPromptNote('/learner', 'claude-code')).toBe(true);
+    expect(shouldPrependMobileClientPromptNote('/other:learn', 'claude-code')).toBe(true);
+    expect(shouldPrependMobileClientPromptNote(' /compact', 'claude-code')).toBe(true);
+    expect(shouldPrependMobileClientPromptNote(
+      {
+        type: 'user',
+        content: [
+          { type: 'text', text: '/compact' },
+          { type: 'image', url: 'x' },
+        ],
+      },
+      'claude-code',
+    )).toBe(true);
+    expect(shouldPrependMobileClientPromptNote('/compact', 'pi')).toBe(false);
+    expect(shouldPrependMobileClientPromptNote('/compact', 'codex')).toBe(true);
+  });
+});
+
+describe('stampMobileClientOrigin(IPC 边界盖章)', () => {
+  it('手机来源盖上标记,返回新对象不改入参', () => {
+    // 显式标出可选字段:真实入参是 AgentInputQueuedMessage(该字段是可选的),
+    // 字面量不写这一项会让 TS 判「与约束无公共属性」(TS2559)而拒收。
+    const item: { clientId: string; text: string; fromMobileClient?: boolean } = { clientId: 'a', text: 'hi' };
+    const out = stampMobileClientOrigin(item, true);
+    expect(out).toEqual({ clientId: 'a', text: 'hi', fromMobileClient: true });
+    expect(item).toEqual({ clientId: 'a', text: 'hi' });
+  });
+
+  it('非手机来源:客户端自填的标记必须被剥掉(wire 值一律不生效)', () => {
+    // item 来自 wire,客户端可以自己填 true —— 必须无条件覆盖。
+    const forged = { clientId: 'a', text: 'hi', fromMobileClient: true };
+    expect(stampMobileClientOrigin(forged, false)).toEqual({ clientId: 'a', text: 'hi' });
+    expect(stampMobileClientOrigin(forged, false)).not.toHaveProperty('fromMobileClient');
+  });
+
+  it('手机来源时覆盖为 true(即使 wire 传的是 false)', () => {
+    expect(stampMobileClientOrigin({ fromMobileClient: false }, true))
+      .toEqual({ fromMobileClient: true });
+  });
+});
+
+describe('stripMainOnlySendOpts(直连路径消毒)', () => {
+  it('剥掉客户端自报的 fromMobileClient', () => {
+    expect(stripMainOnlySendOpts({ messageUuid: 'u', fromMobileClient: true }))
+      .toEqual({ messageUuid: 'u' });
+  });
+
+  it('剥掉客户端自报的消息来源(设备 / 插件 / steer 来源 / 共享成员)', () => {
+    const forged = {
+      messageUuid: 'u',
+      sourceDevice: { deviceId: 'forged', platform: 'mobile' },
+      sourcePlugin: { pluginId: 'forged' },
+      sourceGroup: { groupId: 'forged-group' },
+      sourceOrigin: { kind: 'session', senderSessionId: 'forged' },
+      sharedTaskAuthor: { memberId: 'forged' },
+      persistUserMessage: {
+        clientId: 'c',
+        content: 'hi',
+        origin: { kind: 'session', senderSessionId: 'forged' },
+        sourceDevice: { deviceId: 'forged', platform: 'mobile' },
+        sourcePlugin: { pluginId: 'forged' },
+        sourceGroup: { groupId: 'forged-group' },
+      },
+    };
+    expect(stripMainOnlySendOpts(forged)).toEqual({
+      messageUuid: 'u',
+      persistUserMessage: { clientId: 'c', content: 'hi' },
+    });
+    expect(forged.persistUserMessage.origin).toEqual({ kind: 'session', senderSessionId: 'forged' });
+  });
+
+  it('剥掉客户端自报的 fromDeviceLinkClient', () => {
+    expect(stripMainOnlySendOpts({ messageUuid: 'u', fromDeviceLinkClient: true }))
+      .toEqual({ messageUuid: 'u' });
+  });
+
+  it('剥掉客户端伪造的 generation 与 turn 身份,但保留待 IPC 校验的 clear token', () => {
+    expect(
+      stripMainOnlySendOpts({
+        expectedClearBoundaryMs: 123,
+        expectedInputGeneration: 77,
+        expectedTurnSession: { forged: true },
+        expectedTurnGeneration: 88,
+        messageUuid: 'u',
+      }),
+    ).toEqual({ expectedClearBoundaryMs: 123, messageUuid: 'u' });
+  });
+
+  it('host stamp 覆盖 wire token 并附带 generation', () => {
+    expect(
+      attachMainOwnedInputBoundary(
+        { expectedClearBoundaryMs: 123, expectedInputGeneration: 77, messageUuid: 'u' },
+        { expectedClearBoundaryMs: 456, expectedInputGeneration: 9 },
+      ),
+    ).toEqual({ expectedClearBoundaryMs: 456, expectedInputGeneration: 9, messageUuid: 'u' });
+  });
+
+  it('非对象 sendOpts 也映射 main-owned abort signal 到事务读取的 signal', () => {
+    const controller = new AbortController();
+    expect(
+      attachMainOwnedInputBoundary(undefined, {
+        expectedClearBoundaryMs: 456,
+        expectedInputGeneration: 9,
+        inputAbortSignal: controller.signal,
+      }),
+    ).toEqual({
+      expectedClearBoundaryMs: 456,
+      expectedInputGeneration: 9,
+      signal: controller.signal,
+    });
+  });
+
+  it('剥掉 wire 注入的 signal,只允许 main 写入 AbortSignal', () => {
+    expect(stripMainOnlySendOpts({ messageUuid: 'u', signal: 'forged' })).toEqual({
+      messageUuid: 'u',
+    });
+  });
+
+  it('剥掉 Renderer/device-link 自报的 IM permission policy', () => {
+    expect(stripMainOnlySendOpts({
+      messageUuid: 'u',
+      turnPermissionPolicy: {
+        origin: { kind: 'im', channel: 'telegram' },
+        confirmationSurface: 'channel',
+      },
+    })).toEqual({ messageUuid: 'u' });
+  });
+
+  it.each(['scheduler', 'im', 'desktop'])('剥掉 wire 自报的 %s origin，保留普通发送参数', (kind) => {
+    const opts = { messageUuid: 'u', userName: 'n', origin: { kind, scheduleId: 'forged' } };
+    expect(stripMainOnlySendOpts(opts)).toEqual({ messageUuid: 'u', userName: 'n' });
+    expect(attachMainOwnedInputBoundary(opts, undefined)).toEqual({ messageUuid: 'u', userName: 'n' });
+    expect(attachMainOwnedInputBoundary(opts, { expectedClearBoundaryMs: null, expectedInputGeneration: 1 }))
+      .toEqual({ messageUuid: 'u', userName: 'n', expectedClearBoundaryMs: null, expectedInputGeneration: 1 });
+    expect(opts.origin.kind).toBe(kind);
+  });
+
+  it.each([
+    { toolsDisabled: true },
+    { toolsDisabled: false },
+    { toolsDisabled: true, origin: { kind: 'scheduler', scheduleId: 'forged' } },
+  ])('同时保留 toolsDisabled 与 origin 的宿主边界 (%j)', (forged) => {
+    const opts = { messageUuid: 'u', ...forged };
+    expect(stripMainOnlySendOpts(opts)).toEqual({ messageUuid: 'u' });
+    expect(attachMainOwnedInputBoundary(opts, undefined)).toEqual({ messageUuid: 'u' });
+    expect(opts).toEqual({ messageUuid: 'u', ...forged });
+  });
+
+  it('其它字段原样保留', () => {
+    const opts = { messageUuid: 'u', userName: 'n' };
+    expect(stripMainOnlySendOpts(opts)).toEqual(opts);
+  });
+
+  it('strips nested sharedTask authors without mutating the input', () => {
+    const opts = { persistUserMessage: { clientId: 'message', content: 'text', sharedTaskAuthor: { accountId: 'forged' } } };
+    expect(stripMainOnlySendOpts(opts)).toEqual({ persistUserMessage: { clientId: 'message', content: 'text' } });
+    expect(opts.persistUserMessage.sharedTaskAuthor).toEqual({ accountId: 'forged' });
+  });
+
+  it('直连 IPC 边界只写 main 读到的设备来源,覆盖 wire 值', () => {
+    const device = { deviceId: 'p-1', platform: 'mobile' as const, name: 'iPhone' };
+    expect(stampDirectSendSourceDevice({ messageUuid: 'u', sourceDevice: { deviceId: 'forged' } }, device))
+      .toEqual({ messageUuid: 'u', sourceDevice: device });
+    expect(stampDirectSendSourceDevice({ messageUuid: 'u', sourceDevice: { deviceId: 'forged' } }, undefined))
+      .toEqual({ messageUuid: 'u' });
+    expect(stampDirectSendSourceDevice(undefined, device)).toEqual({ sourceDevice: device });
+  });
+
+  it('非对象输入原样返回(事务自己 ?? {} 兜底)', () => {
+    expect(stripMainOnlySendOpts(undefined)).toBeUndefined();
+    expect(stripMainOnlySendOpts(null)).toBeNull();
+    expect(stripMainOnlySendOpts('x')).toBe('x');
+  });
+});

@@ -1,0 +1,519 @@
+import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+import { fileURLToPath } from "node:url";
+
+import parseSpdxExpression from "spdx-expression-parse";
+
+const repoRoot = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "..",
+);
+const noticesDir = path.join(repoRoot, "docs", "legal", "notices");
+const artifactNames = [
+  "desktop-win",
+  "desktop-macos",
+  "desktop-linux",
+  "mobile-ios",
+  "mobile-android",
+];
+
+function read(relativePath) {
+  return fs.readFileSync(path.join(repoRoot, relativePath), "utf8");
+}
+
+test("speaker models and native inference libraries are disclosed on both clients", () => {
+  for (const artifact of artifactNames) {
+    const notices = read(`docs/legal/notices/${artifact}.txt`);
+    assert.ok(notices.includes("Silero VAD (runtime-downloaded model)"));
+    assert.ok(notices.includes("3D-Speaker CAM++ zh-en advanced"));
+    assert.ok(notices.includes("ONNX Runtime (native inference library)"));
+  }
+});
+
+test("Windows input helper dependencies participate in Cargo license collection", () => {
+  const source = read("scripts/generate-third-party-notices.mjs");
+  assert.ok(source.includes('"windows-gamepad-helper"'));
+  assert.ok(source.includes('"windows-micro-helper"'));
+});
+
+test("generated artifact notices are platform-scoped and disclose restricted components separately", () => {
+  const windows = read("docs/legal/notices/desktop-win.txt");
+  const macos = read("docs/legal/notices/desktop-macos.txt");
+  const linux = read("docs/legal/notices/desktop-linux.txt");
+  const windowsRestricted = read(
+    "docs/legal/notices/desktop-win-restricted.txt",
+  );
+  const macosRestricted = read(
+    "docs/legal/notices/desktop-macos-restricted.txt",
+  );
+  const linuxRestricted = read(
+    "docs/legal/notices/desktop-linux-restricted.txt",
+  );
+  const iosRestricted = read("docs/legal/notices/mobile-ios-restricted.txt");
+  const androidRestricted = read(
+    "docs/legal/notices/mobile-android-restricted.txt",
+  );
+
+  assert.match(windows, /@img\/sharp-win32-x64@/);
+  assert.doesNotMatch(windows, /@img\/sharp-darwin-/);
+  assert.match(windows, /SECTION \d+: cargo packages/);
+  assert.match(windows, /Android SDK Platform-Tools/);
+  // 安装包内资产和运行时受管下载的 agent 二进制，都必须出现在三个桌面平台声明里。
+  for (const notice of [windows, macos, linux]) {
+    assert.match(notice, /OpenAI Codex CLI \(runtime-downloaded binary\) \d/);
+    assert.match(notice, /pi coding agent \(runtime-downloaded binary\) \d/);
+    assert.match(notice, /ripgrep \(bundled binary\) \d/);
+  }
+  assert.match(macos, /@img\/sharp-darwin-/);
+  assert.doesNotMatch(macos, /Android SDK Platform-Tools/);
+  assert.match(linux, /@img\/sharp-linux-x64@/);
+  assert.doesNotMatch(windowsRestricted, /@codesandbox\/nodebox/);
+  assert.doesNotMatch(windowsRestricted, /Sustainable Use License/);
+  assert.match(windowsRestricted, /Microsoft Visual C\+\+ Runtime/);
+  assert.doesNotMatch(macosRestricted, /Microsoft Visual C\+\+ Runtime/);
+  assert.doesNotMatch(linuxRestricted, /Microsoft Visual C\+\+ Runtime/);
+  assert.match(iosRestricted, /WeChat OpenSDK for iOS@2\.0\.5/);
+  assert.match(iosRestricted, /docs\/legal\/wechat-open-sdk-compliance\.md/);
+  assert.match(iosRestricted, /Mobile_App\/agreement\/sdk\.html/);
+  assert.doesNotMatch(iosRestricted, /WeChat OpenSDK for Android@6\.8\.38/);
+  assert.match(androidRestricted, /WeChat OpenSDK for Android@6\.8\.38/);
+  assert.match(androidRestricted, /docs\/legal\/wechat-open-sdk-compliance\.md/);
+  assert.match(androidRestricted, /Mobile_App\/agreement\/sdk\.html/);
+  assert.doesNotMatch(androidRestricted, /Claude Code CLI@/);
+  assert.doesNotMatch(windows, /@codesandbox\/nodebox@0\.1\.8 —/);
+});
+
+test("multi-arch desktop notices describe every architecture they ship with", () => {
+  const macos = read("docs/legal/notices/desktop-macos.txt");
+  const linux = read("docs/legal/notices/desktop-linux.txt");
+
+  // 一个平台声明覆盖两个架构时,内嵌原生库的 README 和 versions.json 都是 per-arch 的:
+  // 只读其中一份,另一个架构的分发物就会带着错误的架构描述发出去。
+  assert.match(
+    macos,
+    /@img\/sharp-libvips-darwin-x64 embedded native libraries/,
+  );
+  assert.match(
+    macos,
+    /@img\/sharp-libvips-darwin-arm64 embedded native libraries/,
+  );
+  assert.match(macos, /for use with sharp on macOS x64\./);
+  assert.match(macos, /for use with sharp on macOS 64-bit ARM\./);
+  assert.match(
+    linux,
+    /@img\/sharp-libvips-linux-x64 embedded native libraries/,
+  );
+  assert.match(
+    linux,
+    /@img\/sharp-libvips-linux-arm64 embedded native libraries/,
+  );
+  assert.match(linux, /for use with sharp on Linux \(glibc\) x64\./);
+  assert.match(linux, /for use with sharp on Linux \(glibc\) 64-bit ARM\./);
+});
+
+// 移动端安装包不分发构建期工具链的预编译二进制，但这些包的许可义务由其 JS 主包
+// 承载，主包必须留在声明里。
+test("mobile notices exclude build-time platform binaries but keep their JS packages", () => {
+  for (const artifact of ["mobile-ios", "mobile-android"]) {
+    const notices = read(`docs/legal/notices/${artifact}.txt`);
+    // 覆盖 name-darwin-arm64 与 @scope/darwin-arm64 两种命名形式。
+    assert.doesNotMatch(
+      notices,
+      /^- \S*(?:darwin|linux|win32|musl|freebsd)\S*@/im,
+    );
+    assert.match(notices, /^- lightningcss@/m);
+  }
+});
+
+// 闭包必须按显式目标平台收集：collectClosure() 判断可选依赖是否存在只看 node_modules
+// 里有没有目录，省掉 target 就会让产物随生成机器的安装集合漂移。
+//
+// 这里守的是那一处强制校验本身，而不是去枚举调用点。枚举的写法（无论正则还是括号扫描）
+// 都能被换一种调用形式绕过，且在本文件上会实打实误报——生成器的错误消息与注释里都出现
+// 了 `collectClosure(`，而源码含带引号的正则字面量，使得零依赖的字符串跳过无法可靠实现。
+// 强制校验则覆盖全部调用形式：`licenses:generate` 是产物的唯一生成途径，缺 target 的调用
+// 必然在生成时抛错，产物不可能带着机器相关的内容进仓库。
+test("collectClosure() refuses to run without an explicit target", () => {
+  const source = read("scripts/generate-third-party-notices.mjs");
+  const signature = source.match(/function collectClosure\(([^)]*)\)/)?.[1];
+  assert.ok(signature, "找不到 collectClosure 定义，守卫已失效");
+  assert.doesNotMatch(
+    signature,
+    /=/,
+    "target 不得有默认值：默认值会让缺 target 的调用静默恢复成机器相关行为",
+  );
+  assert.match(source, /requires an explicit target/);
+  // linux 目标必须连 libc 一起强制：只有 linux 分 glibc / musl，缺了这一轴
+  // matchesPackageConstraint() 会把两种变体同时放行，产物又随本机装了哪个变体漂移。
+  assert.match(
+    source,
+    /os === "linux"\s*\?\s*\["os", "cpu", "libc"\]/,
+    "linux 目标未强制 libc：glibc 与 musl 变体会同时进闭包",
+  );
+  // matchesTarget() 不得再有「target 为空则一律放行」的分支，那是漂移的根源。
+  const matchesTarget = source.match(
+    /function matchesTarget\([^)]*\)\s*\{[\s\S]*?\n\}/,
+  )?.[0];
+  assert.ok(matchesTarget, "找不到 matchesTarget 定义，守卫已失效");
+  assert.doesNotMatch(matchesTarget, /return true/);
+});
+
+test("commercial distributions do not resolve forbidden Sustainable Use dependencies", () => {
+  const lockfile = read("pnpm-lock.yaml");
+  assert.doesNotMatch(lockfile, /@codesandbox\/nodebox/);
+  assert.doesNotMatch(lockfile, /@codesandbox\/sandpack-(?:client|react)/);
+});
+
+test("project-owned iOS podspecs declare the repository Apache-2.0 license", () => {
+  const podspecs = [
+    "xdt-wechat-login/ios/XdtWechatLogin.podspec",
+    "xdt-tapdb/ios/XdtTapdb.podspec",
+    "xdt-mobile-realtime-audio/ios/XdtMobileRealtimeAudio.podspec",
+    "xdt-ios-app-distribution/ios/XdtIosAppDistribution.podspec",
+  ];
+  for (const relativePath of podspecs) {
+    const podspec = read(path.join("apps/mobile/modules", relativePath));
+    assert.match(podspec, /:type\s*=>\s*['\"]Apache-2\.0['\"]/);
+    assert.match(podspec, /:file\s*=>\s*['\"]\.\.\/\.\.\/\.\.\/\.\.\/\.\.\/LICENSE['\"]/);
+    assert.doesNotMatch(podspec, /UNLICENSED/i);
+    assert.match(podspec, /https:\/\/github\.com\/makecindy\/cindy\.git/);
+  }
+});
+
+test("every SPDX document is structurally consistent and has valid license expressions", () => {
+  for (const artifact of artifactNames) {
+    const file = path.join(noticesDir, "sbom", `${artifact}.spdx.json`);
+    const document = JSON.parse(fs.readFileSync(file, "utf8"));
+    assert.equal(document.spdxVersion, "SPDX-2.3");
+    assert.equal(document.dataLicense, "CC0-1.0");
+    assert.match(
+      document.documentNamespace,
+      new RegExp(`/spdx/${artifact}/[a-f0-9]{64}$`),
+    );
+    assert.ok(document.packages.length > 0);
+
+    const packageIds = new Set();
+    for (const pkg of document.packages) {
+      assert.equal(pkg.filesAnalyzed, false);
+      assert.doesNotThrow(
+        () => parseSpdxExpression(pkg.licenseDeclared),
+        pkg.name,
+      );
+      assert.equal(pkg.licenseDeclared, pkg.licenseConcluded);
+      assert.ok(!packageIds.has(pkg.SPDXID), `duplicate SPDXID: ${pkg.SPDXID}`);
+      packageIds.add(pkg.SPDXID);
+    }
+    assert.equal(document.relationships.length, document.packages.length);
+    for (const relationship of document.relationships) {
+      assert.equal(relationship.spdxElementId, "SPDXRef-DOCUMENT");
+      assert.equal(relationship.relationshipType, "DESCRIBES");
+      assert.ok(packageIds.has(relationship.relatedSpdxElement));
+    }
+  }
+});
+
+test("desktop resources include both open-source and restricted disclosures", () => {
+  const desktopRestricted = read(
+    "apps/desktop/resources/THIRD-PARTY-RESTRICTED.txt",
+  );
+  const assertProviderBrandingOrder = (noticePath) => {
+    const notice = read(noticePath);
+    const liteLlmIndex = notice.indexOf("LiteLLM mascot SVG path (adapted)");
+    const lobeIndex = notice.indexOf("Lobe Icons SVG paths (vendored)");
+    const magpieIndex = notice.indexOf("Magpie SVG mark (adapted)");
+    assert.notEqual(liteLlmIndex, -1, `${noticePath} includes the LiteLLM notice`);
+    assert.notEqual(lobeIndex, -1, `${noticePath} includes the Lobe Icons notice`);
+    assert.notEqual(magpieIndex, -1, `${noticePath} includes the Magpie notice`);
+    assert.ok(
+      liteLlmIndex < lobeIndex && lobeIndex < magpieIndex,
+      `${noticePath} keeps provider branding notices in canonical name order`,
+    );
+  };
+  assert.match(desktopRestricted, /Claude Code CLI@/);
+  assert.doesNotMatch(desktopRestricted, /WeChat OpenSDK/);
+  assert.match(
+    read("apps/desktop/resources/THIRD-PARTY-NOTICES.txt"),
+    /sqlite-vec/,
+  );
+  assert.match(
+    read("apps/desktop/resources/THIRD-PARTY-NOTICES.txt"),
+    /Lobe Icons SVG paths \(vendored\).*Copyright \(c\) 2023 LobeHub/s,
+  );
+  assert.match(
+    read("apps/desktop/resources/THIRD-PARTY-NOTICES.txt"),
+    /LiteLLM mascot SVG path \(adapted\).*Copyright \(c\) 2026 Berri AI/s,
+  );
+  assert.match(
+    read("apps/desktop/resources/THIRD-PARTY-NOTICES.txt"),
+    /oh-my-pi Windows Git PATH helpers \(adapted\).*Copyright \(c\) 2025 Mario Zechner.*Copyright \(c\) 2025-2026 Can Bölük/s,
+  );
+  assert.doesNotMatch(
+    read("apps/desktop/resources/THIRD-PARTY-NOTICES.txt"),
+    /LiteLLM mascot SVG path \(adapted\) adapted/,
+  );
+  assertProviderBrandingOrder(
+    "apps/desktop/resources/THIRD-PARTY-NOTICES.txt",
+  );
+  assertProviderBrandingOrder(
+    "docs/legal/notices/THIRD-PARTY-NOTICES.txt",
+  );
+  for (const platform of ["ios", "android"]) {
+    const mobileNotice = read(
+      `docs/legal/notices/mobile-${platform}.txt`,
+    );
+    assert.match(
+      mobileNotice,
+      /LiteLLM mascot SVG path \(adapted\).*Copyright \(c\) 2026 Berri AI/s,
+    );
+    assert.doesNotMatch(
+      mobileNotice,
+      /LiteLLM mascot SVG path \(adapted\) adapted/,
+    );
+    assertProviderBrandingOrder(`docs/legal/notices/mobile-${platform}.txt`);
+  }
+  assert.ok(
+    fs.existsSync(
+      path.join(repoRoot, "apps/desktop/cindy-updater/src-tauri/Cargo.lock"),
+    ),
+  );
+});
+
+test("all shipped desktop notices contain the complete pinned OpenCodex license", () => {
+  const upstream = JSON.parse(read("packages/model-compat/UPSTREAM.json"));
+  const license = read("packages/model-compat/LICENSE.opencodex").replace(/\r\n/g, "\n").trim();
+  for (const artifact of ["desktop-win", "desktop-macos", "desktop-linux"]) {
+    const notice = read(`docs/legal/notices/${artifact}.txt`).replace(/\r\n/g, "\n");
+    assert.ok(notice.includes(license), `${artifact} includes the full MIT text`);
+    const sbom = JSON.parse(read(`docs/legal/notices/sbom/${artifact}.spdx.json`));
+    const component = sbom.packages.find(pkg => pkg.name === "OpenCodex compatibility sources (vendored)");
+    assert.ok(component, `${artifact} inventories OpenCodex`);
+    assert.equal(component.versionInfo, upstream.commit);
+    assert.equal(component.licenseDeclared, "MIT");
+  }
+  for (const file of ["apps/desktop/resources/THIRD-PARTY-NOTICES.txt", "docs/legal/notices/THIRD-PARTY-NOTICES.txt"]) {
+    const notice = read(file).replace(/\r\n/g, "\n");
+    assert.ok(notice.includes(license), `${file} includes the full MIT text`);
+    assert.ok(notice.includes(`${upstream.repository}/tree/${upstream.commit}`));
+  }
+});
+
+test("all shipped desktop notices inventory the bundled skill creator", () => {
+  const license = read(
+    "apps/desktop/resources/system-skills/cindy-skill-creator/license.txt",
+  ).replace(/\r\n/g, "\n").trim();
+  for (const artifact of ["desktop-win", "desktop-macos", "desktop-linux"]) {
+    const notice = read(`docs/legal/notices/${artifact}.txt`).replace(/\r\n/g, "\n");
+    assert.ok(notice.includes(license), `${artifact} includes the Apache text`);
+    const sbom = JSON.parse(read(`docs/legal/notices/sbom/${artifact}.spdx.json`));
+    const component = sbom.packages.find(pkg => pkg.name === "OpenAI Codex skill-creator (adapted)");
+    assert.ok(component, `${artifact} inventories skill-creator`);
+    assert.equal(component.versionInfo, "977193486dfe7a88c4dab24abeafe9b754f5b13f");
+    assert.equal(component.licenseDeclared, "Apache-2.0");
+  }
+  for (const file of ["apps/desktop/resources/THIRD-PARTY-NOTICES.txt", "docs/legal/notices/THIRD-PARTY-NOTICES.txt"]) {
+    const notice = read(file).replace(/\r\n/g, "\n");
+    assert.ok(notice.includes(license), `${file} includes the Apache text`);
+    assert.match(notice, /OpenAI Codex skill-creator \(adapted\)/);
+  }
+});
+
+test("all shipped desktop notices inventory the Skill creator's vendored PyYAML", () => {
+  const license = read(
+    "apps/desktop/resources/system-skills/cindy-skill-creator/scripts/_vendor/PyYAML-LICENSE.txt",
+  ).replace(/\r\n/g, "\n").trim();
+  for (const artifact of ["desktop-win", "desktop-macos", "desktop-linux"]) {
+    const notice = read(`docs/legal/notices/${artifact}.txt`).replace(/\r\n/g, "\n");
+    assert.ok(notice.includes(license), `${artifact} includes the PyYAML MIT text`);
+    const sbom = JSON.parse(read(`docs/legal/notices/sbom/${artifact}.spdx.json`));
+    const component = sbom.packages.find(
+      pkg => pkg.name === "PyYAML (vendored pure-Python runtime)",
+    );
+    assert.ok(component, `${artifact} inventories PyYAML`);
+    assert.equal(component.versionInfo, "6.0.3");
+    assert.equal(component.licenseDeclared, "MIT");
+  }
+  for (const file of ["apps/desktop/resources/THIRD-PARTY-NOTICES.txt", "docs/legal/notices/THIRD-PARTY-NOTICES.txt"]) {
+    const notice = read(file).replace(/\r\n/g, "\n");
+    assert.ok(notice.includes(license), `${file} includes the PyYAML MIT text`);
+    assert.match(notice, /PyYAML \(vendored pure-Python runtime\)/);
+  }
+});
+
+test("the bundled Skill validator accepts standard multiline YAML without external packages", t => {
+  const candidates = [
+    ["python3", []],
+    ["python", []],
+    ["py", ["-3"]],
+  ];
+  const python = candidates.find(([command, prefix]) => {
+    const probe = spawnSync(command, [...prefix, "-S", "-c", "print('cindy-python')"], {
+      encoding: "utf8",
+    });
+    return probe.status === 0 && probe.stdout.trim() === "cindy-python";
+  });
+  if (!python) {
+    t.skip("Python 3 is unavailable");
+    return;
+  }
+
+  const skillDir = fs.mkdtempSync(path.join(os.tmpdir(), "cindy-skill-validator-"));
+  const bundledScriptsDir = path.join(
+    repoRoot,
+    "apps/desktop/resources/system-skills/cindy-skill-creator/scripts",
+  );
+  const bytecodeArtifacts = () => {
+    const artifacts = [];
+    const visit = directory => {
+      for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+        const absolute = path.join(directory, entry.name);
+        if (entry.isDirectory()) {
+          if (entry.name === "__pycache__") artifacts.push(absolute);
+          visit(absolute);
+        } else if (entry.name.endsWith(".pyc")) {
+          artifacts.push(absolute);
+        }
+      }
+    };
+    visit(bundledScriptsDir);
+    return artifacts;
+  };
+  try {
+    const printableBoundaries = String.fromCodePoint(
+      0xa0,
+      0xd7ff,
+      0xe000,
+      0xfffd,
+      0x10000,
+      0x10ffff,
+    );
+    fs.writeFileSync(
+      path.join(skillDir, "SKILL.md"),
+      `---
+name: yaml-regression
+description: "Create and update
+  skills safely"
+metadata:
+  owner: "Cindy
+    team"
+  labels: [creator, validation]
+  printable-boundaries: "${printableBoundaries}"
+---
+# YAML regression
+`,
+    );
+    const [command, prefix] = python;
+    const validator = path.join(
+      repoRoot,
+      "apps/desktop/resources/system-skills/cindy-skill-creator/scripts/quick_validate.py",
+    );
+    const result = spawnSync(command, [...prefix, "-S", validator, skillDir], {
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    assert.match(result.stdout, /Skill is valid!/);
+
+    const generator = path.join(bundledScriptsDir, "generate_openai_yaml.py");
+    const generated = spawnSync(command, [...prefix, "-S", generator, skillDir], {
+      encoding: "utf8",
+    });
+    assert.equal(generated.status, 0, `${generated.stdout}\n${generated.stderr}`);
+
+    const initializer = path.join(bundledScriptsDir, "init_skill.py");
+    const initialized = spawnSync(
+      command,
+      [...prefix, "-S", initializer, "bytecode-regression", "--path", skillDir],
+      { encoding: "utf8" },
+    );
+    assert.equal(initialized.status, 0, `${initialized.stdout}\n${initialized.stderr}`);
+
+    fs.writeFileSync(
+      path.join(skillDir, "SKILL.md"),
+      "---\nname: on\ndescription: yes\n---\n# js-yaml scalar compatibility\n",
+    );
+    const legacyBooleanWords = spawnSync(command, [...prefix, "-S", validator, skillDir], {
+      encoding: "utf8",
+    });
+    assert.equal(
+      legacyBooleanWords.status,
+      0,
+      `${legacyBooleanWords.stdout}\n${legacyBooleanWords.stderr}`,
+    );
+    assert.match(legacyBooleanWords.stdout, /Skill is valid!/);
+
+    fs.writeFileSync(
+      path.join(skillDir, "SKILL.md"),
+      "---\nname: yaml-regression\ndescription: true\n---\n",
+    );
+    const actualBoolean = spawnSync(command, [...prefix, "-S", validator, skillDir], {
+      encoding: "utf8",
+    });
+    assert.notEqual(actualBoolean.status, 0);
+    assert.match(actualBoolean.stdout, /Description must be a string, got bool/);
+
+    fs.writeFileSync(
+      path.join(skillDir, "SKILL.md"),
+      "---\nname: yaml-regression\ndescription: 1e3\n---\n",
+    );
+    const scientificNumber = spawnSync(command, [...prefix, "-S", validator, skillDir], {
+      encoding: "utf8",
+    });
+    assert.notEqual(scientificNumber.status, 0);
+    assert.match(scientificNumber.stdout, /Description must be a string, got float/);
+
+    for (const duplicateKeys of [
+      "  true: first\n  TRUE: second",
+      "  1: first\n  01: second",
+      "  1: first\n  1.0: second",
+      '  "true": first\n  true: second',
+    ]) {
+      fs.writeFileSync(
+        path.join(skillDir, "SKILL.md"),
+        `---\nname: yaml-regression\ndescription: duplicate keys\nmetadata:\n${duplicateKeys}\n---\n`,
+      );
+      const duplicate = spawnSync(command, [...prefix, "-S", validator, skillDir], {
+        encoding: "utf8",
+      });
+      assert.notEqual(duplicate.status, 0);
+      assert.match(duplicate.stdout, /Duplicate mapping key/);
+    }
+
+    fs.writeFileSync(
+      path.join(skillDir, "SKILL.md"),
+      `---
+name: yaml-regression
+description: timestamp keys
+metadata:
+  2023-01-01: first
+  "Sun Jan 01 2023 00:00:00 GMT+0000 (Coordinated Universal Time)": second
+---
+`,
+    );
+    const timestampKey = spawnSync(command, [...prefix, "-S", validator, skillDir], {
+      encoding: "utf8",
+    });
+    assert.notEqual(timestampKey.status, 0);
+    assert.match(timestampKey.stdout, /Timestamp mapping keys are not supported/);
+
+    fs.writeFileSync(
+      path.join(skillDir, "SKILL.md"),
+      "---\nname: yaml-regression\ndescription: invalid\0value\n---\n",
+    );
+    const rejected = spawnSync(command, [...prefix, "-S", validator, skillDir], {
+      encoding: "utf8",
+    });
+    assert.notEqual(rejected.status, 0);
+    assert.match(rejected.stdout, /special characters are not allowed/);
+    assert.deepEqual(
+      bytecodeArtifacts(),
+      [],
+      "bundled Python helpers must not mutate the content-addressed Skill with bytecode caches",
+    );
+  } finally {
+    fs.rmSync(skillDir, { recursive: true, force: true });
+  }
+});

@@ -1,0 +1,259 @@
+import { describe, expect, it } from 'vitest';
+
+import {
+  ClaudeOutputLagTimingGuard,
+  computeModelUsageDeltas,
+  type ModelUsageCumulative,
+  type ModelUsageDeltaEntry,
+} from '../modelUsageDelta';
+
+function snap(over: Partial<ModelUsageCumulative> = {}): ModelUsageCumulative {
+  return {
+    costUSD: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadInputTokens: 0,
+    cacheCreationInputTokens: 0,
+    ...over,
+  };
+}
+
+describe('computeModelUsageDeltas', () => {
+  it('first report without observed request usage only establishes a baseline', () => {
+    const { next, deltas } = computeModelUsageDeltas(undefined, {
+      'claude-opus-4-8': {
+        costUSD: 0.5,
+        inputTokens: 100,
+        outputTokens: 200,
+        cacheReadInputTokens: 3000,
+        cacheCreationInputTokens: 400,
+      },
+    });
+    expect(deltas).toEqual([]);
+    expect(next.get('claude-opus-4-8')).toEqual(snap({
+      costUSD: 0.5,
+      inputTokens: 100,
+      outputTokens: 200,
+      cacheReadInputTokens: 3000,
+      cacheCreationInputTokens: 400,
+    }));
+  });
+
+  it('accepts the first cumulative report when the SDK query explicitly started at zero', () => {
+    const { deltas } = computeModelUsageDeltas(
+      undefined,
+      {
+        'claude-opus-4-8': {
+          costUSD: 0.5,
+          inputTokens: 100,
+          outputTokens: 200,
+          cacheReadInputTokens: 3000,
+          cacheCreationInputTokens: 400,
+        },
+      },
+      undefined,
+      { cumulativeStartsAtZero: true },
+    );
+    expect(deltas).toEqual([
+      {
+        model: 'claude-opus-4-8',
+        costUsdDelta: 0.5,
+        inputTokensDelta: 100,
+        outputTokensDelta: 200,
+        cacheReadTokensDelta: 3000,
+        cacheCreateTokensDelta: 400,
+      },
+    ]);
+  });
+
+  it('first report uses independently observed request usage and accepts cost only on an exact match', () => {
+    const observed = new Map([
+      [
+        'claude-opus-4-8',
+        { inputTokens: 100, outputTokens: 200, cacheReadTokens: 3000, cacheCreateTokens: 400 },
+      ],
+    ]);
+    const { deltas } = computeModelUsageDeltas(
+      undefined,
+      {
+        'claude-opus-4-8': {
+          costUSD: 0.5,
+          inputTokens: 100,
+          outputTokens: 200,
+          cacheReadInputTokens: 3000,
+          cacheCreationInputTokens: 400,
+        },
+      },
+      observed,
+    );
+    expect(deltas).toEqual([
+      {
+        model: 'claude-opus-4-8',
+        costUsdDelta: 0.5,
+        inputTokensDelta: 100,
+        outputTokensDelta: 200,
+        cacheReadTokensDelta: 3000,
+        cacheCreateTokensDelta: 400,
+      },
+    ]);
+  });
+
+  it('monotonic increase: delta = cumulative - last', () => {
+    const prev = new Map([['m', snap({ costUSD: 1, inputTokens: 10, outputTokens: 20 })]]);
+    const { deltas } = computeModelUsageDeltas(prev, {
+      m: { costUSD: 1.25, inputTokens: 15, outputTokens: 26, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+    });
+    expect(deltas).toEqual([
+      {
+        model: 'm',
+        costUsdDelta: 0.25,
+        inputTokensDelta: 5,
+        outputTokensDelta: 6,
+        cacheReadTokensDelta: 0,
+        cacheCreateTokensDelta: 0,
+      },
+    ]);
+  });
+
+  it('cumulative reset without observed request usage rebases without charging the session total', () => {
+    const prev = new Map([['m', snap({ costUSD: 2, inputTokens: 1000, outputTokens: 500 })]]);
+    const { next, deltas } = computeModelUsageDeltas(prev, {
+      m: { costUSD: 0.1, inputTokens: 50, outputTokens: 30, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+    });
+    expect(deltas).toEqual([]);
+    expect(next.get('m')!.costUSD).toBe(0.1);
+  });
+
+  it('cumulative reset uses observed turn tokens but withholds unmatched cumulative cost', () => {
+    const prev = new Map([['m', snap({ costUSD: 2, inputTokens: 1000, outputTokens: 500 })]]);
+    const observed = new Map([
+      ['m', { inputTokens: 40, outputTokens: 20, cacheReadTokens: 0, cacheCreateTokens: 0 }],
+    ]);
+    const { deltas } = computeModelUsageDeltas(
+      prev,
+      {
+        m: {
+          costUSD: 0.1,
+          inputTokens: 50,
+          outputTokens: 30,
+          cacheReadInputTokens: 0,
+          cacheCreationInputTokens: 0,
+        },
+      },
+      observed,
+    );
+    expect(deltas).toEqual([
+      {
+        model: 'm',
+        costUsdDelta: 0,
+        inputTokensDelta: 40,
+        outputTokensDelta: 20,
+        cacheReadTokensDelta: 0,
+        cacheCreateTokensDelta: 0,
+      },
+    ]);
+  });
+
+  it('multi-model: independent deltas, unchanged model omitted', () => {
+    const prev = new Map([
+      ['a', snap({ costUSD: 1, inputTokens: 10 })],
+      ['b', snap({ costUSD: 0.5, inputTokens: 5 })],
+    ]);
+    const { deltas } = computeModelUsageDeltas(prev, {
+      a: { costUSD: 1.5, inputTokens: 20, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+      b: { costUSD: 0.5, inputTokens: 5, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+    });
+    expect(deltas.map((d) => d.model)).toEqual(['a']);
+  });
+
+  it('model absent from current report keeps its previous snapshot and baselines unseen models', () => {
+    const prev = new Map([['stale', snap({ costUSD: 3 })]]);
+    const { next, deltas } = computeModelUsageDeltas(prev, {
+      fresh: { costUSD: 0.2, inputTokens: 1, outputTokens: 1, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+    });
+    expect(deltas).toEqual([]);
+    expect(next.get('stale')).toEqual(snap({ costUSD: 3 }));
+  });
+
+  it('missing / malformed fields sanitize to zero instead of NaN', () => {
+    const { deltas } = computeModelUsageDeltas(undefined, {
+      m: { costUSD: 'oops', inputTokens: -5, outputTokens: Infinity },
+      '': { costUSD: 1 },
+    });
+    expect(deltas).toEqual([]);
+  });
+});
+
+describe('ClaudeOutputLagTimingGuard', () => {
+  const lagged: ModelUsageDeltaEntry[] = [
+    {
+      model: 'claude-opus-4-8',
+      costUsdDelta: 0,
+      inputTokensDelta: 100,
+      outputTokensDelta: 7,
+      cacheReadTokensDelta: 20_000,
+      cacheCreateTokensDelta: 0,
+    },
+  ];
+  const settled: ModelUsageDeltaEntry[] = [
+    {
+      model: 'claude-opus-4-8',
+      costUsdDelta: 0,
+      inputTokensDelta: 100,
+      outputTokensDelta: 3_200,
+      cacheReadTokensDelta: 20_000,
+      cacheCreateTokensDelta: 0,
+    },
+  ];
+
+  it('suppresses the detected turn and the following backfill turn only', () => {
+    const guard = new ClaudeOutputLagTimingGuard();
+    expect(guard.evaluate('session-1', lagged, true, 'msg_vrtx_1')).toEqual({
+      detected: true,
+      suppressTiming: true,
+    });
+    expect(guard.evaluate('session-1', settled, true)).toEqual({
+      detected: false,
+      suppressTiming: true,
+    });
+    expect(guard.evaluate('session-1', settled, true)).toEqual({
+      detected: false,
+      suppressTiming: false,
+    });
+  });
+
+  it('keeps a lagged continuation product turn suppressed through its final segment', () => {
+    const guard = new ClaudeOutputLagTimingGuard();
+    expect(guard.evaluate('session-1', lagged, false, 'msg_vrtx_1').suppressTiming).toBe(true);
+    expect(guard.evaluate('session-1', settled, true).suppressTiming).toBe(true);
+    expect(guard.evaluate('session-1', settled, true).suppressTiming).toBe(true);
+    expect(guard.evaluate('session-1', settled, true).suppressTiming).toBe(false);
+  });
+
+  it('clears pending suppression per session', () => {
+    const guard = new ClaudeOutputLagTimingGuard();
+    guard.evaluate('session-1', lagged, true, 'msg_vrtx_1');
+    guard.clear('session-1');
+    expect(guard.evaluate('session-1', settled, true).suppressTiming).toBe(false);
+  });
+
+  it('does not suppress a legitimate short reply without Vertex evidence', () => {
+    const guard = new ClaudeOutputLagTimingGuard();
+    expect(guard.evaluate('session-1', lagged, true)).toEqual({
+      detected: false,
+      suppressTiming: false,
+    });
+  });
+
+  it('does not arm next-turn suppression from a failed Vertex turn', () => {
+    const guard = new ClaudeOutputLagTimingGuard();
+    expect(guard.evaluate('session-1', lagged, true, 'msg_vrtx_1', false)).toEqual({
+      detected: false,
+      suppressTiming: false,
+    });
+    expect(guard.evaluate('session-1', settled, true)).toEqual({
+      detected: false,
+      suppressTiming: false,
+    });
+  });
+});

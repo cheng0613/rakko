@@ -1,0 +1,376 @@
+// @vitest-environment jsdom
+
+import { act, cleanup, fireEvent, render as renderView, screen } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { createElement, type ReactElement } from 'react';
+import { MemoryRouter, useLocation } from 'react-router-dom';
+
+function LocationProbe() {
+  const location = useLocation();
+  return <output data-testid="location">{location.pathname}{location.search}</output>;
+}
+
+function render(view: ReactElement) {
+  return renderView(<MemoryRouter>{view}<LocationProbe /></MemoryRouter>);
+}
+
+const { useCodexRuntimeRouteMock } = vi.hoisted(() => ({
+  useCodexRuntimeRouteMock: vi.fn(),
+}));
+
+vi.mock('react-i18next', () => ({
+  initReactI18next: { type: '3rdParty', init: () => undefined },
+  useTranslation: () => ({
+    i18n: { exists: () => true },
+    // 插值参数拼进返回值，让进度类文案能断言实际传入的 attempt/maxAttempts。
+    t: (key: string, options?: { attempt?: number; maxAttempts?: number }) =>
+      options?.attempt && options.maxAttempts
+        ? `${key}:${options.attempt}/${options.maxAttempts}`
+        : key,
+  }),
+}));
+
+vi.mock('@/components/ui/confirm-dialog-provider', () => ({
+  useConfirmDialog: () => ({ confirm: async () => true }),
+}));
+
+vi.mock('@/hooks/useCodexRuntimeRoute', () => ({
+  useCodexRuntimeRoute: useCodexRuntimeRouteMock,
+}));
+
+vi.mock('@/hooks/useProviders', () => ({
+  useProviders: () => ({
+    providers: [{ id: 'work-openai', name: 'Work account', connected: true, auth: { method: 'oauth', native: 'codex' } }],
+    refetch: vi.fn(),
+  }),
+}));
+
+vi.mock('@/hooks/useCodexAuth', async importOriginal => ({
+  ...await importOriginal<typeof import('@/hooks/useCodexAuth')>(),
+  useCodexAuth: () => ({ state: { kind: 'unauthenticated' }, recoveryCheck: 'idle' }),
+}));
+
+vi.mock('@/hooks/useCodexSessionExpiredPrompt', () => ({
+  isCodexSessionExpiredError: () => false,
+  useCodexSessionExpiredPrompt: () => vi.fn(),
+}));
+
+import { ErrorBanner } from '@/components/chat/ErrorBanner';
+import { ErrorMessageCard } from '@/components/chat/ErrorMessageCard';
+
+afterEach(() => {
+  cleanup();
+  vi.clearAllMocks();
+});
+
+beforeEach(() => {
+  useCodexRuntimeRouteMock.mockReturnValue({ authInjection: 'oauth-bearer' });
+});
+
+describe('ErrorBanner Codex xAI auth classification', () => {
+  it('keeps Retry visible for xAI Codex 401 errors on an oauth-bearer host', () => {
+    const onRetry = vi.fn();
+
+    render(createElement(ErrorBanner, {
+      error: '401 Unauthorized from xAI',
+      retryText: 'retry-token',
+      onRetry,
+      agentKind: 'codex',
+      modelId: 'xai/grok-4.3',
+    }));
+
+    const retry = screen.getByTitle('chat.errorBanner.retryTitle');
+    fireEvent.click(retry);
+    expect(onRetry).toHaveBeenCalledWith('retry-token');
+    expect(screen.queryByText('chat.errorBanner.codexAuthMissingLocal')).toBeNull();
+  });
+
+  it('still hides Retry for native Codex OAuth 401 errors', () => {
+    render(createElement(ErrorBanner, {
+      error: '401 Unauthorized from Codex',
+      retryText: 'retry-token',
+      onRetry: vi.fn(),
+      agentKind: 'codex',
+      modelId: 'gpt-5.4',
+    }));
+
+    expect(screen.queryByTitle('chat.errorBanner.retryTitle')).toBeNull();
+    expect(screen.getByText('chat.errorBanner.codexAuthMissingLocal')).toBeTruthy();
+    // SplitGroup uses this contract to prevent its focus navigation racing settings.
+    expect(screen.getByRole('button', { name: 'logic.confirm.goToSettings' })
+      .getAttribute('data-split-pane-route-action')).toBe('');
+    fireEvent.click(screen.getByRole('button', { name: 'logic.confirm.goToSettings' }));
+    expect(screen.getByTestId('location').textContent).toBe('/settings?tab=providers&connect=openai');
+  });
+
+  // Unit: generic authentication failures previously had no actionable recovery,
+  // and a changed model selection could send the user to the wrong account.
+  it.each([
+    ['401 Unauthorized', 'openai'],
+    ['Missing bearer token', 'openai'],
+    ['401 Unauthorized', 'work-openai'],
+  ])(
+    'offers the failed connection even after runtime fallback: %s / %s', (error, failedProvider) => {
+      useCodexRuntimeRouteMock.mockReturnValue({ authInjection: 'env-key' });
+      const onRetry = vi.fn();
+      render(<ErrorBanner error={error} agentKind="codex" providerId="xai"
+        errorSourceProviderId={failedProvider} onRetry={onRetry} retryText="original" />);
+      // An independent account's cached connected flag is not recovery evidence.
+      // Keep settings available and allow a manual retry without claiming recovery.
+      expect(screen.queryByText('chatgptAuthRecovery.recovered')).toBeNull();
+      if (failedProvider === 'work-openai') {
+        fireEvent.click(screen.getByTitle('chat.errorBanner.retryTitle'));
+        expect(onRetry).toHaveBeenCalledWith('original');
+      } else {
+        expect(screen.queryByTitle('chat.errorBanner.retryTitle')).toBeNull();
+      }
+      fireEvent.click(screen.getByRole('button', { name: 'logic.confirm.goToSettings' }));
+      expect(screen.getByTestId('location').textContent).toBe(`/settings?tab=providers&connect=${failedProvider}`);
+    },
+  );
+
+  it.each([
+    { providerId: 'openai', errorSourceProviderId: 'custom-deepseek' },
+    { providerId: 'openai', agentDeviceId: 'other-computer' },
+    { providerId: 'openai', deviceLinkDeviceId: 'other-computer' },
+    { providerId: 'openai', remoteHostId: 'ssh-computer' },
+  ])('does not repair a different provider or computer locally: %j', props => {
+    render(<ErrorBanner error="401 Unauthorized" agentKind="codex" onRetry={vi.fn()} {...props} />);
+    expect(screen.queryByRole('button', { name: 'logic.confirm.goToSettings' })).toBeNull();
+    expect(screen.queryByText('chat.errorBanner.codexAuthMissingLocal')).toBeNull();
+  });
+});
+
+describe('ErrorBanner context-overflow retry', () => {
+  // #7951: current translators retain concrete overflow details. The legacy
+  // no-details fallback must not replace that evidence with ciphertext advice.
+  it.each(['live', 'history'])('preserves a remote compact overflow in the %s view', (view) => {
+    const message = 'Error running remote compact task: maximum context length exceeded';
+    render(view === 'live'
+      ? createElement(ErrorBanner, { error: message, errorReason: 'context-overflow', onRetry: vi.fn() })
+      : createElement(ErrorMessageCard, { message, reason: 'context-overflow' }));
+    expect(screen.getByText('chat.errorBanner.contextOverflow')).toBeTruthy();
+    expect(screen.queryByText('chat.errorBanner.remoteCompactEncryptedContent')).toBeNull();
+  });
+  it.each([
+    'Error running remote compact task: invalid_encrypted_content',
+    'Error running remote compact task',
+  ])('corrects a persisted legacy compact error without rewriting history (%s)', (message) => {
+    render(createElement(ErrorMessageCard, {
+      message,
+      reason: 'context-overflow',
+    }));
+    expect(screen.getByText('chat.errorBanner.remoteCompactEncryptedContent')).toBeTruthy();
+    expect(screen.queryByText('chat.errorBanner.contextOverflow')).toBeNull();
+  });
+  // The same compact failure used to show either oversized-input or switch-provider advice.
+  it.each([
+    ['context-overflow', false, 'Error running remote compact task: invalid_encrypted_content'],
+    ['remote-compact-encrypted-content', true, 'Error running remote compact task: invalid_encrypted_content'],
+    ['context-overflow', true, 'Error running remote compact task'],
+  ])(
+    'shows compact recovery guidance for %s (remote=%s)',
+    (errorReason, remote, error) => {
+      const onRetry = vi.fn();
+      render(createElement(ErrorBanner, {
+        error,
+        errorReason,
+        agentKind: 'codex',
+        deviceLinkDeviceId: remote ? 'other-computer' : null,
+        retryText: 'retry-token',
+        onRetry,
+      }));
+      expect(screen.getByText('chat.errorBanner.remoteCompactEncryptedContent')).toBeTruthy();
+      expect(screen.queryByText('chat.errorBanner.contextOverflow')).toBeNull();
+      fireEvent.click(screen.getByTitle('chat.errorBanner.retryTitle'));
+      expect(onRetry).toHaveBeenCalledWith('retry-token');
+    },
+  );
+  it('keeps Retry when automatic rollover failed and recovery is still available', () => {
+    const onRetry = vi.fn();
+    render(
+      createElement(ErrorBanner, {
+        error: "This model's maximum prompt length is 500000",
+        errorReason: 'context-overflow',
+        retryText: 'retry-token',
+        onRetry,
+      }),
+    );
+    const retry = screen.getByTitle('chat.errorBanner.retryTitle');
+    fireEvent.click(retry);
+    expect(onRetry).toHaveBeenCalledWith('retry-token');
+  });
+});
+
+describe('ErrorBanner network retry guidance', () => {
+  it('shows Codex reconnect progress while the turn keeps running', () => {
+    render(createElement(ErrorBanner, {
+      error: 'Reconnecting... 3/5',
+      onRetry: vi.fn(),
+      isRecoverable: true,
+    }));
+
+    expect(screen.getByText('chat.errorBanner.networkReconnecting:3/5')).toBeTruthy();
+    expect(screen.queryByTitle('chat.errorBanner.retryTitle')).toBeNull();
+  });
+
+  it('does not tell the user to click Retry when no safe retry target exists', () => {
+    render(createElement(ErrorBanner, {
+      error: 'Request timed out.',
+      onRetry: vi.fn(),
+    }));
+
+    expect(screen.getByText('chat.errorBanner.networkUnreachableNoRetry')).toBeTruthy();
+    expect(screen.queryByTitle('chat.errorBanner.retryTitle')).toBeNull();
+  });
+
+  it('keeps the actionable guidance and button when a retry target exists', () => {
+    render(createElement(ErrorBanner, {
+      error: 'Request timed out.',
+      retryText: 'retry-token',
+      onRetry: vi.fn(),
+    }));
+
+    expect(screen.getByText('chat.errorBanner.networkUnreachable')).toBeTruthy();
+    expect(screen.getByTitle('chat.errorBanner.retryTitle')).toBeTruthy();
+  });
+});
+
+describe('ErrorBanner overload guidance', () => {
+  const CAPACITY = 'Selected model is at capacity. Please try a different model.';
+
+  // Regression: a settled scheduler run drops its queue recovery to unblock the
+  // next fire. Manual continuation must still work without replaying that run.
+  it('continues a failed scheduled turn when the original retry target is gone', async () => {
+    const onRetry = vi.fn();
+    const onContinueAfterError = vi.fn(async () => {});
+    render(createElement(ErrorBanner, { error: CAPACITY, onRetry, onContinueAfterError }));
+    expect(screen.getByText('chat.errorBanner.overloadBusy')).toBeTruthy();
+    await act(async () => fireEvent.click(screen.getByTitle('chat.errorBanner.retryTitle')));
+    expect(onContinueAfterError).toHaveBeenCalledOnce();
+    expect(onRetry).not.toHaveBeenCalled();
+  });
+
+  it('keeps continuation single-flight and makes a failed send retryable again', async () => {
+    let reject!: (error: Error) => void;
+    const pending = new Promise<void>((_, no) => { reject = no; });
+    const onContinueAfterError = vi.fn(() => pending);
+    render(createElement(ErrorBanner, { error: CAPACITY, onRetry: vi.fn(), onContinueAfterError }));
+    const retry = screen.getByTitle('chat.errorBanner.retryTitle');
+    fireEvent.click(retry);
+    fireEvent.click(retry);
+    expect(onContinueAfterError).toHaveBeenCalledOnce();
+    await act(async () => reject(new Error('offline')));
+    expect(screen.getByText('chat.errorBanner.overloadBusy')).toBeTruthy();
+    expect((retry as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it.each([
+    { error: CAPACITY, isRecoverable: true },
+    { error: 'thread not found', agentKind: 'codex' as const },
+    { error: '[REMOTE_LOCAL_ONLY_PROVIDER] local provider' },
+    { error: '[DEVICE_LINK_CONTROL_DISABLED] disabled' },
+  ])('does not bypass running or configuration recovery gates: $error', (props) => {
+    render(createElement(ErrorBanner, {
+      ...props, onRetry: vi.fn(), onContinueAfterError: vi.fn(async () => {}),
+    }));
+    expect(screen.queryByTitle('chat.errorBanner.retryTitle')).toBeNull();
+  });
+
+  it('shows retry progress while the overload retry is still pending', () => {
+    render(createElement(ErrorBanner, {
+      error: `${CAPACITY} (auto-retry 2/4)`,
+      onRetry: vi.fn(),
+      isRecoverable: true,
+    }));
+
+    expect(screen.getByText('chat.errorBanner.overloadRetrying:2/4')).toBeTruthy();
+    // 仍在自动重试 → 不该同时催用户点重试。
+    expect(screen.queryByTitle('chat.errorBanner.retryTitle')).toBeNull();
+  });
+
+  it('switches to switch-model guidance for a terminal capacity error', () => {
+    // 文案刻意不声称"重试多次": 终态也可能来自"本 turn 已有产出所以不重投"或
+    // 接管条件不满足, 那时一次自动重试都没发生(review #844 codex P1)。
+    render(createElement(ErrorBanner, {
+      error: CAPACITY,
+      retryText: 'retry-token',
+      onRetry: vi.fn(),
+    }));
+
+    expect(screen.getByText('chat.errorBanner.overloadBusy')).toBeTruthy();
+    expect(screen.getByTitle('chat.errorBanner.retryTitle')).toBeTruthy();
+  });
+
+  it('drops the retry prompt when no safe retry target exists', () => {
+    // scheduler / goal 发起的 turn 没有安全的 recovery target。
+    render(createElement(ErrorBanner, {
+      error: CAPACITY,
+      onRetry: vi.fn(),
+    }));
+
+    expect(screen.getByText('chat.errorBanner.overloadBusyNoRetry')).toBeTruthy();
+    expect(screen.queryByTitle('chat.errorBanner.retryTitle')).toBeNull();
+  });
+
+  it('does not fall back to the network copy for a capacity error', () => {
+    // 把容量问题说成"网络异常"会让用户白折腾自己的网络。
+    render(createElement(ErrorBanner, {
+      error: CAPACITY,
+      onRetry: vi.fn(),
+    }));
+
+    expect(screen.queryByText('chat.errorBanner.networkUnreachableNoRetry')).toBeNull();
+  });
+
+  it('keeps the raw upstream error available for overload errors', () => {
+    render(createElement(ErrorBanner, {
+      error: CAPACITY,
+      onRetry: vi.fn(),
+    }));
+
+    const toggle = screen.getByText('chat.errorBanner.networkShowRaw');
+    fireEvent.click(toggle);
+    expect(screen.getByText(CAPACITY)).toBeTruthy();
+  });
+
+  it('treats an Anthropic 529 retry as an overload, not a plain network error', () => {
+    render(createElement(ErrorBanner, {
+      error: 'SDK API request failed: overloaded_error (HTTP 529) (auto-retry 3/10)',
+      onRetry: vi.fn(),
+      isRecoverable: true,
+    }));
+
+    expect(screen.getByText('chat.errorBanner.overloadRetrying:3/10')).toBeTruthy();
+  });
+});
+
+describe('ErrorBanner terminal rate-limit retry guidance', () => {
+  const RATE_LIMIT =
+    'exceeded retry limit, last status: 429 Too Many Requests (rate-limit-retry 1/2)';
+
+  it('shows localized rate-limit progress without calling it model overload', () => {
+    render(createElement(ErrorBanner, {
+      error: RATE_LIMIT,
+      errorReason: 'terminal-rate-limit-retry',
+      onRetry: vi.fn(),
+      isRecoverable: true,
+    }));
+
+    expect(screen.getByText('chat.errorBanner.rateLimitRetrying:1/2')).toBeTruthy();
+    expect(screen.queryByText('chat.errorBanner.overloadRetrying:1/2')).toBeNull();
+    expect(screen.queryByTitle('chat.errorBanner.retryTitle')).toBeNull();
+  });
+
+  it('keeps the raw provider error available for diagnosis', () => {
+    render(createElement(ErrorBanner, {
+      error: RATE_LIMIT,
+      errorReason: 'terminal-rate-limit-retry',
+      onRetry: vi.fn(),
+      isRecoverable: true,
+    }));
+
+    fireEvent.click(screen.getByText('chat.errorBanner.networkShowRaw'));
+    expect(screen.getByText(RATE_LIMIT)).toBeTruthy();
+  });
+});

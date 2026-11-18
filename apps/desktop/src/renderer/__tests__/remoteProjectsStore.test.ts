@@ -1,0 +1,1313 @@
+/**
+ * remoteProjectsStore — vitest 单测(push 驱动纯镜像)
+ *
+ * 覆盖 device-link 控制端内存层的核心不变量:
+ *  - setDeviceSessions:打 device-link origin 标记 + 合并扁平列表 + sessionId→deviceId 注册 + 引用稳定
+ *  - active/archived 分桶快照互不覆盖，applyPatch 在状态桶间迁移 / deleted 移出分片
+ *  - epoch:旧 snapshot 不覆盖新 snapshot(乱序保护)
+ *  - markDeviceDisconnected:断线保留快照 + 在线索引清理;removeDevice / clear:明确移除时清理
+ */
+
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+import {
+  remoteProjectsStore,
+  getSessionDeviceId,
+  retryRemoteSessionBootstrap,
+  retryRemoteSessionStatus,
+  requestRemoteSessionStatus,
+  setRemoteReseedImpl,
+  setRemoteSessionBootstrapRetryImpl,
+  subscribeRemoteSessionRemoval,
+} from '@/features/device-link/remoteProjectsStore';
+import type { Session } from '@/lib/ccAgent.types';
+
+/** 造一个最小可用 Session(store 只存/透传,不校验字段)。 */
+function mk(id: string, partial: Partial<Session> = {}): Session {
+  return {
+    id,
+    userId: 'u',
+    source: partial.source,
+    title: partial.title ?? id,
+    workingDir: partial.workingDir ?? `/proj/${id}`,
+    workspaceKind: 'project',
+    model: partial.model ?? 'gpt-5.4',
+    effort: (partial.effort ?? 'medium') as Session['effort'],
+    permissionMode: (partial.permissionMode ?? 'default') as Session['permissionMode'],
+    sdkSessionId: null,
+    totalTokenUsage: 0,
+    totalCostUsd: 0,
+    contextTokens: 0,
+    contextWindow: 0,
+    fastMode: partial.fastMode ?? false,
+    clearedAt: null,
+    pinnedAt: partial.pinnedAt ?? null,
+    userSendAt: '2026-01-01T00:00:00.000Z',
+    status: partial.status ?? 'active',
+    agentKind: partial.agentKind ?? 'cc',
+    // fork 占位判据要看它(与被控端 getOverwritableAutoTitle 同一条规则)。
+    parentSessionId: partial.parentSessionId ?? null,
+    extraDirs: [],
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+}
+
+describe('remoteProjectsStore', () => {
+  // Unit, #7469: a two-row snapshot changing one task must not invalidate the
+  // other sidebar row's memo. Existing tests cover whole-snapshot no-ops, not
+  // per-row UI identity or its separation from in-flight detail-read fences.
+  it('reuses unchanged visible rows without reusing authoritative snapshot identities', () => {
+    remoteProjectsStore.setDeviceSessions('host', 'Host', [mk('same'), mk('changed')]);
+    remoteProjectsStore.setDeviceSessions('other', 'Other', [mk('same')]);
+    const before = remoteProjectsStore.getVisibleMergedRemoteSessions();
+    const rawBefore = remoteProjectsStore.getDeviceSessions('host');
+    const read = remoteProjectsStore.captureSessionRead('host', 'same');
+
+    remoteProjectsStore.setDeviceSessions('host', 'Host', [
+      mk('changed', { title: 'Updated title' }), mk('same'),
+    ]);
+
+    const visible = remoteProjectsStore.getVisibleMergedRemoteSessions();
+    expect(visible.map(row => [row.deviceLinkDeviceId, row.id, row.title])).toEqual([
+      ['host', 'changed', 'Updated title'], ['host', 'same', 'same'], ['other', 'same', 'same'],
+    ]);
+    expect(visible[0]).not.toBe(before[1]);
+    expect(visible[1]).toBe(before[0]);
+    expect(visible[2]).toBe(before[2]);
+    expect(remoteProjectsStore.getDeviceSessions('host')[1]).not.toBe(rawBefore[0]);
+    expect(read()).toBe(false);
+    const freshRead = remoteProjectsStore.captureSessionRead('host', 'same');
+    expect(freshRead()).toBe(true);
+    remoteProjectsStore.applyPatch('host', 'same', { lastActivityAt: '2026-01-02T00:00:00.000Z' });
+    expect(freshRead()).toBe(true);
+    expect(freshRead.mergeActivity(mk('same')).lastActivityAt).toBe('2026-01-02T00:00:00.000Z');
+  });
+
+  // Unit, #7469: structural sharing must compare nested payloads too, and must
+  // not resurrect removed rows or hide connection changes behind a UI cache.
+  it('updates nested visible data and retires rows on disconnect, deletion and clear', () => {
+    const row = { ...mk('a'), extraDirs: ['/first'] };
+    remoteProjectsStore.setDeviceSessions('host', 'Host', [row, mk('b')]);
+    const before = remoteProjectsStore.getVisibleMergedRemoteSessions();
+    remoteProjectsStore.setDeviceSessions('host', 'Host', [
+      { ...row, extraDirs: ['/second'] }, mk('b'),
+    ]);
+    const changed = remoteProjectsStore.getVisibleMergedRemoteSessions();
+    expect(changed[0]?.extraDirs).toEqual(['/second']);
+    expect(changed[0]).not.toBe(before[0]);
+    expect(changed[1]).toBe(before[1]);
+    remoteProjectsStore.markDeviceDisconnected('host');
+    expect(remoteProjectsStore.getVisibleMergedRemoteSessions().map(s => s.deviceLinkConnectionStatus))
+      .toEqual(['disconnected', 'disconnected']);
+    remoteProjectsStore.setDeviceSessions('host', 'Renamed host', [row]);
+    expect(remoteProjectsStore.getVisibleMergedRemoteSessions()).toMatchObject([
+      { id: 'a', deviceLinkDeviceName: 'Renamed host', deviceLinkConnectionStatus: 'connected' },
+    ]);
+    remoteProjectsStore.applyPatch('host', 'a', { status: 'deleted' });
+    expect(remoteProjectsStore.getVisibleMergedRemoteSessions()).toEqual([]);
+    remoteProjectsStore.setDeviceSessions('host', 'Host', [row]);
+    expect(remoteProjectsStore.getVisibleMergedRemoteSessions()[0]).not.toBe(before[0]);
+    remoteProjectsStore.clear();
+    expect(remoteProjectsStore.getVisibleMergedRemoteSessions()).toEqual([]);
+  });
+
+  it('preserves an activity push while accepting an in-flight detail read', () => {
+    const session = mk('handoff');
+    remoteProjectsStore.setDeviceSessions('host', 'Host', [session]);
+    const read = remoteProjectsStore.captureSessionRead('host', session.id);
+    const lastActivityAt = '2026-01-02T00:00:00.000Z';
+    remoteProjectsStore.applyPatch('host', session.id, { lastActivityAt });
+    expect(read()).toBe(true);
+    expect(read.mergeActivity(session)).toMatchObject({
+      lastActivityAt,
+      userSendAt: session.userSendAt,
+    });
+  });
+  // Unit, #6529: ordinary lists deliberately omit side chats; a list refresh
+  // must not erase detail loaded for an opened full-page follow-up.
+  it('retains a hidden side chat across ordinary snapshots until an explicit deletion', () => {
+    remoteProjectsStore.mergeDeviceSessions('host', 'Host', [mk('parent'), mk('child', { source: 'side-chat', parentSessionId: 'parent' })]);
+    remoteProjectsStore.setDeviceSessions('host', 'Host', [mk('parent')]);
+    expect(remoteProjectsStore.getDeviceSessions('host').map(row => row.id)).toEqual(['parent', 'child']);
+    remoteProjectsStore.applyPatch('host', 'child', { model: 'new-model' });
+    expect(remoteProjectsStore.getDeviceSessions('host').find(row => row.id === 'child')?.model).toBe('new-model');
+    remoteProjectsStore.applyPatch('host', 'child', { status: 'deleted' });
+    expect(remoteProjectsStore.getDeviceSessions('host').map(row => row.id)).toEqual(['parent']);
+  });
+  it('hides Make tasks from visible snapshots while preserving raw mirrors and origins', () => {
+    remoteProjectsStore.clear();
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [
+      mk('make', { source: 'cindy-make' }),
+      mk('merge', { source: 'cindy-make-merge' }),
+      mk('ordinary', { source: 'desktop' }),
+    ]);
+    expect(remoteProjectsStore.getMergedRemoteSessions()).toHaveLength(3);
+    expect(getSessionDeviceId('make')).toBe('dev-B');
+    const visible = remoteProjectsStore.getVisibleMergedRemoteSessions();
+    expect(visible.map(session => session.id)).toEqual(['ordinary']);
+    remoteProjectsStore.applyPatch('dev-B', 'make', { title: 'Hidden update' });
+    expect(remoteProjectsStore.getVisibleMergedRemoteSessions()).toBe(visible);
+    remoteProjectsStore.applyPatch('dev-B', 'ordinary', { source: 'cindy-make' });
+    expect(remoteProjectsStore.getVisibleMergedRemoteSessions()).toEqual([]);
+    remoteProjectsStore.clear();
+    expect(remoteProjectsStore.getVisibleMergedRemoteSessions()).toEqual([]);
+  });
+  beforeEach(() => {
+    setRemoteReseedImpl(null);
+    setRemoteSessionBootstrapRetryImpl(null);
+    remoteProjectsStore.clear();
+    remoteProjectsStore.__resetPendingTitlePreviewForTest();
+    // 钉子刻意不随 clear() 消失(见 pinnedOrigins),所以测试间必须显式清,否则会串用例。
+    remoteProjectsStore.__resetPinnedOriginsForTest();
+  });
+
+  it('invalidates and reloads the first snapshot when a tag catalog push arrives first', () => {
+    const reseed = vi.fn();
+    setRemoteReseedImpl(reseed);
+    const epoch = remoteProjectsStore.nextSnapshotEpoch('dev-A');
+    const otherEpoch = remoteProjectsStore.nextSnapshotEpoch('dev-B');
+    remoteProjectsStore.applyTagCatalog('dev-A', []);
+    expect(remoteProjectsStore.isLatestSnapshotEpoch('dev-A', epoch)).toBe(false);
+    expect(remoteProjectsStore.isLatestSnapshotEpoch('dev-B', otherEpoch)).toBe(true);
+    expect(reseed.mock.calls).toEqual([['dev-A', 'active']]);
+    const replacementEpoch = remoteProjectsStore.nextSnapshotEpoch('dev-A');
+    expect(remoteProjectsStore.isLatestSnapshotEpoch('dev-A', replacementEpoch)).toBe(true);
+  });
+
+  it('reloads an in-flight first archived snapshot without loading untouched history', () => {
+    const reseed = vi.fn();
+    setRemoteReseedImpl(reseed);
+    remoteProjectsStore.setDeviceSessions('dev-A', 'A', [mk('a')]);
+    remoteProjectsStore.applyTagCatalog('dev-A', []);
+    expect(reseed.mock.calls).toEqual([['dev-A', 'active']]);
+    reseed.mockClear();
+    remoteProjectsStore.markSessionStatusLoading('dev-A', 'archived');
+    const epoch = remoteProjectsStore.nextSnapshotEpoch('dev-A', 'archived');
+    remoteProjectsStore.applyTagCatalog('dev-A', []);
+    expect(remoteProjectsStore.isLatestSnapshotEpoch('dev-A', epoch, 'archived')).toBe(false);
+    expect(reseed.mock.calls).toEqual([['dev-A', 'active'], ['dev-A', 'archived']]);
+  });
+
+  it('requeues both loaded buckets after invalidating a refresh that may contain new tasks', () => {
+    const reseed = vi.fn();
+    setRemoteReseedImpl(reseed);
+    remoteProjectsStore.setDeviceSessions('dev-A', 'A', [mk('a')]);
+    remoteProjectsStore.setDeviceSessions('dev-A', 'A', [mk('archived', { status: 'archived' })], 'archived');
+    const activeEpoch = remoteProjectsStore.nextSnapshotEpoch('dev-A');
+    const archivedEpoch = remoteProjectsStore.nextSnapshotEpoch('dev-A', 'archived');
+    remoteProjectsStore.applyTagCatalog('dev-A', []);
+    expect(remoteProjectsStore.isLatestSnapshotEpoch('dev-A', activeEpoch)).toBe(false);
+    expect(remoteProjectsStore.isLatestSnapshotEpoch('dev-A', archivedEpoch, 'archived')).toBe(false);
+    expect(reseed.mock.calls).toEqual([['dev-A', 'active'], ['dev-A', 'archived']]);
+  });
+
+  it('把用户的任务重试动作交给 listing tier 注册的 bootstrap 实现', () => {
+    const retry = vi.fn();
+    setRemoteSessionBootstrapRetryImpl(retry);
+
+    retryRemoteSessionBootstrap('dev-B');
+
+    expect(retry).toHaveBeenCalledWith('dev-B');
+    expect(retry).toHaveBeenCalledTimes(1);
+  });
+
+  describe('origin 钉子(pinSessionOrigin)', () => {
+    // #7115: a copied task can exist on multiple computers with the same id.
+    // A link's explicit origin must survive both existing and later snapshots.
+    it('keeps an explicit origin ahead of same-id snapshots from another computer', () => {
+      remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('same', { title: 'B task' })]);
+      remoteProjectsStore.setDeviceSessions('dev-C', 'C', [mk('same', { title: 'C task' })]);
+      remoteProjectsStore.pinSessionOrigin('dev-B', 'same');
+      expect(getSessionDeviceId('same')).toBe('dev-B');
+      expect(remoteProjectsStore.getSessionTitle('same')).toBe('B task');
+      remoteProjectsStore.setDeviceSessions('dev-C', 'C', [mk('same', { title: 'C changed' })]);
+      expect(getSessionDeviceId('same')).toBe('dev-B');
+      expect(remoteProjectsStore.getSessionTitle('same')).toBe('B task');
+      remoteProjectsStore.pinSessionOrigin('dev-C', 'same');
+      expect(getSessionDeviceId('same')).toBe('dev-C');
+      expect(remoteProjectsStore.getSessionTitle('same')).toBe('C changed');
+    });
+
+    it('does not borrow another computer\'s title while the pinned snapshot is unavailable', () => {
+      remoteProjectsStore.setDeviceSessions('dev-C', 'C', [mk('same', { title: 'C task' })]);
+      remoteProjectsStore.pinSessionOrigin('dev-B', 'same');
+      expect(getSessionDeviceId('same')).toBe('dev-B');
+      expect(remoteProjectsStore.getSessionTitle('same')).toBeNull();
+    });
+
+    it('远程新建会话后 origin 立刻可判定,即使权威快照还没到', () => {
+      remoteProjectsStore.pinSessionOrigin('dev-B', 'new-1');
+      // 传输层据此走隧道 —— 没有钉子时它返回 undefined,首条消息就发给本机 maker。
+      expect(getSessionDeviceId('new-1')).toBe('dev-B');
+    });
+
+    it('钉子只影响 origin 判定,不伪造会话行', () => {
+      remoteProjectsStore.pinSessionOrigin('dev-B', 'new-1');
+      // 会话进列表仍等权威快照:侧边栏不该出现一条字段全靠猜的行。
+      expect(remoteProjectsStore.getMergedRemoteSessions()).toHaveLength(0);
+      expect(remoteProjectsStore.getDeviceSessions('dev-B')).toHaveLength(0);
+    });
+
+    it('权威快照到达后归属不变,且该会话正常进入列表', () => {
+      remoteProjectsStore.pinSessionOrigin('dev-B', 'new-1');
+      remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('new-1'), mk('s2')]);
+      expect(getSessionDeviceId('new-1')).toBe('dev-B');
+      expect(remoteProjectsStore.getMergedRemoteSessions()).toHaveLength(2);
+    });
+
+    it('钉子跨 clear() 存活:relay 瞬时重连不该让远程会话看起来像本机会话', () => {
+      remoteProjectsStore.pinSessionOrigin('dev-B', 'new-1');
+      remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('new-1')]);
+      remoteProjectsStore.clear();
+      // 分片没了(镜像随链路重建),但归属仍然成立 —— 否则重建窗口里的操作会落到本机执行。
+      expect(remoteProjectsStore.getMergedRemoteSessions()).toHaveLength(0);
+      expect(getSessionDeviceId('new-1')).toBe('dev-B');
+    });
+
+    it('重复钉同一条是幂等的', () => {
+      remoteProjectsStore.pinSessionOrigin('dev-B', 'new-1');
+      const before = remoteProjectsStore.getMergedRemoteSessions();
+      remoteProjectsStore.pinSessionOrigin('dev-B', 'new-1');
+      expect(remoteProjectsStore.getMergedRemoteSessions()).toBe(before);
+      expect(getSessionDeviceId('new-1')).toBe('dev-B');
+    });
+  });
+
+  it('stamps device-link origin, merges sessions, and registers sessionId→deviceId', () => {
+    remoteProjectsStore.setDeviceSessions('dev-B', 'Bob Mac', [mk('s1'), mk('s2')]);
+    const merged = remoteProjectsStore.getMergedRemoteSessions();
+    expect(merged).toHaveLength(2);
+    for (const s of merged) {
+      expect(s.deviceLinkDeviceId).toBe('dev-B');
+      expect(s.deviceLinkDeviceName).toBe('Bob Mac');
+      expect(s.deviceLinkConnectionStatus).toBe('connected');
+    }
+    expect(getSessionDeviceId('s1')).toBe('dev-B');
+    expect(getSessionDeviceId('unknown')).toBeUndefined();
+  });
+
+  it('merges multiple devices and keeps origin per device', () => {
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('s1')]);
+    remoteProjectsStore.setDeviceSessions('dev-C', 'C', [mk('s2')]);
+    expect(remoteProjectsStore.getMergedRemoteSessions()).toHaveLength(2);
+    expect(getSessionDeviceId('s1')).toBe('dev-B');
+    expect(getSessionDeviceId('s2')).toBe('dev-C');
+  });
+
+  it('active / archived 权威快照只替换自己的状态桶', () => {
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('active-1')], 'active');
+    remoteProjectsStore.setDeviceSessions(
+      'dev-B',
+      'B',
+      [mk('archived-1', { status: 'archived' })],
+      'archived',
+    );
+
+    expect(remoteProjectsStore.hasLoadedSessionStatus('dev-B', 'active')).toBe(true);
+    expect(remoteProjectsStore.hasLoadedSessionStatus('dev-B', 'archived')).toBe(true);
+    expect([...remoteProjectsStore.getArchivedLoadedDeviceIds()]).toEqual(['dev-B']);
+    expect(remoteProjectsStore.getDeviceSessions('dev-B', 'active').map((s) => s.id)).toEqual([
+      'active-1',
+    ]);
+    expect(remoteProjectsStore.getDeviceSessions('dev-B', 'archived').map((s) => s.id)).toEqual([
+      'archived-1',
+    ]);
+
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('active-2')], 'active');
+    expect(remoteProjectsStore.getMergedRemoteSessions().map((s) => s.id)).toEqual([
+      'active-2',
+      'archived-1',
+    ]);
+  });
+
+  it('归档桶按设备+状态去重，active 在途不拦请求且成功只清 archived loading', () => {
+    const reseed = vi.fn();
+    setRemoteReseedImpl(reseed);
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('active-1')]);
+    remoteProjectsStore.markBootstrapLoading('dev-B');
+
+    requestRemoteSessionStatus('dev-B', 'archived');
+    requestRemoteSessionStatus('dev-B', 'archived');
+    expect(reseed).toHaveBeenCalledTimes(1);
+    expect(reseed).toHaveBeenCalledWith('dev-B', 'archived');
+    expect(remoteProjectsStore.isSessionStatusLoading('dev-B', 'active')).toBe(true);
+    expect(remoteProjectsStore.isSessionStatusLoading('dev-B', 'archived')).toBe(true);
+    expect([...remoteProjectsStore.getBootstrapLoadingDeviceIds()]).toEqual(['dev-B']);
+
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [], 'archived');
+    expect(remoteProjectsStore.isSessionStatusLoading('dev-B', 'active')).toBe(true);
+    expect(remoteProjectsStore.isSessionStatusLoading('dev-B', 'archived')).toBe(false);
+    expect([...remoteProjectsStore.getBootstrapLoadingDeviceIds()]).toEqual(['dev-B']);
+    requestRemoteSessionStatus('dev-B', 'archived');
+    expect(reseed).toHaveBeenCalledTimes(1);
+  });
+
+  it('归档桶失败后显示失败态，并允许下一次按需请求自动重试', () => {
+    const reseed = vi.fn();
+    setRemoteReseedImpl(reseed);
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('active-1')]);
+
+    requestRemoteSessionStatus('dev-B', 'archived');
+    remoteProjectsStore.markSessionStatusFailed('dev-B', 'archived');
+
+    expect(remoteProjectsStore.isSessionStatusLoading('dev-B', 'archived')).toBe(false);
+    expect(remoteProjectsStore.getBootstrapFailedDeviceIds().size).toBe(0);
+    expect([...remoteProjectsStore.getArchivedFailedDeviceIds()]).toEqual(['dev-B']);
+
+    requestRemoteSessionStatus('dev-B', 'archived');
+
+    expect(reseed).toHaveBeenCalledTimes(2);
+    expect(remoteProjectsStore.isSessionStatusLoading('dev-B', 'archived')).toBe(true);
+    expect(remoteProjectsStore.getArchivedFailedDeviceIds().size).toBe(0);
+  });
+
+  it('已加载过 archived 桶后，失败恢复仍会强制重新拉取', () => {
+    const reseed = vi.fn();
+    setRemoteReseedImpl(reseed);
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [], 'archived');
+    remoteProjectsStore.markSessionStatusFailed('dev-B', 'archived');
+
+    retryRemoteSessionStatus('dev-B', 'archived');
+
+    expect(reseed).toHaveBeenCalledWith('dev-B', 'archived');
+    expect(remoteProjectsStore.isSessionStatusLoading('dev-B', 'archived')).toBe(true);
+    expect(remoteProjectsStore.getArchivedFailedDeviceIds().size).toBe(0);
+  });
+
+  it('snapshot reference is stable across no-op (useSyncExternalStore safety)', () => {
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('s1')]);
+    const a = remoteProjectsStore.getMergedRemoteSessions();
+    const b = remoteProjectsStore.getMergedRemoteSessions();
+    expect(a).toBe(b);
+  });
+
+  describe('applyPatch(push 驱动镜像)', () => {
+    it('就地幂等合并字段(title / pinnedAt / model)', () => {
+      remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('s1', { model: 'gpt-5.4' })]);
+      remoteProjectsStore.applyPatch('dev-B', 's1', { title: 'New', model: 'opus-4-8' });
+      const s = remoteProjectsStore.getMergedRemoteSessions().find((x) => x.id === 's1')!;
+      expect(s.title).toBe('New');
+      expect(s.model).toBe('opus-4-8');
+      expect(getSessionDeviceId('s1')).toBe('dev-B'); // origin 标记不丢
+    });
+
+    it('合并被控端运行时模型投影并同步有效设置轴', () => {
+      remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('s1')]);
+      remoteProjectsStore.applyPatch('dev-B', 's1', {
+        model: 'gpt-runtime',
+        providerId: 'openai',
+        effort: 'xhigh',
+        fastMode: true,
+        runtimeGeneration: 3,
+        runtimeBaseline: {
+          agentKind: 'codex',
+          model: 'gpt-baseline',
+          providerId: 'xd',
+          effort: 'high',
+          fastMode: false,
+        },
+        runtimeEffective: {
+          agentKind: 'codex',
+          model: 'gpt-runtime',
+          providerId: 'openai',
+          effort: 'xhigh',
+          fastMode: true,
+        },
+        runtimePending: null,
+      });
+
+      expect(remoteProjectsStore.getMergedRemoteSessions()[0]).toMatchObject({
+        model: 'gpt-runtime',
+        providerId: 'openai',
+        effort: 'xhigh',
+        fastMode: true,
+        runtimeGeneration: 3,
+        runtimeEffective: { model: 'gpt-runtime', providerId: 'openai' },
+      });
+    });
+
+    it('固定强度运行时模型显式清除旧 effort', () => {
+      remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('s1', { effort: 'high' })]);
+      remoteProjectsStore.applyPatch('dev-B', 's1', {
+        model: 'fixed-strength-model',
+        providerId: 'openai',
+        effort: '',
+        runtimeEffective: {
+          agentKind: 'codex',
+          model: 'fixed-strength-model',
+          providerId: 'openai',
+          effort: null,
+          fastMode: false,
+        },
+      });
+
+      expect(remoteProjectsStore.getMergedRemoteSessions()[0]).toMatchObject({
+        model: 'fixed-strength-model',
+        effort: '',
+        runtimeEffective: { effort: null },
+      });
+    });
+
+    it('status=deleted 移出分片，archived 保留完整行供归档筛选展示', () => {
+      remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('s1'), mk('s2')]);
+      remoteProjectsStore.applyPatch('dev-B', 's1', { status: 'deleted' });
+      expect(remoteProjectsStore.getMergedRemoteSessions().map((x) => x.id)).toEqual(['s2']);
+      remoteProjectsStore.applyPatch('dev-B', 's2', { status: 'archived' });
+      expect(remoteProjectsStore.getDeviceSessions('dev-B', 'active')).toHaveLength(0);
+      expect(remoteProjectsStore.getDeviceSessions('dev-B', 'archived')).toEqual([
+        expect.objectContaining({ id: 's2', status: 'archived' }),
+      ]);
+      expect(getSessionDeviceId('s1')).toBeUndefined();
+      expect(getSessionDeviceId('s2')).toBe('dev-B');
+    });
+
+    it('通知只在意 sessionId 的旁路状态，包含不在任何分片里的会话', () => {
+      const removed: string[] = [];
+      const off = subscribeRemoteSessionRemoval((id) => removed.push(id));
+      remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('s1')]);
+
+      remoteProjectsStore.applyPatch('dev-B', 's1', { status: 'deleted' });
+      // 不在任何分片里的会话(分片有界/设备早已移除)也得报:窗口里可能还挂着它的路由。
+      remoteProjectsStore.applyPatch('dev-gone', 's9', { status: 'deleted' });
+      // 非删除的 patch 不是消失。
+      remoteProjectsStore.applyPatch('dev-B', 's2', { status: 'archived' });
+
+      off();
+      remoteProjectsStore.applyPatch('dev-B', 's3', { status: 'deleted' });
+      expect(removed).toEqual(['s1', 's9']);
+    });
+
+    it('unpin 后触发 reseed,让仅因 includePinned 补入的旧会话被后续 snapshot 剔除', () => {
+      const reseed = vi.fn();
+      setRemoteReseedImpl(reseed);
+      remoteProjectsStore.setDeviceSessions('dev-B', 'B', [
+        mk('old-pinned', { pinnedAt: '2026-01-02T00:00:00.000Z' }),
+      ]);
+
+      remoteProjectsStore.applyPatch('dev-B', 'old-pinned', { pinnedAt: null });
+
+      expect(remoteProjectsStore.getMergedRemoteSessions()[0].pinnedAt).toBeNull();
+      expect(reseed).toHaveBeenCalledWith('dev-B', 'active');
+      expect(reseed).toHaveBeenCalledTimes(1);
+    });
+
+    it('落到未知 session 丢弃(不造壳)', () => {
+      remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('s1')]);
+      remoteProjectsStore.applyPatch('dev-B', 'ghost', { title: 'X' });
+      expect(remoteProjectsStore.getMergedRemoteSessions().map((x) => x.id)).toEqual(['s1']);
+    });
+
+    it('未知设备 no-op', () => {
+      remoteProjectsStore.applyPatch('dev-Z', 's1', { title: 'X' });
+      expect(remoteProjectsStore.getMergedRemoteSessions()).toHaveLength(0);
+    });
+  });
+
+  describe('snapshot epoch(乱序保护)', () => {
+    it('旧 snapshot 不覆盖新 snapshot', () => {
+      remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('s1', { model: 'old' })]);
+      // 模拟两次重拉:先发起 e1(旧),再发起 e2(新);e2 先 set,e1 后到应被丢弃。
+      const e1 = remoteProjectsStore.nextSnapshotEpoch('dev-B');
+      const e2 = remoteProjectsStore.nextSnapshotEpoch('dev-B');
+      expect(remoteProjectsStore.isLatestSnapshotEpoch('dev-B', e2)).toBe(true);
+      // e2 的结果落地
+      if (remoteProjectsStore.isLatestSnapshotEpoch('dev-B', e2)) {
+        remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('s1', { model: 'new' })]);
+      }
+      // e1(旧)回来:已非最新 → 调用方据 isLatestSnapshotEpoch 丢弃,不 set
+      expect(remoteProjectsStore.isLatestSnapshotEpoch('dev-B', e1)).toBe(false);
+      const s = remoteProjectsStore.getMergedRemoteSessions().find((x) => x.id === 's1')!;
+      expect(s.model).toBe('new');
+    });
+
+    it('removeDevice 即使无 shard 也失效 epoch:在途 refresh 不会把已移除设备会话加回', () => {
+      // 设备首次 bootstrap 还没建 shard 就被移除(下线/关被控),此刻在途 refresh 已取 epoch。
+      const e = remoteProjectsStore.nextSnapshotEpoch('dev-X'); // 无 shard
+      remoteProjectsStore.removeDevice('dev-X');
+      // 在途 refresh await 回来:epoch 已失效 → isLatestSnapshotEpoch=false → 调用方丢弃结果。
+      expect(remoteProjectsStore.isLatestSnapshotEpoch('dev-X', e)).toBe(false);
+    });
+
+    it('clear() 即使无 shard 也清 epoch:断连时在途首拉不会把会话加回', () => {
+      // relay 断连(connecting/stopped)调 clear();某设备首拉还在途、shard 未建,此刻已取 epoch。
+      const e = remoteProjectsStore.nextSnapshotEpoch('dev-Y'); // 无 shard
+      remoteProjectsStore.clear();
+      // 在途首拉 await 回来:epoch 已被 clear 失效 → 调用方据 isLatestSnapshotEpoch 丢弃,不 set。
+      expect(remoteProjectsStore.isLatestSnapshotEpoch('dev-Y', e)).toBe(false);
+    });
+
+    it('[ABA] removeDevice 后重新 bootstrap 的 epoch 不复用旧值,断连前的在途响应永久失效', () => {
+      const e1 = remoteProjectsStore.nextSnapshotEpoch('dev-A'); // 断连前在途
+      remoteProjectsStore.removeDevice('dev-A'); // 移除 → 自增(非归零)
+      const e2 = remoteProjectsStore.nextSnapshotEpoch('dev-A'); // reconnect 后新一轮
+      expect(e2).not.toBe(e1); // 关键:不复用 → 无 ABA
+      expect(e2).toBeGreaterThan(e1);
+      // 断连前在途响应(e1)即使在新一轮发起后回来,也已永久失效,不会盖回新 snapshot。
+      expect(remoteProjectsStore.isLatestSnapshotEpoch('dev-A', e1)).toBe(false);
+      expect(remoteProjectsStore.isLatestSnapshotEpoch('dev-A', e2)).toBe(true);
+    });
+
+    it('[ABA] clear() 后重新 bootstrap 的 epoch 不复用旧值', () => {
+      const e1 = remoteProjectsStore.nextSnapshotEpoch('dev-A');
+      remoteProjectsStore.clear(); // 断连 → 全部自增(非 clear-to-0)
+      const e2 = remoteProjectsStore.nextSnapshotEpoch('dev-A');
+      expect(e2).not.toBe(e1);
+      expect(e2).toBeGreaterThan(e1);
+      expect(remoteProjectsStore.isLatestSnapshotEpoch('dev-A', e1)).toBe(false);
+    });
+  });
+
+  it('removeDevice clears shard + registry', () => {
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('s1')]);
+    remoteProjectsStore.removeDevice('dev-B');
+    expect(remoteProjectsStore.getMergedRemoteSessions()).toHaveLength(0);
+    expect(getSessionDeviceId('s1')).toBeUndefined();
+    expect(remoteProjectsStore.getDeviceIds()).toHaveLength(0);
+  });
+
+  it('markDeviceDisconnected keeps sessions visible but removes the device from the online index', () => {
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('s1'), mk('s2')]);
+    remoteProjectsStore.setDeviceSessions(
+      'dev-B',
+      'B',
+      [mk('archived-1', { status: 'archived' })],
+      'archived',
+    );
+    remoteProjectsStore.markDeviceDisconnected('dev-B');
+
+    const merged = remoteProjectsStore.getMergedRemoteSessions();
+    expect(merged.map((s) => s.id)).toEqual(['s1', 's2', 'archived-1']);
+    expect(merged.every((s) => s.deviceLinkConnectionStatus === 'disconnected')).toBe(true);
+    // 旧 archived 行作缓存保留，但权威标记失效，重连后侧栏会重新校准断线期间变化。
+    expect(remoteProjectsStore.getArchivedLoadedDeviceIds().size).toBe(0);
+    // origin 保留:打开会话仍知道要走哪个 device-link 隧道,连接状态由 banner / invoke 错误处理。
+    expect(getSessionDeviceId('s1')).toBe('dev-B');
+    // 在线索引清掉:useRemoteSessionConnection 会显示 host-offline。
+    expect(remoteProjectsStore.getDeviceIds()).toEqual([]);
+    expect(remoteProjectsStore.getDeviceList()).toEqual([
+      { deviceId: 'dev-B', deviceName: 'B', sessionCount: 3, connected: false },
+    ]);
+  });
+
+  it('markAllDisconnected invalidates archived authority for every cached device', () => {
+    remoteProjectsStore.setDeviceSessions('dev-A', 'A', [], 'archived');
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [], 'archived');
+    expect([...remoteProjectsStore.getArchivedLoadedDeviceIds()]).toEqual(['dev-A', 'dev-B']);
+
+    remoteProjectsStore.markAllDisconnected();
+
+    expect(remoteProjectsStore.getArchivedLoadedDeviceIds().size).toBe(0);
+  });
+
+  // PR #8182 / unit: scope invalidation must also fence reads/loading before
+  // their first shard exists, while an independent connection retains authority.
+  it.each(['disconnect', 'clear'] as const)('scopes %s to matching in-flight devices without shards', (operation) => {
+    const primaryEpoch = remoteProjectsStore.nextSnapshotEpoch('primary-pending');
+    const otherEpoch = remoteProjectsStore.nextSnapshotEpoch('other-pending');
+    remoteProjectsStore.markSessionStatusLoading('primary-pending', 'active');
+    remoteProjectsStore.markSessionStatusLoading('other-pending', 'active');
+    const matches = (id: string) => id === 'primary-pending';
+    if (operation === 'disconnect') remoteProjectsStore.markAllDisconnected(matches);
+    else remoteProjectsStore.clear(matches);
+    expect(remoteProjectsStore.isLatestSnapshotEpoch('primary-pending', primaryEpoch)).toBe(false);
+    expect(remoteProjectsStore.isLatestSnapshotEpoch('other-pending', otherEpoch)).toBe(true);
+    expect(remoteProjectsStore.isSessionStatusLoading('primary-pending', 'active')).toBe(false);
+    expect(remoteProjectsStore.isSessionStatusLoading('other-pending', 'active')).toBe(true);
+  });
+
+  it('setDeviceSessions reconnects a disconnected cached shard', () => {
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('s1')]);
+    remoteProjectsStore.markDeviceDisconnected('dev-B');
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('s1')]);
+
+    expect(remoteProjectsStore.getMergedRemoteSessions()[0].deviceLinkConnectionStatus).toBe(
+      'connected',
+    );
+    expect(remoteProjectsStore.getDeviceIds()).toEqual(['dev-B']);
+    expect(remoteProjectsStore.getDeviceList()).toEqual([
+      { deviceId: 'dev-B', deviceName: 'B', sessionCount: 1, connected: true },
+    ]);
+  });
+
+  it('tracks loading/error independently from an existing shard and clears both after a successful snapshot', () => {
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('old')]);
+    remoteProjectsStore.markBootstrapLoading('dev-B');
+    expect([...remoteProjectsStore.getBootstrapLoadingDeviceIds()]).toEqual(['dev-B']);
+    expect(remoteProjectsStore.getDeviceSessions('dev-B').map((session) => session.id)).toEqual([
+      'old',
+    ]);
+
+    const before = remoteProjectsStore.getBootstrapFailedDeviceIds();
+    remoteProjectsStore.markBootstrapFailed('dev-B');
+    expect(remoteProjectsStore.getBootstrapLoadingDeviceIds().size).toBe(0);
+    const failed = remoteProjectsStore.getBootstrapFailedDeviceIds();
+    expect(failed).not.toBe(before);
+    expect([...failed]).toEqual(['dev-B']);
+
+    remoteProjectsStore.markBootstrapFailed('dev-B');
+    expect(remoteProjectsStore.getBootstrapFailedDeviceIds()).toBe(failed);
+
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', []);
+    expect(remoteProjectsStore.getBootstrapLoadingDeviceIds().size).toBe(0);
+    expect(remoteProjectsStore.getBootstrapFailedDeviceIds().size).toBe(0);
+  });
+
+  it('disconnect, removeDevice and clear discard active / archived activity before a shard exists', () => {
+    remoteProjectsStore.markBootstrapLoading('dev-loading');
+    remoteProjectsStore.markSessionStatusLoading('dev-loading', 'archived');
+    remoteProjectsStore.markDeviceDisconnected('dev-loading');
+    expect(remoteProjectsStore.getBootstrapLoadingDeviceIds().size).toBe(0);
+    expect(remoteProjectsStore.getArchivedLoadingDeviceIds().size).toBe(0);
+
+    remoteProjectsStore.markBootstrapFailed('dev-A');
+    remoteProjectsStore.markSessionStatusFailed('dev-A', 'archived');
+    remoteProjectsStore.removeDevice('dev-A');
+    expect(remoteProjectsStore.getBootstrapFailedDeviceIds().size).toBe(0);
+    expect(remoteProjectsStore.getArchivedFailedDeviceIds().size).toBe(0);
+
+    remoteProjectsStore.setDeviceSessions('dev-loaded', 'Loaded', [], 'archived');
+    remoteProjectsStore.removeDevice('dev-loaded');
+    expect(remoteProjectsStore.getArchivedLoadedDeviceIds().size).toBe(0);
+
+    remoteProjectsStore.markBootstrapLoading('dev-A');
+    remoteProjectsStore.markBootstrapFailed('dev-B');
+    remoteProjectsStore.markSessionStatusLoading('dev-C', 'archived');
+    remoteProjectsStore.markSessionStatusFailed('dev-D', 'archived');
+    remoteProjectsStore.clear();
+    expect(remoteProjectsStore.getBootstrapLoadingDeviceIds().size).toBe(0);
+    expect(remoteProjectsStore.getBootstrapFailedDeviceIds().size).toBe(0);
+    expect(remoteProjectsStore.getArchivedLoadingDeviceIds().size).toBe(0);
+    expect(remoteProjectsStore.getArchivedFailedDeviceIds().size).toBe(0);
+    expect(remoteProjectsStore.getArchivedLoadedDeviceIds().size).toBe(0);
+  });
+
+  it('clears only a superseded bootstrap loading state', () => {
+    remoteProjectsStore.markBootstrapLoading('dev-loading');
+    remoteProjectsStore.clearBootstrapLoading('dev-loading');
+    expect(remoteProjectsStore.getBootstrapLoadingDeviceIds().size).toBe(0);
+    expect(remoteProjectsStore.getBootstrapFailedDeviceIds().size).toBe(0);
+
+    remoteProjectsStore.markBootstrapFailed('dev-failed');
+    remoteProjectsStore.clearBootstrapLoading('dev-failed');
+    expect([...remoteProjectsStore.getBootstrapFailedDeviceIds()]).toEqual(['dev-failed']);
+  });
+
+  it('clear resets everything', () => {
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('s1'), mk('s2')]);
+    remoteProjectsStore.clear();
+    expect(remoteProjectsStore.getMergedRemoteSessions()).toHaveLength(0);
+    expect(getSessionDeviceId('s1')).toBeUndefined();
+    expect(remoteProjectsStore.getDeviceIds()).toHaveLength(0);
+  });
+
+  it('applyPatch 只换被 patch 设备的会话对象引用,其它设备会话引用稳定(防级联重渲染)', () => {
+    remoteProjectsStore.setDeviceSessions('dev-A', 'A', [mk('a1'), mk('a2')]);
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('b1')]);
+    const before = remoteProjectsStore.getMergedRemoteSessions();
+    const a1Before = before.find((x) => x.id === 'a1')!;
+    const a2Before = before.find((x) => x.id === 'a2')!;
+
+    remoteProjectsStore.applyPatch('dev-B', 'b1', { title: 'B1!' });
+
+    const after = remoteProjectsStore.getMergedRemoteSessions();
+    expect(after).not.toBe(before); // 扁平快照 recompute 换新数组
+    // dev-A 的会话对象引用未变(只有 dev-B 分片被 .map);否则 React 会无谓重渲所有设备项。
+    expect(after.find((x) => x.id === 'a1')).toBe(a1Before);
+    expect(after.find((x) => x.id === 'a2')).toBe(a2Before);
+    // 被 patch 的 dev-B 会话是新对象 + 新值。
+    expect(after.find((x) => x.id === 'b1')!.title).toBe('B1!');
+  });
+
+  it('renameDevice:重打 deviceLinkDeviceName + 通知 subscribeRename;同名时不重算(引用稳定)', () => {
+    remoteProjectsStore.setDeviceSessions('dev-B', 'Old', [mk('s1')]);
+    const seen: Array<[string, string]> = [];
+    const off = remoteProjectsStore.subscribeRename((id, name) => seen.push([id, name]));
+
+    remoteProjectsStore.renameDevice('dev-B', 'New');
+    expect(
+      remoteProjectsStore.getMergedRemoteSessions().find((x) => x.id === 's1')!
+        .deviceLinkDeviceName,
+    ).toBe('New');
+    expect(seen).toEqual([['dev-B', 'New']]);
+
+    // 同名:分片名未变 → 不 recompute(扁平快照引用不变),避免无谓重渲。
+    const beforeSameName = remoteProjectsStore.getMergedRemoteSessions();
+    remoteProjectsStore.renameDevice('dev-B', 'New');
+    expect(remoteProjectsStore.getMergedRemoteSessions()).toBe(beforeSameName);
+    off();
+  });
+});
+
+/**
+ * 标题预览叠加层:控制端发送瞬间即时显示占位,不等被控端那一次隧道往返;
+ * 分片数据仍是纯镜像(不被本地改写),被控端权威标题一到自动让位。
+ */
+describe('remoteProjectsStore pending title preview', () => {
+  beforeEach(() => {
+    setRemoteReseedImpl(null);
+    remoteProjectsStore.clear();
+    remoteProjectsStore.__resetPendingTitlePreviewForTest();
+  });
+
+  it('shows the preview while the authoritative title is still the default placeholder', () => {
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('s1', { title: 'New Maker' })]);
+
+    remoteProjectsStore.setPendingTitlePreview('s1', '帮我排查登录失败');
+
+    expect(remoteProjectsStore.getMergedRemoteSessions()[0]?.title).toBe('帮我排查登录失败');
+    // 分片本身没有被改写 —— 纯镜像不变量。
+    expect(remoteProjectsStore.getDeviceSessions('dev-B')[0]?.title).toBe('New Maker');
+  });
+
+  it('yields to the authoritative title as soon as the controlled device writes one', () => {
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('s1', { title: 'New Maker' })]);
+    remoteProjectsStore.setPendingTitlePreview('s1', '帮我排查登录失败');
+
+    // 被控端回流占位 → 权威值胜出。
+    remoteProjectsStore.applyPatch('dev-B', 's1', { title: '帮我排查登录失败' });
+    expect(remoteProjectsStore.getMergedRemoteSessions()[0]?.title).toBe('帮我排查登录失败');
+
+    // 再回流智能标题 → 预览已回收,不会把它顶回去。
+    remoteProjectsStore.applyPatch('dev-B', 's1', { title: '登录失败排查' });
+    expect(remoteProjectsStore.getMergedRemoteSessions()[0]?.title).toBe('登录失败排查');
+  });
+
+  it('previews over a synthesized placeholder the controller itself registered', () => {
+    // 纯附件首条消息:被控端把标题写成文件名。用户随后打下第一句话时,控制端同样
+    // 要即时顶上 —— 只认默认占位的话,即时性恰好在这条恢复路径上缺席(review P1)。
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('s1', { title: 'New Maker' })]);
+    remoteProjectsStore.setPendingTitlePreview('s1', '设计稿-v3.png', false);
+    remoteProjectsStore.applyPatch('dev-B', 's1', { title: '设计稿-v3.png' });
+    expect(remoteProjectsStore.getMergedRemoteSessions()[0]?.title).toBe('设计稿-v3.png');
+
+    remoteProjectsStore.setPendingTitlePreview('s1', '这个报错怎么修');
+
+    expect(remoteProjectsStore.getMergedRemoteSessions()[0]?.title).toBe('这个报错怎么修');
+    // 分片仍是纯镜像。
+    expect(remoteProjectsStore.getDeviceSessions('dev-B')[0]?.title).toBe('设计稿-v3.png');
+
+    // 智能标题落地 → 归属作废,后续预览不再生效。
+    remoteProjectsStore.applyPatch('dev-B', 's1', { title: '报错排查' });
+    expect(remoteProjectsStore.getMergedRemoteSessions()[0]?.title).toBe('报错排查');
+    remoteProjectsStore.setPendingTitlePreview('s1', '又一条消息');
+    expect(remoteProjectsStore.getMergedRemoteSessions()[0]?.title).toBe('报错排查');
+  });
+
+  it('previews over a fork placeholder (system-owned, parentSessionId present)', () => {
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [
+      mk('s1', { title: '[Fork] 源会话标题', parentSessionId: 'src-1' }),
+    ]);
+
+    remoteProjectsStore.setPendingTitlePreview('s1', '这个报错怎么修');
+
+    expect(remoteProjectsStore.getMergedRemoteSessions()[0]?.title).toBe('这个报错怎么修');
+  });
+
+  it('treats a user-named "[Fork] ..." session without parentSessionId as manual', () => {
+    // 与被控端 getOverwritableAutoTitle 同一条判据:没有 parentSessionId 就不是
+    // fork 占位,是用户自己起的名。
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [
+      mk('s1', { title: '[Fork] 我自己起的名' }),
+    ]);
+
+    remoteProjectsStore.setPendingTitlePreview('s1', '这个报错怎么修');
+
+    expect(remoteProjectsStore.getMergedRemoteSessions()[0]?.title).toBe('[Fork] 我自己起的名');
+  });
+
+  it('drops synthesized-title provenance together with the session (archive / device removal)', () => {
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('s1', { title: 'New Maker' })]);
+    remoteProjectsStore.setPendingTitlePreview('s1', '设计稿-v3.png', false);
+    remoteProjectsStore.applyPatch('dev-B', 's1', { title: '设计稿-v3.png' });
+    remoteProjectsStore.applyPatch('dev-B', 's1', { status: 'archived' });
+
+    // unarchive 回来:归属已随会话回收,旧的合成标题不再被当成系统占位。
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('s1', { title: '设计稿-v3.png' })]);
+    remoteProjectsStore.setPendingTitlePreview('s1', '这个报错怎么修');
+
+    expect(remoteProjectsStore.getMergedRemoteSessions()[0]?.title).toBe('设计稿-v3.png');
+  });
+
+  it('does not claim provenance for a prose title that the host settles on', () => {
+    // 首句是用户文字、标题模型无结果时,被控端就地定稿 —— 那是终态标题,不是占位。
+    // 靠"预览与权威值相等"推断归属会把它记成系统占位,之后每条消息的预览都能盖着
+    // 它不放,而权威侧再也不会发新 patch 纠正(review P1)。
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('s1', { title: 'New Maker' })]);
+    remoteProjectsStore.setPendingTitlePreview('s1', '帮我排查登录失败', true);
+    remoteProjectsStore.applyPatch('dev-B', 's1', { title: '帮我排查登录失败' });
+
+    remoteProjectsStore.setPendingTitlePreview('s1', '第二条消息', true);
+
+    expect(remoteProjectsStore.getMergedRemoteSessions()[0]?.title).toBe('帮我排查登录失败');
+  });
+
+  it('keeps the newer prose preview when an older synthesized patch lands late', () => {
+    // 用户在附件占位回流之前就打了字:旧占位 A 随后才到,它既不等于当前预览 B、
+    // 也不在归属表里,会被当成手动改名而把 B 整个丢掉,侧边栏回退到附件名
+    // 直到下一跳(review P1)。
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('s1', { title: 'New Maker' })]);
+    remoteProjectsStore.setPendingTitlePreview('s1', '设计稿-v3.png', false);
+    remoteProjectsStore.setPendingTitlePreview('s1', '这个报错怎么修', true);
+
+    // 迟到的 A 补丁。
+    remoteProjectsStore.applyPatch('dev-B', 's1', { title: '设计稿-v3.png' });
+    expect(remoteProjectsStore.getMergedRemoteSessions()[0]?.title).toBe('这个报错怎么修');
+
+    // 随后 B 的权威补丁到达 → 叠加层整体作废,后续预览不再生效。
+    remoteProjectsStore.applyPatch('dev-B', 's1', { title: '这个报错怎么修' });
+    expect(remoteProjectsStore.getMergedRemoteSessions()[0]?.title).toBe('这个报错怎么修');
+    remoteProjectsStore.setPendingTitlePreview('s1', '又一条消息', true);
+    expect(remoteProjectsStore.getMergedRemoteSessions()[0]?.title).toBe('这个报错怎么修');
+  });
+
+  it('never treats a manual rename arriving mid-preview as a synthesized confirmation', () => {
+    // 用户在合成预览在途时手动改了名 —— 那是权威的、他自己起的名字。若把"下一个
+    // 非默认标题"一律当成合成占位登记,之后的预览就能长期顶掉它,而被控端正确地
+    // 拒绝给手动命名的会话改名、不会有 patch 来纠正(review P1)。
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('s1', { title: 'New Maker' })]);
+    remoteProjectsStore.setPendingTitlePreview('s1', '设计稿-v3.png', false);
+
+    remoteProjectsStore.applyPatch('dev-B', 's1', { title: '我自己起的名字' });
+    remoteProjectsStore.setPendingTitlePreview('s1', '这个报错怎么修', true);
+
+    expect(remoteProjectsStore.getMergedRemoteSessions()[0]?.title).toBe('我自己起的名字');
+  });
+
+  it('跨语种占位登记不上时只丢失即时预览,不影响权威改名', () => {
+    // 已知且刻意接受的降级:两端 UI 语言不同、且首条消息只能回落到 i18n 类别词
+    // (粘贴截图)时,两端算出的串不逐字相等,归属登记不上。表现为后续首句话没有
+    // 即时预览,仍会经隧道往返正常改名 —— 少一次即时性,好过顶掉用户的名字。
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('s1', { title: 'New Maker' })]);
+    remoteProjectsStore.setPendingTitlePreview('s1', 'Image', false);
+    remoteProjectsStore.applyPatch('dev-B', 's1', { title: '图片' });
+
+    remoteProjectsStore.setPendingTitlePreview('s1', '这个报错怎么修', true);
+    expect(remoteProjectsStore.getMergedRemoteSessions()[0]?.title).toBe('图片');
+
+    // 权威改名照常到达。
+    remoteProjectsStore.applyPatch('dev-B', 's1', { title: '这个报错怎么修' });
+    expect(remoteProjectsStore.getMergedRemoteSessions()[0]?.title).toBe('这个报错怎么修');
+  });
+
+  it('drops overlays for sessions a full snapshot no longer contains', () => {
+    // 权威快照整片替换分片:patch 丢失期间被归档的会话就此离场,叠加层若不在这里
+    // 回收,removeDevice 也够不着它,unarchive/reseed 后旧预览会复活(review P1)。
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [
+      mk('s1', { title: 'New Maker' }),
+      mk('s2', { title: 'New Maker' }),
+    ]);
+    remoteProjectsStore.setPendingTitlePreview('s1', '帮我排查登录失败');
+
+    // s1 没在这次快照里回来 → 离场。
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('s2', { title: 'New Maker' })]);
+    // unarchive/reseed 把它拉回来,权威标题仍是默认占位。
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [
+      mk('s1', { title: 'New Maker' }),
+      mk('s2', { title: 'New Maker' }),
+    ]);
+
+    expect(remoteProjectsStore.getMergedRemoteSessions().find((s) => s.id === 's1')?.title).toBe(
+      'New Maker',
+    );
+  });
+
+  it('keeps overlays for sessions merged back by a partial anti-entropy window', () => {
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [
+      mk('s1', { title: 'New Maker' }),
+      mk('s2', { title: 'New Maker' }),
+    ]);
+    remoteProjectsStore.setPendingTitlePreview('s1', '帮我排查登录失败');
+
+    // 半窗口 anti-entropy:s1 不在本次窗口内,但 mergeDeviceSessions 会把它并回来。
+    remoteProjectsStore.mergeDeviceSessions('dev-B', 'B', [mk('s2', { title: 'New Maker' })]);
+
+    expect(remoteProjectsStore.getMergedRemoteSessions().find((s) => s.id === 's1')?.title).toBe(
+      '帮我排查登录失败',
+    );
+  });
+
+  it('clears stale synthesized provenance once a prose preview is confirmed', () => {
+    // 合成占位 A 落地后又来了用户文字 B;B 被权威确认时 A 的归属必须一并作废,
+    // 否则用户日后手动把标题改回 A,会被误判成系统占位而被预览长期顶替 —— 权威侧
+    // 正确地拒绝给手动命名的会话改名,不会有 patch 来纠正(review P1)。
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('s1', { title: 'New Maker' })]);
+    remoteProjectsStore.setPendingTitlePreview('s1', '设计稿-v3.png', false);
+    remoteProjectsStore.applyPatch('dev-B', 's1', { title: '设计稿-v3.png' });
+    remoteProjectsStore.setPendingTitlePreview('s1', '这个报错怎么修', true);
+    remoteProjectsStore.applyPatch('dev-B', 's1', { title: '这个报错怎么修' });
+
+    // 用户手动改回那个合成串。
+    remoteProjectsStore.applyPatch('dev-B', 's1', { title: '设计稿-v3.png' });
+    remoteProjectsStore.setPendingTitlePreview('s1', '又一条消息', true);
+
+    expect(remoteProjectsStore.getMergedRemoteSessions()[0]?.title).toBe('设计稿-v3.png');
+  });
+
+  it('never overrides a title the user already renamed on the controlled device', () => {
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('s1', { title: '我自己起的名字' })]);
+
+    remoteProjectsStore.setPendingTitlePreview('s1', '帮我排查登录失败');
+
+    expect(remoteProjectsStore.getMergedRemoteSessions()[0]?.title).toBe('我自己起的名字');
+  });
+
+  it('can explicitly drop a preview when first-message handoff fails', () => {
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('s1', { title: 'New Maker' })]);
+    remoteProjectsStore.setPendingTitlePreview('s1', '帮我排查登录失败');
+    remoteProjectsStore.clearPendingTitlePreview('s1');
+    expect(remoteProjectsStore.getMergedRemoteSessions()[0]?.title).toBe('New Maker');
+  });
+
+  it('survives a snapshot rebuild while the authoritative title stays default', () => {
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('s1', { title: 'New Maker' })]);
+    remoteProjectsStore.setPendingTitlePreview('s1', '帮我排查登录失败');
+
+    // anti-entropy 重拉:权威标题仍是默认占位 → 预览继续顶着,不闪回 New Maker。
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('s1', { title: 'New Maker' })]);
+
+    expect(remoteProjectsStore.getMergedRemoteSessions()[0]?.title).toBe('帮我排查登录失败');
+  });
+
+  it('drops previews for a removed device (revoke / stop control)', () => {
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('s1', { title: 'New Maker' })]);
+    remoteProjectsStore.setPendingTitlePreview('s1', '帮我排查登录失败');
+
+    remoteProjectsStore.removeDevice('dev-B');
+    // 重新接入后权威标题仍是默认占位 —— 边界前的旧预览不得复活。
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('s1', { title: 'New Maker' })]);
+
+    expect(remoteProjectsStore.getMergedRemoteSessions()[0]?.title).toBe('New Maker');
+  });
+
+  it('drops previews on clear() (logout / device-link stopped)', () => {
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('s1', { title: 'New Maker' })]);
+    remoteProjectsStore.setPendingTitlePreview('s1', '帮我排查登录失败');
+
+    remoteProjectsStore.clear();
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('s1', { title: 'New Maker' })]);
+
+    expect(remoteProjectsStore.getMergedRemoteSessions()[0]?.title).toBe('New Maker');
+  });
+
+  it('drops the preview when the session leaves the shard (archive / delete)', () => {
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('s1', { title: 'New Maker' })]);
+    remoteProjectsStore.setPendingTitlePreview('s1', '帮我排查登录失败');
+
+    // 归档移出分片 —— removeDevice 之后也遍历不到它,预览必须在这里回收。
+    remoteProjectsStore.applyPatch('dev-B', 's1', { status: 'archived' });
+    // unarchive / reseed 把同一个仍是默认标题的会话拉回来,旧预览不得复活。
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('s1', { title: 'New Maker' })]);
+
+    expect(remoteProjectsStore.getMergedRemoteSessions()[0]?.title).toBe('New Maker');
+  });
+
+  it('no-ops when the authoritative title is already set (avoids write/recompute churn)', () => {
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('s1', { title: '登录失败排查' })]);
+    const before = remoteProjectsStore.getMergedRemoteSessions();
+
+    remoteProjectsStore.setPendingTitlePreview('s1', '帮我排查登录失败');
+
+    // 预览本来就不会生效 —— 不写、不 recompute,快照引用保持不变。
+    expect(remoteProjectsStore.getMergedRemoteSessions()).toBe(before);
+    expect(remoteProjectsStore.getMergedRemoteSessions()[0]?.title).toBe('登录失败排查');
+  });
+
+  it('ignores empty previews and keeps the snapshot reference stable on repeat calls', () => {
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [mk('s1', { title: 'New Maker' })]);
+    remoteProjectsStore.setPendingTitlePreview('s1', '   ');
+    expect(remoteProjectsStore.getMergedRemoteSessions()[0]?.title).toBe('New Maker');
+
+    remoteProjectsStore.setPendingTitlePreview('s1', '帮我排查登录失败');
+    const first = remoteProjectsStore.getMergedRemoteSessions();
+    remoteProjectsStore.setPendingTitlePreview('s1', '帮我排查登录失败');
+    expect(remoteProjectsStore.getMergedRemoteSessions()).toBe(first);
+  });
+});
+
+describe('remote session title index', () => {
+  beforeEach(() => remoteProjectsStore.clear());
+
+  it('resolves titles by id and follows renames pushed by the device', () => {
+    remoteProjectsStore.setDeviceSessions('dev-A', 'A', [mk('a', { title: 'Release checklist' })]);
+    expect(remoteProjectsStore.getSessionTitle('a')).toBe('Release checklist');
+    expect(remoteProjectsStore.getSessionTitle('missing')).toBeNull();
+
+    remoteProjectsStore.setDeviceSessions('dev-A', 'A', [mk('a', { title: 'Renamed' })]);
+    expect(remoteProjectsStore.getSessionTitle('a')).toBe('Renamed');
+
+    remoteProjectsStore.removeDevice('dev-A');
+    expect(remoteProjectsStore.getSessionTitle('a')).toBeNull();
+  });
+});
+
+/**
+ * 首条发送叠加层:远程建会话后、被控端收下首条前,列表回流里的 userSendAt 仍为空。
+ * 叠加层让会话一直留在项目里,不先掉进项目外的草稿区再跳回来。
+ */
+describe('remoteProjectsStore pending first send', () => {
+  const SENT_AT = '2026-10-05T03:41:49.000Z';
+  const unsent = (id: string): Session => ({ ...mk(id, { title: 'New Maker' }), userSendAt: null });
+
+  beforeEach(() => {
+    setRemoteReseedImpl(null);
+    remoteProjectsStore.clear();
+    remoteProjectsStore.__resetPendingTitlePreviewForTest();
+  });
+
+  it('keeps the send time across a list refresh that still reports the host row as unsent', () => {
+    remoteProjectsStore.setPendingFirstSend('s1', SENT_AT);
+    remoteProjectsStore.mergeDeviceSessions('dev-B', 'B', [unsent('s1')]);
+    expect(remoteProjectsStore.getMergedRemoteSessions()[0]?.userSendAt).toBe(SENT_AT);
+
+    // 权威快照再来一次(host 仍未收下首条)—— 叠加层继续顶着。
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [unsent('s1')]);
+    expect(remoteProjectsStore.getMergedRemoteSessions()[0]?.userSendAt).toBe(SENT_AT);
+    // 分片本身没有被改写 —— 纯镜像不变量。
+    expect(remoteProjectsStore.getDeviceSessions('dev-B')[0]?.userSendAt).toBeNull();
+  });
+
+  it('yields to the host value and retires once the host records the first send', () => {
+    remoteProjectsStore.setPendingFirstSend('s1', SENT_AT);
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [unsent('s1')]);
+
+    const hostSentAt = '2026-10-05T03:41:50.123Z';
+    remoteProjectsStore.applyPatch('dev-B', 's1', { userSendAt: hostSentAt });
+    expect(remoteProjectsStore.getMergedRemoteSessions()[0]?.userSendAt).toBe(hostSentAt);
+
+    // 首条受理前就发出的列表读取晚于 patch 落地:叠加层已回收,但 userSendAt 只会前进,
+    // 陈旧快照不能把它退回空(否则任务掉出项目、等下一次回流才回来)。
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [unsent('s1')]);
+    expect(remoteProjectsStore.getMergedRemoteSessions()[0]?.userSendAt).toBe(hostSentAt);
+  });
+
+  it('lets an undelivered first message fall back to the honest empty state', () => {
+    remoteProjectsStore.setPendingFirstSend('s1', SENT_AT);
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [unsent('s1')]);
+
+    remoteProjectsStore.clearPendingFirstSend('s1');
+    expect(remoteProjectsStore.getMergedRemoteSessions()[0]?.userSendAt).toBeNull();
+  });
+
+  it('drops the overlay when the session leaves the mirror', () => {
+    remoteProjectsStore.setPendingFirstSend('s1', SENT_AT);
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [unsent('s1')]);
+    remoteProjectsStore.applyPatch('dev-B', 's1', { status: 'deleted' });
+
+    remoteProjectsStore.setDeviceSessions('dev-B', 'B', [unsent('s1')]);
+    expect(remoteProjectsStore.getMergedRemoteSessions()[0]?.userSendAt).toBeNull();
+  });
+});
+
+/**
+ * 远程归档 / 恢复的状态迁移叠加层:写库往返期间行先换桶,分片保持权威;
+ * 写库成功落被控端返回的行,叠加层留到写库之后的新列表确认为止。
+ */
+describe('remoteProjectsStore pending status (remote archive / unarchive)', () => {
+  const PINNED_AT = '2026-01-02T00:00:00.000Z';
+  const projected = (id: string) =>
+    remoteProjectsStore.getMergedRemoteSessions().find((session) => session.id === id);
+  const stored = (id: string) =>
+    remoteProjectsStore.getDeviceSessions('dev-A').find((session) => session.id === id);
+
+  beforeEach(() => {
+    setRemoteReseedImpl(null);
+    remoteProjectsStore.clear();
+    remoteProjectsStore.__resetPendingTitlePreviewForTest();
+  });
+
+  it('moves an archived row out of the active bucket at once without rewriting the shard', () => {
+    remoteProjectsStore.setDeviceSessions('dev-A', 'A', [mk('a', { pinnedAt: PINNED_AT }), mk('b')]);
+    const before = remoteProjectsStore.getMergedRemoteSessions();
+
+    remoteProjectsStore.beginPendingStatus('dev-A', 'a', 'archived');
+
+    expect(remoteProjectsStore.getMergedRemoteSessions()).not.toBe(before);
+    expect(projected('a')).toMatchObject({ status: 'archived', pinnedAt: null });
+    expect(projected('b')?.status).toBe('active');
+    // 分片仍是权威镜像;origin 判定不受影响。
+    expect(stored('a')).toMatchObject({ status: 'active', pinnedAt: PINNED_AT });
+    expect(getSessionDeviceId('a')).toBe('dev-A');
+  });
+
+  it('restores the row on rollback, and only the latest token can settle a session', () => {
+    remoteProjectsStore.setDeviceSessions('dev-A', 'A', [mk('a')]);
+    const first = remoteProjectsStore.beginPendingStatus('dev-A', 'a', 'archived');
+    const second = remoteProjectsStore.beginPendingStatus('dev-A', 'a', 'archived');
+    expect(remoteProjectsStore.isPendingStatusCurrent(first)).toBe(false);
+    expect(remoteProjectsStore.isPendingStatusCurrent(second)).toBe(true);
+
+    expect(remoteProjectsStore.rollbackPendingStatus(first)).toBe(false);
+    expect(remoteProjectsStore.completePendingStatus(first, { status: 'archived' })).toBe(false);
+    expect(projected('a')?.status).toBe('archived');
+    expect(stored('a')?.status).toBe('active');
+
+    expect(remoteProjectsStore.rollbackPendingStatus(second)).toBe(true);
+    expect(projected('a')?.status).toBe('active');
+  });
+
+  it('keeps the row hidden while stale snapshots and patches land during the write', () => {
+    remoteProjectsStore.setDeviceSessions('dev-A', 'A', [mk('a')]);
+    remoteProjectsStore.beginPendingStatus('dev-A', 'a', 'archived');
+
+    // 写库前就在途的列表 / 乱序 push 仍报 active —— 叠加层顶着,不回弹。
+    remoteProjectsStore.nextSnapshotEpoch('dev-A');
+    remoteProjectsStore.setDeviceSessions('dev-A', 'A', [mk('a', { title: 'renamed' })]);
+    remoteProjectsStore.applyPatch('dev-A', 'a', { status: 'active' });
+
+    expect(projected('a')).toMatchObject({ status: 'archived', title: 'renamed' });
+    expect(stored('a')?.status).toBe('active');
+  });
+
+  it('applies the persisted row on success and survives a list that started before the write', () => {
+    const reseed = vi.fn();
+    setRemoteReseedImpl(reseed);
+    remoteProjectsStore.setDeviceSessions('dev-A', 'A', [mk('a', { pinnedAt: PINNED_AT })]);
+    // 10s 周期对账在写库前已发出(拿到了 epoch),响应会在写库成功之后才落地。
+    const staleEpoch = remoteProjectsStore.nextSnapshotEpoch('dev-A');
+    const token = remoteProjectsStore.beginPendingStatus('dev-A', 'a', 'archived');
+
+    expect(
+      remoteProjectsStore.completePendingStatus(token, {
+        id: 'a',
+        status: 'archived',
+        pinnedAt: null,
+        updatedAt: '2026-02-01T00:00:00.000Z',
+      }),
+    ).toBe(true);
+    // 不等 sessions:patched 回流,权威行已就地落下。
+    expect(stored('a')).toMatchObject({
+      status: 'archived',
+      pinnedAt: null,
+      updatedAt: '2026-02-01T00:00:00.000Z',
+    });
+    // 完成不让在途列表 superseded(不打断 bootstrap / 按需读取的收尾)。
+    expect(remoteProjectsStore.isLatestSnapshotEpoch('dev-A', staleEpoch)).toBe(true);
+
+    // 陈旧列表落地,把权威行改回 active —— 叠加层继续顶着,行不复活。
+    remoteProjectsStore.setDeviceSessions('dev-A', 'A', [mk('a')]);
+    expect(stored('a')?.status).toBe('active');
+    expect(projected('a')?.status).toBe('archived');
+
+    // 同状态的 push 回流不撤叠加层(它可能早于那份陈旧列表到达)。
+    remoteProjectsStore.applyPatch('dev-A', 'a', { status: 'archived' });
+    remoteProjectsStore.setDeviceSessions('dev-A', 'A', [mk('a')]);
+    expect(projected('a')?.status).toBe('archived');
+
+    // 写库之后才发出的列表不含该行 → 权威确认,叠加层让位。
+    remoteProjectsStore.nextSnapshotEpoch('dev-A');
+    remoteProjectsStore.setDeviceSessions('dev-A', 'A', []);
+    expect(projected('a')).toBeUndefined();
+    // 叠加层已回收:之后的权威 active 快照照实显示(例如别处又恢复了它)。
+    remoteProjectsStore.nextSnapshotEpoch('dev-A');
+    remoteProjectsStore.setDeviceSessions('dev-A', 'A', [mk('a')]);
+    expect(projected('a')?.status).toBe('active');
+  });
+
+  it('settles on a confirming snapshot even when the shard is already byte-identical', () => {
+    remoteProjectsStore.setDeviceSessions('dev-A', 'A', [mk('a')]);
+    const token = remoteProjectsStore.beginPendingStatus('dev-A', 'a', 'archived');
+    remoteProjectsStore.completePendingStatus(token, { status: 'archived', pinnedAt: null });
+
+    // 写库后的 active 新列表不含 a:分片内容与此前逐字节相同(a 已是 archived),走 no-op
+    // 分支 —— 叠加层仍要在这里确认回收。
+    const listener = vi.fn();
+    const unsubscribe = remoteProjectsStore.subscribe(listener);
+    remoteProjectsStore.nextSnapshotEpoch('dev-A');
+    remoteProjectsStore.setDeviceSessions('dev-A', 'A', []);
+    unsubscribe();
+    expect(listener).toHaveBeenCalled();
+    expect(projected('a')?.status).toBe('archived');
+
+    // 已回收:之后的权威 active 行(例如别处又恢复了它)照实显示。
+    remoteProjectsStore.setDeviceSessions('dev-A', 'A', [mk('a')]);
+    expect(projected('a')?.status).toBe('active');
+  });
+
+  it('brings an unarchived row back into the active bucket immediately', () => {
+    remoteProjectsStore.setDeviceSessions('dev-A', 'A', []);
+    remoteProjectsStore.setDeviceSessions(
+      'dev-A',
+      'A',
+      [mk('a', { status: 'archived' })],
+      'archived',
+    );
+    const token = remoteProjectsStore.beginPendingStatus('dev-A', 'a', 'active');
+    expect(projected('a')?.status).toBe('active');
+    expect(stored('a')?.status).toBe('archived');
+
+    remoteProjectsStore.completePendingStatus(token, { id: 'a', status: 'active' });
+    expect(stored('a')?.status).toBe('active');
+    expect(projected('a')?.status).toBe('active');
+  });
+
+  it('ignores late status pushes after the write and a post-write list that still carries old data', () => {
+    remoteProjectsStore.setDeviceSessions('dev-A', 'A', [mk('a')]);
+    const token = remoteProjectsStore.beginPendingStatus('dev-A', 'a', 'archived');
+    remoteProjectsStore.completePendingStatus(token, {
+      id: 'a',
+      status: 'archived',
+      updatedAt: '2026-02-01T00:00:00.000Z',
+    });
+
+    // 写库前产生的 active 推送晚于回包到达:不带 updatedAt,分不清新旧 —— 不撤叠加层。
+    remoteProjectsStore.applyPatch('dev-A', 'a', { status: 'active' });
+    expect(projected('a')?.status).toBe('archived');
+
+    // 写库后才发出的列表被被控端并进写库前的查询,仍带旧 active 行 —— 第一份容忍一次。
+    remoteProjectsStore.nextSnapshotEpoch('dev-A');
+    remoteProjectsStore.setDeviceSessions('dev-A', 'A', [mk('a')]);
+    expect(projected('a')?.status).toBe('archived');
+
+    // 真正写库后的列表不含它 → 确认让位。
+    remoteProjectsStore.nextSnapshotEpoch('dev-A');
+    remoteProjectsStore.setDeviceSessions('dev-A', 'A', []);
+    remoteProjectsStore.nextSnapshotEpoch('dev-A');
+    remoteProjectsStore.setDeviceSessions('dev-A', 'A', [mk('a')]);
+    expect(projected('a')?.status).toBe('active');
+  });
+
+  it('yields to a later change by another controller on the second post-write list', () => {
+    remoteProjectsStore.setDeviceSessions('dev-A', 'A', []);
+    remoteProjectsStore.setDeviceSessions(
+      'dev-A',
+      'A',
+      [mk('a', { status: 'archived' })],
+      'archived',
+    );
+    const token = remoteProjectsStore.beginPendingStatus('dev-A', 'a', 'active');
+    remoteProjectsStore.completePendingStatus(token, { id: 'a', status: 'active' });
+
+    // 另一控制端随后又把它归档了。状态写不推进 updatedAt,推送和第一份对不上的写库后列表
+    // 都分不清它与旧结果 —— 叠加层顶住;第二份写库后列表无论内容一律让位,不会永远顶住。
+    remoteProjectsStore.applyPatch('dev-A', 'a', { status: 'archived' });
+    expect(projected('a')?.status).toBe('active');
+    const archivedList = () => {
+      remoteProjectsStore.nextSnapshotEpoch('dev-A', 'archived');
+      remoteProjectsStore.setDeviceSessions('dev-A', 'A', [mk('a', { status: 'archived' })], 'archived');
+    };
+    archivedList();
+    expect(projected('a')?.status).toBe('active');
+    archivedList();
+    expect(projected('a')?.status).toBe('archived');
+  });
+
+  it('drops the overlay on deletion, device removal and clear', () => {
+    remoteProjectsStore.setDeviceSessions('dev-A', 'A', [mk('a'), mk('b'), mk('c')]);
+    const deleted = remoteProjectsStore.beginPendingStatus('dev-A', 'a', 'archived');
+    remoteProjectsStore.applyPatch('dev-A', 'a', { status: 'deleted' });
+    expect(projected('a')).toBeUndefined();
+    expect(remoteProjectsStore.completePendingStatus(deleted, { status: 'archived' })).toBe(false);
+
+    const removed = remoteProjectsStore.beginPendingStatus('dev-A', 'b', 'archived');
+    remoteProjectsStore.removeDevice('dev-A');
+    remoteProjectsStore.setDeviceSessions('dev-A', 'A', [mk('b')]);
+    expect(projected('b')?.status).toBe('active');
+    expect(remoteProjectsStore.rollbackPendingStatus(removed)).toBe(false);
+
+    remoteProjectsStore.beginPendingStatus('dev-A', 'b', 'archived');
+    remoteProjectsStore.clear();
+    remoteProjectsStore.setDeviceSessions('dev-A', 'A', [mk('b')]);
+    expect(projected('b')?.status).toBe('active');
+  });
+});

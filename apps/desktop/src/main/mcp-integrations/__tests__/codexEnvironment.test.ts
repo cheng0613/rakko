@@ -1,0 +1,531 @@
+import { createLiziMcpProviders } from '@cindy/mcps';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+
+import type { Logger, McpProvider, McpProviderContext } from '@cindy/maker-core';
+import type { AppServerConfig } from '../../mcp-apps/connection.js';
+import {
+  getActiveCodexBridgeServerNames,
+  getCodexExtraSpawnConfig,
+  registerCodexMcpThreadContext,
+  setCodexEnvironmentShutdownHook,
+  shutdownCodexEnvironment,
+  unregisterCodexMcpThreadContext,
+} from '../codexEnvironment.desktop.js';
+import { CODEX_ALLOWED_BUILTIN_PLUGIN_IDS_KEY, CODEX_DISABLED_BUILTIN_PLUGIN_IDS_KEY } from '../codexBuiltinToolPolicy.js';
+import { registerAppServer, clearAppServerConfigs } from '../../mcp-apps/runtime.js';
+import { CINDY_MAKE_VENDOR_OPTION_KEY } from '../../../shared/cindyMakeSession.js';
+import { BOT_IM_CHANNELS_VENDOR_KEY } from '../../../shared/botImConnection.js';
+import { CustomMcpProvider } from '../custom-mcp-provider.js';
+
+function noopLogger(): Logger {
+  const logger: Logger = {
+    trace() {},
+    debug() {},
+    info() {},
+    warn() {},
+    error() {},
+    fatal() {},
+    child() {
+      return logger;
+    },
+  };
+  return logger;
+}
+
+function testProvider(): McpProvider {
+  return {
+    name: 'cindy_test',
+    toClaudeSdkConfig: () => ({
+      type: 'sdk',
+      name: 'cindy_test',
+      instance: new McpServer({ name: 'cindy_test', version: '1.0.0' }),
+    }),
+  };
+}
+
+/** server 名是不安全对象 key 的远程 provider（自定义 MCP id 正则允许 `__proto__`）。 */
+function unsafeKeyRemoteProvider(): McpProvider {
+  return {
+    name: '__proto__',
+    toCodexMcpConfig: () => ({ type: 'http', url: 'https://evil.example/mcp' }),
+  };
+}
+
+/** 远程 HTTP MCP provider(无 in-process SDK server),带自定义 header。 */
+function remoteHttpProvider(): McpProvider {
+  return {
+    name: 'themis',
+    toCodexMcpConfig: () => ({
+      type: 'http',
+      url: 'https://themis.example/mcp',
+      envHttpHeaders: { 'xd-themis-sk': 'CUSTOM_MCP_THEMIS_HDR_XD_2DTHEMIS_2DSK' },
+    }),
+    getExtraEnv: () => ({ CUSTOM_MCP_THEMIS_HDR_XD_2DTHEMIS_2DSK: 'sk-123' }),
+  };
+}
+
+function extractUrl(args: string[]): URL {
+  const value = args.find((arg) => arg.startsWith('mcp_servers.cindy_test.url='));
+  if (!value) throw new Error('missing cindy_test URL arg');
+  const raw = value.slice('mcp_servers.cindy_test.url='.length);
+  return new URL(raw.replace(/^"|"$/g, ''));
+}
+
+describe('codexEnvironment', () => {
+  afterEach(async () => {
+    setCodexEnvironmentShutdownHook(null);
+    await shutdownCodexEnvironment();
+    clearAppServerConfigs();
+  });
+
+  it('reuses one bridge and exposes unbound MCP server URLs', async () => {
+    const logger = noopLogger();
+    const providers = [testProvider()];
+
+    const first = await getCodexExtraSpawnConfig({
+      mcpProviders: providers,
+      logger,
+    });
+    const second = await getCodexExtraSpawnConfig({
+      mcpProviders: providers,
+      logger,
+    });
+
+    const firstUrl = extractUrl(first.extraArgs);
+    const secondUrl = extractUrl(second.extraArgs);
+
+    expect(first).toBe(second);
+    expect(first.bridge).toBe(second.bridge);
+    expect(first.extraEnv).toEqual(second.extraEnv);
+    expect(firstUrl.origin).toBe(secondUrl.origin);
+    expect(firstUrl.pathname).toBe('/mcp/cindy_test');
+    expect(secondUrl.pathname).toBe('/mcp/cindy_test');
+
+    expect(first.buildSessionMcpConfig).toBeTypeOf('function');
+    const boundConfig = first.buildSessionMcpConfig!('instance-1');
+    const boundUrl = new URL(boundConfig['mcp_servers.cindy_test.url'] as string);
+    expect(boundUrl.origin).toBe(firstUrl.origin);
+    expect(boundUrl.pathname).toBe('/mcp/cindy_test');
+    expect(boundUrl.searchParams.get('instance')).toBe('instance-1');
+    expect(boundUrl.searchParams.has('session')).toBe(false);
+
+    const replacementUrl = new URL(
+      first.buildSessionMcpConfig!('instance-2')['mcp_servers.cindy_test.url'] as string,
+    );
+    expect(replacementUrl.searchParams.get('instance')).toBe('instance-2');
+    expect(replacementUrl.toString()).not.toBe(boundUrl.toString());
+  });
+
+  it.each(['http', 'sse'] as const)('keeps a %s custom MCP facade available across Codex clients', async (transport) => {
+    const instances: McpServer[] = [];
+    const appProxy = vi.fn((read: () => AppServerConfig, context: McpProviderContext) => {
+      expect(read()).toEqual({
+        id: 'custom_test',
+        url: 'https://example.test/mcp',
+        transport,
+        headers: { Authorization: 'Bearer test-only-token' },
+      });
+      expect(context.agentKind).toBe('codex');
+      const server = new McpServer({ name: 'custom_test', version: '1.0.0' });
+      instances.push(server);
+      return server;
+    });
+    const provider = new CustomMcpProvider({
+      id: 'custom_test', name: 'Custom Test', transport, url: 'https://example.test/mcp', headers: {},
+    }, () => 'test-only-token', appProxy);
+    registerAppServer(provider.name, () => provider.appServerConfig());
+    const config = await getCodexExtraSpawnConfig({
+      mcpProviders: [provider], logger: noopLogger(),
+    });
+    expect(config.bridgeServerNames).toContain('custom_test');
+    expect(config.extraArgs.join('\n')).not.toContain('test-only-token');
+    expect(Object.values(config.extraEnv)).not.toContain('test-only-token');
+    expect(config.extraArgs).toContain('mcp_servers.custom_test.enabled=false');
+    const vendorOptions = { [CODEX_ALLOWED_BUILTIN_PLUGIN_IDS_KEY]: [], cindyRuntimeMcpServerNames: [] as string[] };
+    expect(config.buildSessionMcpConfig!('local-instance', { vendorOptions }))
+      .toHaveProperty('mcp_servers.custom_test.enabled', false);
+    vendorOptions.cindyRuntimeMcpServerNames = ['custom_test'];
+    const bound = config.buildSessionMcpConfig!('local-instance', { vendorOptions });
+    expect(bound).toHaveProperty('mcp_servers.custom_test.enabled', true);
+    const url = bound['mcp_servers.custom_test.url'] as string;
+
+    // Each MCP client needs its own facade; rebuilding must keep the provider receiver too.
+    for (const id of [1, 2]) {
+      const response = await config.bridge!.withDiscoveryContext({
+        agentKind: 'codex', sessionId: 'local-task', sessionInstanceId: 'local-instance',
+        workingDir: '/test', vendorOptions,
+      }, () => fetch(url, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${config.bridge!.token}`,
+          accept: 'application/json, text/event-stream',
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0', id, method: 'initialize',
+          params: { protocolVersion: '2024-11-05', capabilities: {},
+            clientInfo: { name: 'test-client', version: '1.0.0' } },
+        }),
+      }));
+      const body = await response.text();
+      expect(response.status).toBe(200);
+      expect(body).toContain('"name":"custom_test"');
+    }
+    expect(appProxy).toHaveBeenCalledTimes(2);
+    expect(instances[0]).not.toBe(instances[1]);
+  });
+
+  it('disables cindy_make per thread unless the Session carries the Cindy Make marker', async () => {
+    const cindyMake: McpProvider = {
+      name: 'cindy_make',
+      toClaudeSdkConfig: () => ({
+        type: 'sdk',
+        name: 'cindy_make',
+        instance: new McpServer({ name: 'cindy_make', version: '1.0.0' }),
+      }),
+    };
+    const config = await getCodexExtraSpawnConfig({
+      mcpProviders: [testProvider(), cindyMake],
+      logger: noopLogger(),
+    });
+    expect(config.extraArgs.some((arg) => arg.startsWith('mcp_servers.cindy_make.url='))).toBe(true);
+
+    const ordinary = config.buildSessionMcpConfig!('instance-plain', { vendorOptions: {} });
+    expect(ordinary['mcp_servers.cindy_make.enabled']).toBe(false);
+    expect(ordinary['mcp_servers.cindy_test.enabled']).toBeUndefined();
+    expect(config.buildSessionMcpConfig!('instance-legacy')['mcp_servers.cindy_make.enabled']).toBe(false);
+
+    const make = config.buildSessionMcpConfig!('instance-make', {
+      vendorOptions: { [CINDY_MAKE_VENDOR_OPTION_KEY]: true },
+    });
+    expect(make['mcp_servers.cindy_make.enabled']).toBeUndefined();
+    expect(make['mcp_servers.cindy_make.url']).toEqual(expect.stringContaining('/mcp/cindy_make'));
+  });
+
+  it('disables cindy_telegram_bot per thread unless the Session carries a Telegram channel marker', async () => {
+    const telegramBot: McpProvider = {
+      name: 'cindy_telegram_bot',
+      // Mirrors mcp-providers: the shared app-server builds its server list with an empty ctx.
+      isEnabled: (ctx) => typeof ctx.vendorOptions?.telegramChatId === 'string'
+        || ((ctx.agentKind === 'codex' || ctx.agentKind === 'pi') && !ctx.workingDir),
+      toClaudeSdkConfig: () => ({
+        type: 'sdk',
+        name: 'cindy_telegram_bot',
+        instance: new McpServer({ name: 'cindy_telegram_bot', version: '1.0.0' }),
+      }),
+    };
+    const config = await getCodexExtraSpawnConfig({
+      mcpProviders: [testProvider(), telegramBot],
+      logger: noopLogger(),
+    });
+    expect(config.extraArgs.some((arg) => arg.startsWith('mcp_servers.cindy_telegram_bot.url='))).toBe(true);
+
+    const desktop = config.buildSessionMcpConfig!('instance-desktop', { vendorOptions: {} });
+    expect(desktop['mcp_servers.cindy_telegram_bot.enabled']).toBe(false);
+    expect(desktop['mcp_servers.cindy_test.enabled']).toBeUndefined();
+    expect(config.buildSessionMcpConfig!('instance-legacy')['mcp_servers.cindy_telegram_bot.enabled']).toBe(false);
+
+    // Group / topic lane and personal bot session: chat-based vendor options.
+    const lane = config.buildSessionMcpConfig!('instance-lane', {
+      vendorOptions: { telegramChatId: 'g/-100123', source: 'telegram' },
+    });
+    expect(lane['mcp_servers.cindy_telegram_bot.enabled']).toBeUndefined();
+    // Bot canonical chat: bound-channel marker written by botProfileRuntime.
+    const canonical = config.buildSessionMcpConfig!('instance-main', {
+      vendorOptions: { [BOT_IM_CHANNELS_VENDOR_KEY]: ['telegram'] },
+    });
+    expect(canonical['mcp_servers.cindy_telegram_bot.enabled']).toBeUndefined();
+    // A Bot that only bound Feishu does not see the Telegram tool.
+    const feishuOnly = config.buildSessionMcpConfig!('instance-feishu', {
+      vendorOptions: { [BOT_IM_CHANNELS_VENDOR_KEY]: ['feishu'] },
+    });
+    expect(feishuOnly['mcp_servers.cindy_telegram_bot.enabled']).toBe(false);
+  });
+
+  it('freezes policy within one session instance but replaces it on thread rebinding', async () => {
+    const cfg = await getCodexExtraSpawnConfig({
+      mcpProviders: [testProvider()],
+      logger: noopLogger(),
+    });
+    const register = vi.spyOn(cfg.bridge!, 'registerThreadContext');
+    const unregister = vi.spyOn(cfg.bridge!, 'unregisterThreadContext');
+
+    registerCodexMcpThreadContext('thread-1', {
+      agentKind: 'codex',
+      sessionInstanceId: 'instance-old',
+      workingDir: '/project',
+      vendorOptions: { [CODEX_DISABLED_BUILTIN_PLUGIN_IDS_KEY]: ['cindy-ssh'] },
+      mcpCallerKind: 'descendant',
+      mcpCallerAttested: true,
+    });
+    registerCodexMcpThreadContext('thread-1', {
+      agentKind: 'codex',
+      sessionInstanceId: 'instance-old',
+      workingDir: '/project',
+      vendorOptions: { [CODEX_DISABLED_BUILTIN_PLUGIN_IDS_KEY]: [] },
+    });
+
+    expect(register).toHaveBeenLastCalledWith(
+      'thread-1',
+      expect.objectContaining({
+        mcpCallerKind: 'descendant',
+        mcpCallerAttested: true,
+        vendorOptions: expect.objectContaining({
+          [CODEX_DISABLED_BUILTIN_PLUGIN_IDS_KEY]: ['cindy-ssh'],
+        }),
+      }),
+    );
+
+    registerCodexMcpThreadContext('thread-1', {
+      agentKind: 'codex',
+      sessionInstanceId: 'instance-new',
+      workingDir: '/project',
+      vendorOptions: { [CODEX_DISABLED_BUILTIN_PLUGIN_IDS_KEY]: [] },
+      mcpCallerKind: 'descendant',
+      mcpCallerAttested: true,
+    });
+    expect(register).toHaveBeenLastCalledWith(
+      'thread-1',
+      expect.objectContaining({
+        sessionInstanceId: 'instance-new',
+        mcpCallerKind: 'descendant',
+        mcpCallerAttested: true,
+        vendorOptions: expect.objectContaining({
+          [CODEX_DISABLED_BUILTIN_PLUGIN_IDS_KEY]: [],
+        }),
+      }),
+    );
+
+    unregisterCodexMcpThreadContext('thread-1', 'instance-old');
+    expect(unregister).not.toHaveBeenCalled();
+    unregisterCodexMcpThreadContext('thread-1', 'instance-new');
+    expect(unregister).toHaveBeenCalledWith('thread-1', 'instance-new');
+  });
+
+  it('does not carry provenance into a new session instance and preserves explicit unknown/false', async () => {
+    const cfg = await getCodexExtraSpawnConfig({
+      mcpProviders: [testProvider()],
+      logger: noopLogger(),
+    });
+    const register = vi.spyOn(cfg.bridge!, 'registerThreadContext');
+
+    registerCodexMcpThreadContext('thread-provenance', {
+      agentKind: 'codex',
+      sessionInstanceId: 'instance-old',
+      workingDir: '/project',
+      mcpCallerKind: 'descendant',
+      mcpCallerAttested: true,
+    });
+    registerCodexMcpThreadContext('thread-provenance', {
+      agentKind: 'codex',
+      sessionInstanceId: 'instance-new',
+      workingDir: '/project',
+    });
+    expect(register).toHaveBeenLastCalledWith(
+      'thread-provenance',
+      expect.objectContaining({
+        sessionInstanceId: 'instance-new',
+        mcpCallerKind: undefined,
+        mcpCallerAttested: undefined,
+      }),
+    );
+
+    registerCodexMcpThreadContext('thread-provenance', {
+      agentKind: 'codex',
+      sessionInstanceId: 'instance-new',
+      workingDir: '/project',
+      mcpCallerKind: 'unknown',
+      mcpCallerAttested: false,
+    });
+    registerCodexMcpThreadContext('thread-provenance', {
+      agentKind: 'codex',
+      sessionInstanceId: 'instance-new',
+      workingDir: '/project',
+    });
+    expect(register).toHaveBeenLastCalledWith(
+      'thread-provenance',
+      expect.objectContaining({
+        mcpCallerKind: 'unknown',
+        mcpCallerAttested: false,
+      }),
+    );
+  });
+
+  it('clears provenance on unregister so a reused thread starts unknown', async () => {
+    const cfg = await getCodexExtraSpawnConfig({
+      mcpProviders: [testProvider()],
+      logger: noopLogger(),
+    });
+    const register = vi.spyOn(cfg.bridge!, 'registerThreadContext');
+    const unregister = vi.spyOn(cfg.bridge!, 'unregisterThreadContext');
+
+    registerCodexMcpThreadContext('thread-reused', {
+      agentKind: 'codex',
+      sessionInstanceId: 'instance-old',
+      workingDir: '/project',
+      mcpCallerKind: 'root',
+      mcpCallerAttested: true,
+    });
+    unregisterCodexMcpThreadContext('thread-reused', 'instance-old');
+    registerCodexMcpThreadContext('thread-reused', {
+      agentKind: 'codex',
+      sessionInstanceId: 'instance-new',
+      workingDir: '/project',
+    });
+
+    expect(unregister).toHaveBeenCalledWith('thread-reused', 'instance-old');
+    expect(register).toHaveBeenLastCalledWith(
+      'thread-reused',
+      expect.objectContaining({
+        sessionInstanceId: 'instance-new',
+        mcpCallerKind: undefined,
+        mcpCallerAttested: undefined,
+      }),
+    );
+  });
+
+  it('does not let an old unregister clear a new provenance generation without vendor policy', async () => {
+    const cfg = await getCodexExtraSpawnConfig({
+      mcpProviders: [testProvider()],
+      logger: noopLogger(),
+    });
+    const register = vi.spyOn(cfg.bridge!, 'registerThreadContext');
+    const unregister = vi.spyOn(cfg.bridge!, 'unregisterThreadContext');
+
+    registerCodexMcpThreadContext('thread-generation', {
+      agentKind: 'codex',
+      sessionInstanceId: 'instance-old',
+      workingDir: '/project',
+      mcpCallerKind: 'descendant',
+      mcpCallerAttested: true,
+    });
+    registerCodexMcpThreadContext('thread-generation', {
+      agentKind: 'codex',
+      sessionInstanceId: 'instance-new',
+      workingDir: '/project',
+      mcpCallerKind: 'root',
+      mcpCallerAttested: true,
+    });
+
+    unregisterCodexMcpThreadContext('thread-generation', 'instance-old');
+    expect(unregister).not.toHaveBeenCalled();
+    registerCodexMcpThreadContext('thread-generation', {
+      agentKind: 'codex',
+      sessionInstanceId: 'instance-new',
+      workingDir: '/project',
+    });
+    expect(register).toHaveBeenLastCalledWith(
+      'thread-generation',
+      expect.objectContaining({
+        mcpCallerKind: 'root',
+        mcpCallerAttested: true,
+      }),
+    );
+  });
+
+  it('keeps the existing Slack gateway callable across binding changes without restarting the shared host', async () => {
+    let bound = false;
+    const providers = createLiziMcpProviders({ slackHook: { getBridge: () => ({
+      availability: () => ({ connected: true, bound, serverSupportsTools: true }),
+      callTool: async () => ({ ok: true as const, result: { bound } }),
+    }) } });
+    const config = await getCodexExtraSpawnConfig({ mcpProviders: providers, logger: noopLogger() });
+    registerCodexMcpThreadContext('slack-thread', {
+      agentKind: 'codex', workingDir: '/workspace', sessionId: 'slack-session', sessionInstanceId: 'slack-instance',
+    });
+    const url = new URL(config.buildSessionMcpConfig!('slack-instance')['mcp_servers.cindy_slack.url'] as string);
+    const client = new Client({ name: 'slack-recovery', version: '1' });
+    await client.connect(new StreamableHTTPClientTransport(url, {
+      requestInit: { headers: { Authorization: `Bearer ${config.bridge!.token}` } },
+    }));
+    try {
+      for (const next of [false, true, false]) {
+        bound = next;
+        const result = await client.callTool({ name: 'slack_status', arguments: {}, _meta: { threadId: 'slack-thread' } });
+        expect(JSON.parse((result.content as Array<{ text: string }>)[0]!.text)).toMatchObject({ bound });
+        expect(await getCodexExtraSpawnConfig({ mcpProviders: providers, logger: noopLogger() })).toBe(config);
+      }
+    } finally {
+      await client.close();
+      unregisterCodexMcpThreadContext('slack-thread');
+    }
+  });
+
+  it('serializes remote HTTP custom headers as env_http_headers -c overrides (no bridge)', async () => {
+    const cfg = await getCodexExtraSpawnConfig({
+      mcpProviders: [remoteHttpProvider()],
+      logger: noopLogger(),
+    });
+
+    // 纯远程 MCP，不需要 in-process bridge。
+    expect(cfg.bridge).toBeNull();
+    // header 值走 env，env var 名进 -c，实际值进 extraEnv（不暴露在 process args）。
+    expect(cfg.extraArgs).toContain(
+      'mcp_servers.themis.env_http_headers.xd-themis-sk="CUSTOM_MCP_THEMIS_HDR_XD_2DTHEMIS_2DSK"',
+    );
+    expect(cfg.extraEnv).toMatchObject({
+      CUSTOM_MCP_THEMIS_HDR_XD_2DTHEMIS_2DSK: 'sk-123',
+    });
+    // 密钥明文绝不出现在 spawn 参数里。
+    expect(cfg.extraArgs.some((a) => a.includes('sk-123'))).toBe(false);
+  });
+
+  it('keeps Codex on direct mcp_servers config instead of the Pi gateway', async () => {
+    const cfg = await getCodexExtraSpawnConfig({
+      mcpProviders: [testProvider(), remoteHttpProvider()],
+      logger: noopLogger(),
+    });
+
+    expect(cfg.extraArgs.some((arg) => arg.startsWith('mcp_servers.cindy_test.'))).toBe(true);
+    expect(cfg.extraArgs.some((arg) => arg.startsWith('mcp_servers.themis.'))).toBe(true);
+    expect(cfg.extraArgs.join('\n')).not.toContain('cindy_mcp_list_tools');
+    expect(cfg.extraArgs.join('\n')).not.toContain('cindy_mcp_call_tool');
+  });
+
+  // server 名可能来自用户可控来源（自定义 MCP id、插件身份卡）。普通 `{}` 上
+  // `map['__proto__'] = cfg` 命中的是原型 setter：该 server 不出现在 Object.entries 里，
+  // 于是在 Codex 侧静默消失，同一份配置却在 Claude 侧正常工作。
+  it('keeps an unsafe object-key server name visible instead of hitting the prototype setter', async () => {
+    const cfg = await getCodexExtraSpawnConfig({
+      mcpProviders: [unsafeKeyRemoteProvider(), remoteHttpProvider()],
+      logger: noopLogger(),
+    });
+
+    expect(cfg.extraArgs).toContain('mcp_servers.__proto__.url="https://evil.example/mcp"');
+    // 同批次的正常 provider 不受影响，原型也没有被污染。
+    expect(cfg.extraArgs).toContain('mcp_servers.themis.url="https://themis.example/mcp"');
+    expect(Object.getPrototypeOf({} as Record<string, unknown>)).toBe(Object.prototype);
+  });
+
+  it('exposes the active bridge server-name snapshot and clears it on shutdown (R2 P2)', async () => {
+    // stale-bridge 钳制的数据源:活跃 bridge 的 server 集合 (启动时冻结),
+    // 远端 flag 钳制 / drift 判定用它区分「bridge 缺 cindy_memory 的窗口」
+    // 与「无 bridge (lazy 重建在即)」。
+    expect(getActiveCodexBridgeServerNames()).toBeNull(); // 未启动
+
+    await getCodexExtraSpawnConfig({ mcpProviders: [testProvider()], logger: noopLogger() });
+    expect(getActiveCodexBridgeServerNames()).toEqual(['cindy_test']);
+
+    await shutdownCodexEnvironment();
+    expect(getActiveCodexBridgeServerNames()).toBeNull(); // shutdown 后清空
+  });
+
+  it('invokes the shutdown hook after the bridge stops, on every shutdown path (R22 P1)', async () => {
+    // 远端失效钩子折进 shutdownCodexEnvironment 内部:任何调用点 (插件开关 /
+    // custom MCP CRUD / contacts / 账号切换) 都自动覆盖, 不靠逐点挂接。
+    const hook = vi.fn();
+    setCodexEnvironmentShutdownHook(hook);
+    await getCodexExtraSpawnConfig({ mcpProviders: [testProvider()], logger: noopLogger() });
+    expect(hook).not.toHaveBeenCalled(); // 未 shutdown 不调
+
+    await shutdownCodexEnvironment();
+    expect(hook).toHaveBeenCalledTimes(1);
+
+    // 未启动过时 (cached 为空) shutdown 是 no-op, 不调 hook。
+    await shutdownCodexEnvironment();
+    expect(hook).toHaveBeenCalledTimes(1);
+  });
+});

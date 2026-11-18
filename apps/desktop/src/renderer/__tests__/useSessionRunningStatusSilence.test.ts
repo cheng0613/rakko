@@ -1,0 +1,1081 @@
+// @vitest-environment jsdom
+import { act, renderHook } from '@testing-library/react';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+import type { SessionStatusInfo } from '@/lib/makerChatStore';
+import {
+  isSessionDoneSilenced,
+  markNextSessionTerminalNotificationOwnedByScheduler,
+  markNextSessionDoneSilenced,
+  resetSilencedSessionDoneStoreForTests,
+  scheduleClearSchedulerOwnedRun,
+  scheduleClearSilencedRun,
+} from '@/lib/silencedSessionDoneStore';
+import { markSessionStarting, resetSessionStartingStoreForTests } from '@/lib/sessionStartingStore';
+import { sessionAlertEventId, useSessionRunningStatus } from '@/hooks/useSessionRunningStatus';
+import { setDataOwnerGeneration } from '@/contexts/dataOwnerGeneration';
+import { noteSessionTurnStartedForAlerts, refreshPendingAlerts } from '@/hooks/usePendingAlertAttention';
+import {
+  addSessionAttention,
+  clearSessionAttention,
+  getSessionAttentionKind,
+  hasSessionAttention,
+} from '@/lib/sessionAttentionStore';
+
+const storeMock = vi.hoisted(() => ({
+  snapshot: new Map<string, SessionStatusInfo>(),
+  listeners: new Set<() => void>(),
+  terminalErrorSessions: new Set<string>(),
+  sideTaskStopSessions: new Set<string>(),
+  privateReplySessions: new Set<string>(),
+  imSessions: new Set<string>(),
+  groupLaneSessions: new Set<string>(),
+  recoverySessions: new Set<string>(),
+  heldByAgentIsland: new Set<string>(),
+  pausedQueueSessions: new Set<string>(),
+}));
+
+vi.mock('@/state/agentIslandActivity', () => ({
+  ensureAgentIslandActivitySubscribed: vi.fn(),
+  isSessionCompletionHeldByAgentIsland: (sessionId: string, hasPausedQueue: boolean) =>
+    !hasPausedQueue && storeMock.heldByAgentIsland.has(sessionId),
+}));
+
+vi.mock('@/lib/makerChatStore', () => ({
+  makerChatStore: {
+    subscribeAll: (listener: () => void) => {
+      storeMock.listeners.add(listener);
+      return () => {
+        storeMock.listeners.delete(listener);
+      };
+    },
+    getRunningSnapshot: () => storeMock.snapshot,
+    hasSessionTerminalError: (sessionId: string) => storeMock.terminalErrorSessions.has(sessionId),
+    hasSessionRecoveryPending: (sessionId: string) => storeMock.recoverySessions.has(sessionId),
+    wasLastStopQuietCompletion: (sessionId: string) =>
+      storeMock.privateReplySessions.has(sessionId) || storeMock.imSessions.has(sessionId),
+    wasLastStopGroupLane: (sessionId: string) => storeMock.groupLaneSessions.has(sessionId),
+    wasLastStopSideTask: (sessionId: string) => storeMock.sideTaskStopSessions.has(sessionId),
+    hasPausedQueue: (sessionId: string) => storeMock.pausedQueueSessions.has(sessionId),
+  },
+}));
+
+vi.mock('@/lib/sessionAttentionStore', () => ({
+  addSessionAttention: vi.fn(),
+  clearSessionAttention: vi.fn(),
+  getSessionAttentionKind: vi.fn(() => undefined),
+  hasSessionAttention: vi.fn(() => false),
+  useSessionAttentionSnapshot: () => new Set<string>(),
+}));
+
+vi.mock('@/hooks/usePendingAlertAttention', () => ({
+  noteSessionTurnStartedForAlerts: vi.fn(),
+  refreshPendingAlerts: vi.fn(async () => {}),
+}));
+
+function status(isRunning: boolean, hasError = false, sideTask?: boolean): SessionStatusInfo {
+  return {
+    isRunning,
+    hasError,
+    ...(sideTask !== undefined ? { sideTask } : {}),
+    hasPendingAskUser: false,
+    hasPendingPermission: false,
+    hasPendingPlanReview: false,
+    hasPendingPluginSetup: false,
+  };
+}
+
+async function emitSnapshot(snapshot: ReadonlyMap<string, SessionStatusInfo>): Promise<void> {
+  await act(async () => {
+    storeMock.snapshot = new Map(snapshot);
+    for (const listener of storeMock.listeners) listener();
+  });
+}
+
+describe('useSessionRunningStatus silenced completion handling', () => {
+  afterEach(() => {
+    storeMock.snapshot = new Map();
+    storeMock.listeners.clear();
+    storeMock.terminalErrorSessions.clear();
+    storeMock.sideTaskStopSessions.clear();
+    storeMock.privateReplySessions.clear();
+    storeMock.imSessions.clear();
+    storeMock.recoverySessions.clear();
+    storeMock.heldByAgentIsland.clear();
+    storeMock.pausedQueueSessions.clear();
+    resetSilencedSessionDoneStoreForTests();
+    resetSessionStartingStoreForTests();
+    setDataOwnerGeneration(null);
+    vi.clearAllMocks();
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it.each(['before-stop', 'during-debounce', 'missing-snapshot'])('keeps IM completion quiet (%s), but alerts for the next App turn and errors', async (timing) => {
+    vi.useFakeTimers();
+    const onSessionDone = vi.fn();
+    const onSessionError = vi.fn();
+    renderHook(() => useSessionRunningStatus(undefined, { onSessionDone, onSessionError }));
+    await emitSnapshot(new Map([['im', status(true)]]));
+    if (timing !== 'during-debounce') storeMock.imSessions.add('im');
+    await emitSnapshot(timing === 'missing-snapshot' ? new Map() : new Map([['im', status(false)]]));
+    storeMock.imSessions.add('im');
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+    expect(addSessionAttention).not.toHaveBeenCalled();
+    expect(onSessionDone).not.toHaveBeenCalled();
+
+    storeMock.imSessions.clear();
+    await emitSnapshot(new Map([['im', status(true)]]));
+    await emitSnapshot(new Map([['im', status(false)]]));
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+    expect(addSessionAttention).toHaveBeenCalledWith('im', 'done');
+    expect(onSessionDone).toHaveBeenCalledExactlyOnceWith('im');
+
+    await emitSnapshot(new Map([['im', status(true)]]));
+    storeMock.imSessions.add('im');
+    await emitSnapshot(new Map([['im', status(false, true)]]));
+    expect(addSessionAttention).toHaveBeenCalledWith('im', 'error');
+    expect(onSessionError).toHaveBeenCalledExactlyOnceWith('im');
+  });
+
+  it.each([false, true])('keeps recovery quiet until final success (missing stop snapshot: %s)', async (missing) => {
+    vi.useFakeTimers();
+    const onSessionDone = vi.fn();
+    const onSessionError = vi.fn();
+    renderHook(() => useSessionRunningStatus(undefined, { onSessionDone, onSessionError }));
+    for (let attempt = 0; attempt < 3; attempt++) {
+      storeMock.recoverySessions.delete('retry');
+      await emitSnapshot(new Map([['retry', status(true)]]));
+      storeMock.recoverySessions.add('retry');
+      await emitSnapshot(missing ? new Map() : new Map([['retry', status(false)]]));
+      await act(async () => { await vi.advanceTimersByTimeAsync(20_000); });
+      expect(onSessionDone).not.toHaveBeenCalled();
+      expect(onSessionError).not.toHaveBeenCalled();
+      expect(addSessionAttention).not.toHaveBeenCalled();
+    }
+    storeMock.recoverySessions.delete('retry');
+    await emitSnapshot(new Map([['retry', status(true)]]));
+    await emitSnapshot(new Map([['retry', status(false)]]));
+    await act(async () => { await vi.advanceTimersByTimeAsync(500); });
+    expect(onSessionDone).toHaveBeenCalledExactlyOnceWith('retry');
+    expect(addSessionAttention).toHaveBeenCalledWith('retry', 'done');
+  });
+
+  it('drops a scheduled completion when recovery arrives during debounce', async () => {
+    vi.useFakeTimers();
+    const onSessionDone = vi.fn();
+    renderHook(() => useSessionRunningStatus(undefined, { onSessionDone }));
+    await emitSnapshot(new Map([['retry', status(true)]]));
+    await emitSnapshot(new Map([['retry', status(false)]]));
+    storeMock.recoverySessions.add('retry');
+    await act(async () => { await vi.advanceTimersByTimeAsync(500); });
+    storeMock.recoverySessions.clear();
+    await emitSnapshot(new Map());
+    await act(async () => { await vi.advanceTimersByTimeAsync(20_000); });
+    expect(onSessionDone).not.toHaveBeenCalled();
+    expect(addSessionAttention).not.toHaveBeenCalled();
+  });
+
+  // #9317 review / unit: the id is what main dedups on. A needs-reply joins every
+  // pending request key, and a long list used to exceed 256 — main then rejected
+  // the whole notification. The id has to stay bounded, and two different long
+  // lists of the same turn must not collapse into one id.
+  it('keeps every alert id within 256 characters, even for a long request list', () => {
+    const keys = Array.from({ length: 40 }, (_, index) => `permission:${'k'.repeat(40)}-${index}`);
+    const first = sessionAlertEventId('needs-reply', 1_700_000_000_000, keys.join(','));
+    const second = sessionAlertEventId('needs-reply', 1_700_000_000_000, [...keys].reverse().join(','));
+    const failure = sessionAlertEventId('error', 1_700_000_000_000);
+
+    expect(first).toBeDefined();
+    expect(second).toBeDefined();
+    expect(first!.length).toBeLessThanOrEqual(256);
+    expect(second!.length).toBeLessThanOrEqual(256);
+    expect(failure).toBe('turn:1700000000000:error');
+    expect(first).not.toBe(second);
+    // A short list is kept verbatim, so a repeat of the same request still matches.
+    expect(sessionAlertEventId('needs-reply', 100, 'ask:1')).toBe('turn:100:ask:1');
+  });
+
+  it('reports recovery failure before another vendor turn starts', async () => {
+    vi.useFakeTimers();
+    const onSessionDone = vi.fn();
+    const onSessionError = vi.fn();
+    renderHook(() => useSessionRunningStatus(undefined, { onSessionDone, onSessionError }));
+    await emitSnapshot(new Map([['retry', status(true)]]));
+    storeMock.recoverySessions.add('retry');
+    // The store keeps recovery logically running even though the vendor stopped.
+    await emitSnapshot(new Map([['retry', status(true)]]));
+    await act(async () => { await vi.advanceTimersByTimeAsync(20_000); });
+    storeMock.recoverySessions.clear();
+    storeMock.terminalErrorSessions.add('retry');
+    await emitSnapshot(new Map([['retry', status(false, true)]]));
+    await act(async () => { await vi.advanceTimersByTimeAsync(500); });
+    expect(onSessionDone).not.toHaveBeenCalled();
+    expect(onSessionError).toHaveBeenCalledExactlyOnceWith('retry');
+  });
+
+  it('keeps private replies quiet even when the final attribution arrives during debounce', async () => {
+    vi.useFakeTimers();
+    const onSessionDone = vi.fn();
+    renderHook(() => useSessionRunningStatus(undefined, { onSessionDone }));
+    await emitSnapshot(new Map([['private', status(true)]]));
+    await emitSnapshot(new Map([['private', status(false)]]));
+    storeMock.privateReplySessions.add('private');
+    await act(async () => { await vi.advanceTimersByTimeAsync(500); });
+    expect(onSessionDone).not.toHaveBeenCalled();
+    expect(addSessionAttention).not.toHaveBeenCalled();
+    storeMock.privateReplySessions.clear();
+    await emitSnapshot(new Map([['private', status(true)]]));
+    await emitSnapshot(new Map([['private', status(false)]]));
+    await act(async () => { await vi.advanceTimersByTimeAsync(500); });
+    expect(onSessionDone).toHaveBeenCalledWith('private');
+  });
+
+  it('never raises attention or callbacks for a Bot group lane, even when it fails', async () => {
+    const onSessionDone = vi.fn();
+    const onSessionError = vi.fn();
+    renderHook(() => useSessionRunningStatus(undefined, { onSessionDone, onSessionError }));
+    storeMock.groupLaneSessions.add('lane');
+    await emitSnapshot(new Map([['lane', status(true)]]));
+    await emitSnapshot(new Map([['lane', status(false, true)]]));
+    expect(addSessionAttention).not.toHaveBeenCalled();
+    expect(onSessionError).not.toHaveBeenCalled();
+    storeMock.groupLaneSessions.clear();
+  });
+
+  it('does not mute a normal follow-up that starts during silenced completion linger', async () => {
+    vi.useFakeTimers();
+    const onSessionDone = vi.fn();
+    markNextSessionDoneSilenced('run-1', 'session-1');
+    scheduleClearSilencedRun('run-1', 2000);
+
+    renderHook(() => useSessionRunningStatus(undefined, { onSessionDone }));
+
+    await emitSnapshot(new Map([['session-1', status(true)]]));
+    await emitSnapshot(new Map([['session-1', status(false)]]));
+    // done 走 debounce,推进 500ms 让定时器 fire
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500);
+    });
+
+    expect(onSessionDone).toHaveBeenCalledWith('session-1');
+    vi.useRealTimers();
+  });
+
+  it('fires the error callback instead of the done callback when a running turn ends with error', async () => {
+    const onSessionDone = vi.fn();
+    const onSessionError = vi.fn();
+
+    renderHook(() => useSessionRunningStatus(undefined, { onSessionDone, onSessionError }));
+
+    await emitSnapshot(new Map([['session-err', status(true)]]));
+    // error 是终态,立刻触发(不走 debounce)
+    await emitSnapshot(new Map([['session-err', status(false, true)]]));
+
+    expect(onSessionDone).not.toHaveBeenCalled();
+    expect(onSessionError).toHaveBeenCalledWith('session-err');
+  });
+
+  it('suppresses scheduler-owned success attention and completion callback', async () => {
+    vi.useFakeTimers();
+    const onSessionDone = vi.fn();
+    markNextSessionTerminalNotificationOwnedByScheduler('run-owned', 'session-owned');
+
+    renderHook(() => useSessionRunningStatus(undefined, { onSessionDone }));
+
+    await emitSnapshot(new Map([['session-owned', status(true)]]));
+    await emitSnapshot(new Map([['session-owned', status(false)]]));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500);
+    });
+
+    expect(vi.mocked(addSessionAttention)).not.toHaveBeenCalledWith('session-owned', 'done');
+    expect(onSessionDone).not.toHaveBeenCalled();
+  });
+
+  it('rereads silence when it arrives during the done debounce window', async () => {
+    vi.useFakeTimers();
+    const onSessionDone = vi.fn();
+    renderHook(() => useSessionRunningStatus(undefined, { onSessionDone }));
+
+    await emitSnapshot(new Map([['session-late', status(true)]]));
+    await emitSnapshot(new Map([['session-late', status(false)]]));
+    markNextSessionDoneSilenced('run-late', 'session-late');
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500);
+    });
+
+    expect(vi.mocked(addSessionAttention)).not.toHaveBeenCalledWith('session-late', 'done');
+    expect(onSessionDone).not.toHaveBeenCalled();
+  });
+
+  it('does not suppress a later ordinary turn once the scheduler run has completed', async () => {
+    // run 终态之后同 session 的 turn 属于用户手动对话,照常通知。
+    //
+    // `completed` 是这条断言的**必要前提**,不是可省略的布景:run 仍在飞行时,
+    // 「用户插话的 turn」和「后台 subagent 续 turn」在 renderer 侧是同一个信号
+    // (running=true → done),无从区分。标记因此在 run 飞行期间对每次 done 都有效
+    // (见文件末尾的 multi-turn 回归),run 终态后才交回普通通知路径 —— 判据就是
+    // scheduler 的 completed/failed 事件排下的 linger 定时器。
+    vi.useFakeTimers();
+    const onSessionDone = vi.fn();
+    markNextSessionTerminalNotificationOwnedByScheduler('run-owned', 'session-reused');
+
+    renderHook(() => useSessionRunningStatus(undefined, { onSessionDone }));
+
+    await emitSnapshot(new Map([['session-reused', status(true)]]));
+    await emitSnapshot(new Map([['session-reused', status(false)]]));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500);
+    });
+    expect(onSessionDone).not.toHaveBeenCalled();
+
+    // scheduler 发出 completed → 排 linger,标记进入「run 已终态」。
+    scheduleClearSchedulerOwnedRun('run-owned', 2000);
+
+    await emitSnapshot(new Map([['session-reused', status(true)]]));
+    await emitSnapshot(new Map([['session-reused', status(false)]]));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500);
+    });
+
+    expect(onSessionDone).toHaveBeenCalledOnce();
+    expect(onSessionDone).toHaveBeenCalledWith('session-reused');
+  });
+
+  it('keeps error attention but suppresses a scheduler-owned error callback', async () => {
+    const onSessionError = vi.fn();
+    markNextSessionTerminalNotificationOwnedByScheduler('run-owned-error', 'session-owned-error');
+
+    renderHook(() => useSessionRunningStatus(undefined, { onSessionError }));
+
+    await emitSnapshot(new Map([['session-owned-error', status(true)]]));
+    await emitSnapshot(new Map([['session-owned-error', status(false, true)]]));
+
+    expect(vi.mocked(addSessionAttention)).toHaveBeenCalledWith('session-owned-error', 'error');
+    expect(onSessionError).not.toHaveBeenCalled();
+  });
+
+  it('fires the error callback even when a silenced completion is pending for the session', async () => {
+    const onSessionDone = vi.fn();
+    const onSessionError = vi.fn();
+    markNextSessionDoneSilenced('run-err', 'session-silenced-err');
+    scheduleClearSilencedRun('run-err', 2000);
+
+    renderHook(() => useSessionRunningStatus(undefined, { onSessionDone, onSessionError }));
+
+    await emitSnapshot(new Map([['session-silenced-err', status(true)]]));
+    await emitSnapshot(new Map([['session-silenced-err', status(false, true)]]));
+
+    expect(onSessionDone).not.toHaveBeenCalled();
+    expect(onSessionError).toHaveBeenCalledWith('session-silenced-err');
+  });
+
+  // 回归:过渡条目只存活一代 snapshot,可能被另一个 useSyncExternalStore 订阅者
+  // 抢先消费 —— 本 hook 观察到的 snapshot 里条目已消失(info=undefined)。此时
+  // hasError 不能兜底成 false(原 bug:失败被通知成"已完成"),必须回查 store 的
+  // 权威 error 状态。error 立刻触发,不走 debounce。
+  it('resolves errors via the authoritative store when the transition entry was consumed by another subscriber', async () => {
+    const onSessionDone = vi.fn();
+    const onSessionError = vi.fn();
+    storeMock.terminalErrorSessions.add('session-raced');
+
+    renderHook(() => useSessionRunningStatus(undefined, { onSessionDone, onSessionError }));
+
+    await emitSnapshot(new Map([['session-raced', status(true)]]));
+    // 过渡代已被其它订阅者消费:条目直接消失,而不是出现 isRunning:false 的一代。
+    await emitSnapshot(new Map());
+
+    expect(onSessionDone).not.toHaveBeenCalled();
+    expect(onSessionError).toHaveBeenCalledWith('session-raced');
+  });
+
+  it('suppresses both callbacks for side-task stop transitions (mivo skipTurnReset)', async () => {
+    const onSessionDone = vi.fn();
+    const onSessionError = vi.fn();
+    renderHook(() => useSessionRunningStatus(undefined, { onSessionDone, onSessionError }));
+
+    await emitSnapshot(new Map([['s-side', status(true)]]));
+    // side-task 结束: transition 标记 sideTask → done/error 都不触发,也不进 debounce。
+    await emitSnapshot(new Map([['s-side', status(false, true, true)]]));
+
+    expect(onSessionDone).not.toHaveBeenCalled();
+    expect(onSessionError).not.toHaveBeenCalled();
+  });
+
+  it('suppresses callbacks via the store fallback when a side-task transition entry was consumed', async () => {
+    const onSessionDone = vi.fn();
+    const onSessionError = vi.fn();
+    storeMock.terminalErrorSessions.add('s-side2');
+    storeMock.sideTaskStopSessions.add('s-side2');
+    renderHook(() => useSessionRunningStatus(undefined, { onSessionDone, onSessionError }));
+
+    await emitSnapshot(new Map([['s-side2', status(true)]]));
+    // entry 被其它订阅者消费(本代际拿不到) → 兜底查询 store 判 side-task。
+    await emitSnapshot(new Map());
+
+    expect(onSessionDone).not.toHaveBeenCalled();
+    expect(onSessionError).not.toHaveBeenCalled();
+  });
+
+  it('still fires the done callback when the transition entry vanished and the store has no error', async () => {
+    vi.useFakeTimers();
+    const onSessionDone = vi.fn();
+    const onSessionError = vi.fn();
+
+    renderHook(() => useSessionRunningStatus(undefined, { onSessionDone, onSessionError }));
+
+    await emitSnapshot(new Map([['session-vanish', status(true)]]));
+    await emitSnapshot(new Map());
+    // done 走 debounce,推进 500ms 让定时器 fire
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500);
+    });
+
+    expect(onSessionError).not.toHaveBeenCalled();
+    expect(onSessionDone).toHaveBeenCalledWith('session-vanish');
+    vi.useRealTimers();
+  });
+
+  it('suppresses onSessionDone when a new turn starts within the debounce window', async () => {
+    // 场景:用户排了多条队列;turn A 结束后 main 在 debounce 窗口内自动 spawn
+    // turn B。此时不应触发系统通知 —— 用户视角这是一条完整任务的中间态。
+    vi.useFakeTimers();
+    const onSessionDone = vi.fn();
+    renderHook(() => useSessionRunningStatus(undefined, { onSessionDone }));
+
+    await emitSnapshot(new Map([['session-1', status(true)]]));
+    await emitSnapshot(new Map([['session-1', status(false)]]));
+    // 100ms 后 turn B 开始 —— 应取消刚刚 schedule 的通知
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(100);
+    });
+    await emitSnapshot(new Map([['session-1', status(true)]]));
+    // 继续推进到超过 debounce 窗口
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(600);
+    });
+
+    expect(onSessionDone).not.toHaveBeenCalled();
+    vi.useRealTimers();
+  });
+
+  it('fires onSessionDone once the debounce window elapses without a follow-up turn', async () => {
+    // 队列排空、真正 idle 的最后一次 turn 结束,debounce 窗口过完仍是 not-running
+    // → 正常发系统通知。
+    vi.useFakeTimers();
+    const onSessionDone = vi.fn();
+    renderHook(() => useSessionRunningStatus(undefined, { onSessionDone }));
+
+    await emitSnapshot(new Map([['session-1', status(true)]]));
+    await emitSnapshot(new Map([['session-1', status(false)]]));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500);
+    });
+
+    expect(onSessionDone).toHaveBeenCalledWith('session-1');
+    vi.useRealTimers();
+  });
+
+  it('does not restore done attention when the session becomes active during debounce', async () => {
+    vi.useFakeTimers();
+    const onSessionDone = vi.fn();
+    const initialProps: { activeSessionId: string | undefined } = {
+      activeSessionId: undefined,
+    };
+    const { rerender } = renderHook(
+      ({ activeSessionId }: { activeSessionId: string | undefined }) =>
+        useSessionRunningStatus(activeSessionId, { onSessionDone }),
+      { initialProps },
+    );
+
+    await emitSnapshot(new Map([['session-active', status(true)]]));
+    await emitSnapshot(new Map([['session-active', status(false)]]));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(200);
+    });
+    rerender({ activeSessionId: 'session-active' });
+    rerender({ activeSessionId: undefined });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(300);
+    });
+
+    expect(vi.mocked(addSessionAttention)).not.toHaveBeenCalledWith('session-active', 'done');
+    expect(onSessionDone).not.toHaveBeenCalled();
+  });
+
+  it('does not restore done attention after leaving a session that was active when it completed', async () => {
+    vi.useFakeTimers();
+    const onSessionDone = vi.fn();
+    const initialProps: { activeSessionId: string | undefined } = {
+      activeSessionId: 'session-active-at-completion',
+    };
+    const { rerender } = renderHook(
+      ({ activeSessionId }: { activeSessionId: string | undefined }) =>
+        useSessionRunningStatus(activeSessionId, { onSessionDone }),
+      { initialProps },
+    );
+
+    await emitSnapshot(new Map([['session-active-at-completion', status(true)]]));
+    await emitSnapshot(new Map([['session-active-at-completion', status(false)]]));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(200);
+    });
+    rerender({ activeSessionId: undefined });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(300);
+    });
+
+    expect(vi.mocked(addSessionAttention)).not.toHaveBeenCalledWith(
+      'session-active-at-completion',
+      'done',
+    );
+    expect(onSessionDone).toHaveBeenCalledOnce();
+    expect(onSessionDone).toHaveBeenCalledWith('session-active-at-completion');
+  });
+
+  it('suppresses done attention and notification if a new run is visible when debounce expires', async () => {
+    vi.useFakeTimers();
+    const onSessionDone = vi.fn();
+    renderHook(() => useSessionRunningStatus(undefined, { onSessionDone }));
+
+    await emitSnapshot(new Map([['session-running', status(true)]]));
+    await emitSnapshot(new Map([['session-running', status(false)]]));
+    // 模拟 running snapshot 已更新、订阅 effect 尚未消费的同帧竞态。
+    storeMock.snapshot = new Map([['session-running', status(true)]]);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500);
+    });
+
+    expect(vi.mocked(addSessionAttention)).not.toHaveBeenCalledWith('session-running', 'done');
+    expect(onSessionDone).not.toHaveBeenCalled();
+  });
+
+  it('does not overwrite a terminal error that appears during the done debounce', async () => {
+    vi.useFakeTimers();
+    const onSessionDone = vi.fn();
+    renderHook(() => useSessionRunningStatus(undefined, { onSessionDone }));
+
+    await emitSnapshot(new Map([['session-error', status(true)]]));
+    await emitSnapshot(new Map([['session-error', status(false)]]));
+    storeMock.terminalErrorSessions.add('session-error');
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500);
+    });
+
+    expect(vi.mocked(addSessionAttention)).not.toHaveBeenCalledWith('session-error', 'done');
+    expect(onSessionDone).not.toHaveBeenCalled();
+  });
+
+  it('does not replace a native Make failure with delayed Agent success attention', async () => {
+    vi.useFakeTimers();
+    renderHook(() => useSessionRunningStatus(undefined));
+    await emitSnapshot(new Map([['make', status(true)]]));
+    await emitSnapshot(new Map([['make', status(false)]]));
+    // The native build failed after the Agent finished: there is no Agent error row.
+    vi.mocked(getSessionAttentionKind).mockReturnValue('error');
+    try {
+      await act(async () => { await vi.advanceTimersByTimeAsync(500); });
+      expect(addSessionAttention).not.toHaveBeenCalledWith('make', 'done');
+    } finally {
+      vi.mocked(getSessionAttentionKind).mockReturnValue(undefined);
+    }
+  });
+
+  it('preserves the prior done attention if the next turn stays in starting', async () => {
+    vi.useFakeTimers();
+    const onSessionDone = vi.fn();
+    renderHook(() => useSessionRunningStatus(undefined, { onSessionDone }));
+
+    await emitSnapshot(new Map([['session-starting', status(true)]]));
+    await emitSnapshot(new Map([['session-starting', status(false)]]));
+    markSessionStarting('session-starting');
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500);
+    });
+
+    expect(vi.mocked(addSessionAttention)).toHaveBeenCalledWith('session-starting', 'done');
+    expect(onSessionDone).toHaveBeenCalledWith('session-starting');
+  });
+
+  it('coalesces multiple queue-drain transitions into a single final notification', async () => {
+    // 排队 3 条消息:A → done → B → done → C → done。前两次 done 都在 debounce
+    // 窗口内被下一次 turn 起始取消,只有 C 结束(队列空)最终 fire 一次通知。
+    // 修复"一次弹很多"回归。
+    vi.useFakeTimers();
+    const onSessionDone = vi.fn();
+    renderHook(() => useSessionRunningStatus(undefined, { onSessionDone }));
+
+    // A running
+    await emitSnapshot(new Map([['session-1', status(true)]]));
+    // A done
+    await emitSnapshot(new Map([['session-1', status(false)]]));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(50);
+    });
+    // B running
+    await emitSnapshot(new Map([['session-1', status(true)]]));
+    // B done
+    await emitSnapshot(new Map([['session-1', status(false)]]));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(50);
+    });
+    // C running
+    await emitSnapshot(new Map([['session-1', status(true)]]));
+    // C done —— 队列空
+    await emitSnapshot(new Map([['session-1', status(false)]]));
+    // 推进过 debounce 窗口
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(600);
+    });
+
+    expect(onSessionDone).toHaveBeenCalledTimes(1);
+    expect(onSessionDone).toHaveBeenCalledWith('session-1');
+    vi.useRealTimers();
+  });
+
+  it('does not downgrade an awaiting badge to done after the debounce window', async () => {
+    // 回归:turn 结束的同一帧带 pending ask-user → section 3 先亮 awaiting(黄)。
+    // debounce 把 done 推迟到 section 3 之后,定时器 fire 时若仍 pending,不能用
+    // done(橙)覆盖 awaiting,否则用户看不到需要处理的交互。done 系统通知仍照常发。
+    vi.useFakeTimers();
+    const onSessionDone = vi.fn();
+    renderHook(() => useSessionRunningStatus(undefined, { onSessionDone }));
+
+    await emitSnapshot(new Map([['s-ask', status(true)]]));
+    await emitSnapshot(new Map([['s-ask', { ...status(false), hasPendingAskUser: true }]]));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500);
+    });
+
+    expect(vi.mocked(addSessionAttention)).toHaveBeenCalledWith('s-ask', 'awaiting');
+    expect(vi.mocked(addSessionAttention)).not.toHaveBeenCalledWith('s-ask', 'done');
+    expect(onSessionDone).toHaveBeenCalledWith('s-ask');
+    vi.useRealTimers();
+  });
+
+  it('treats plugin setup as a needs-reply interaction', async () => {
+    const onSessionNeedsReply = vi.fn();
+    renderHook(() => useSessionRunningStatus('another-session', { onSessionNeedsReply }));
+
+    await emitSnapshot(new Map([['s-setup', { ...status(false), hasPendingPluginSetup: true }]]));
+
+    expect(vi.mocked(addSessionAttention)).toHaveBeenCalledWith('s-setup', 'awaiting');
+    expect(onSessionNeedsReply).toHaveBeenCalledWith('s-setup');
+  });
+
+  it('does not repeat an already cleared pending reminder after the sidebar remounts', async () => {
+    setDataOwnerGeneration('remount-owner');
+    const onSessionNeedsReply = vi.fn();
+    const first = renderHook(() => useSessionRunningStatus(undefined, { onSessionNeedsReply }));
+    await emitSnapshot(new Map([['s-remount', {
+      ...status(false), hasPendingAskUser: true, pendingRequestKeys: ['ask:request-1'],
+    }]]));
+    expect(onSessionNeedsReply).toHaveBeenCalledTimes(1);
+    first.result.current.clearNotification('s-remount');
+    first.unmount();
+    vi.mocked(addSessionAttention).mockClear();
+
+    setDataOwnerGeneration('remount-owner', 2);
+    renderHook(() => useSessionRunningStatus(undefined, { onSessionNeedsReply }));
+    expect(onSessionNeedsReply).toHaveBeenCalledTimes(1);
+    expect(addSessionAttention).not.toHaveBeenCalledWith('s-remount', 'awaiting');
+  });
+
+  it('alerts on the next handoff step after remount without repeating the current step', async () => {
+    // #3259: a new owner-input step needs a fresh reminder even while pending stays true.
+    setDataOwnerGeneration('handoff-owner');
+    const onSessionNeedsReply = vi.fn();
+    const first = renderHook(() => useSessionRunningStatus(undefined, { onSessionNeedsReply }));
+    const handoffStatus = (step: number, actionable = true): SessionStatusInfo => ({
+      ...status(false), hasPendingInputHandoff: true, hasActionableInputHandoff: actionable,
+      pendingRequestKeys: [`handoff:same-request:${step}`],
+    });
+
+    await emitSnapshot(new Map([['s-handoff', handoffStatus(1)]]));
+    expect(onSessionNeedsReply).toHaveBeenCalledExactlyOnceWith('s-handoff', { inputHandoff: true, inputHandoffRequestId: 'same-request' });
+    first.result.current.clearNotification('s-handoff');
+    first.unmount();
+    vi.mocked(addSessionAttention).mockClear();
+
+    renderHook(() => useSessionRunningStatus(undefined, { onSessionNeedsReply }));
+    expect(onSessionNeedsReply).toHaveBeenCalledTimes(1);
+    expect(addSessionAttention).not.toHaveBeenCalledWith('s-handoff', 'awaiting');
+
+    await emitSnapshot(new Map([['s-handoff', handoffStatus(1, false)]]));
+    await emitSnapshot(new Map([['s-handoff', handoffStatus(1)]]));
+    expect(onSessionNeedsReply).toHaveBeenCalledTimes(1);
+
+    // The Host advances stepNumber before publishing a non-actionable finishing card.
+    await emitSnapshot(new Map([['s-handoff', handoffStatus(2, false)]]));
+    expect(onSessionNeedsReply).toHaveBeenCalledTimes(1);
+    expect(addSessionAttention).not.toHaveBeenCalledWith('s-handoff', 'awaiting');
+
+    await emitSnapshot(new Map([['s-handoff', handoffStatus(2)]]));
+    expect(onSessionNeedsReply).toHaveBeenCalledTimes(2);
+    expect(onSessionNeedsReply).toHaveBeenLastCalledWith('s-handoff', { inputHandoff: true, inputHandoffRequestId: 'same-request' });
+    expect(addSessionAttention).toHaveBeenCalledWith('s-handoff', 'awaiting');
+    await emitSnapshot(new Map([['s-handoff', handoffStatus(2)]]));
+    expect(onSessionNeedsReply).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps generic mobile delivery for a new permission alongside a handoff step', async () => {
+    setDataOwnerGeneration('mixed-handoff-owner');
+    const onSessionNeedsReply = vi.fn();
+    renderHook(() => useSessionRunningStatus(undefined, { onSessionNeedsReply }));
+
+    await emitSnapshot(new Map([['s-mixed', {
+      ...status(false), hasPendingInputHandoff: true, hasActionableInputHandoff: true,
+      pendingRequestKeys: ['handoff:same-request:1'],
+    }]]));
+    expect(onSessionNeedsReply).toHaveBeenLastCalledWith('s-mixed', { inputHandoff: true, inputHandoffRequestId: 'same-request' });
+
+    await emitSnapshot(new Map([['s-mixed', {
+      ...status(false), hasPendingInputHandoff: true, hasActionableInputHandoff: true,
+      hasPendingPermission: true,
+      pendingRequestKeys: ['handoff:same-request:1', 'permission:new-request'],
+    }]]));
+    expect(onSessionNeedsReply).toHaveBeenLastCalledWith('s-mixed');
+    expect(onSessionNeedsReply).toHaveBeenCalledTimes(2);
+  });
+
+  it('alerts for a different request while the sidebar is hidden, then again for a new owner', async () => {
+    setDataOwnerGeneration('first-owner');
+    const onSessionNeedsReply = vi.fn();
+    const first = renderHook(() => useSessionRunningStatus(undefined, { onSessionNeedsReply }));
+    await emitSnapshot(new Map([['s-pending', {
+      ...status(false), hasPendingPermission: true, pendingRequestKeys: ['permission:request-1'],
+    }]]));
+    first.unmount();
+    await emitSnapshot(new Map([['s-pending', {
+      ...status(false), hasPendingPermission: true, pendingRequestKeys: ['permission:request-2'],
+    }]]));
+    renderHook(() => useSessionRunningStatus(undefined, { onSessionNeedsReply }));
+    expect(onSessionNeedsReply).toHaveBeenCalledTimes(2);
+    await emitSnapshot(new Map([['s-pending', {
+      ...status(false), hasPendingPermission: true, pendingRequestKeys: ['permission:request-2'],
+    }]]));
+    expect(onSessionNeedsReply).toHaveBeenCalledTimes(2);
+    await emitSnapshot(new Map([['s-pending', {
+      ...status(false), hasPendingPermission: true, pendingRequestKeys: ['permission:request-3'],
+    }]]));
+    expect(onSessionNeedsReply).toHaveBeenCalledTimes(3);
+    await emitSnapshot(new Map([
+      ['s-pending', {
+        ...status(false), hasPendingPermission: true, pendingRequestKeys: ['permission:request-3'],
+      }],
+      ['new-task', {
+        ...status(false), hasPendingAskUser: true, pendingRequestKeys: ['ask:new-task-request'],
+      }],
+    ]));
+    expect(onSessionNeedsReply).toHaveBeenCalledTimes(4);
+
+    setDataOwnerGeneration('second-owner');
+    renderHook(() => useSessionRunningStatus(undefined, { onSessionNeedsReply }));
+    expect(onSessionNeedsReply).toHaveBeenCalledTimes(6);
+  });
+
+  it('clears awaiting attention when resolving a card immediately starts a continuation', async () => {
+    vi.mocked(getSessionAttentionKind).mockReturnValue('awaiting');
+    vi.mocked(hasSessionAttention).mockReturnValue(true);
+    renderHook(() => useSessionRunningStatus(undefined));
+
+    await emitSnapshot(new Map([['s-confirm', {
+      ...status(false),
+      hasPendingAskUser: true,
+    }]]));
+    vi.mocked(clearSessionAttention).mockClear();
+
+    // Resolving ask/plan can start its continuation in the same projection
+    // that removes the card. The awaiting badge must not survive that run.
+    await emitSnapshot(new Map([['s-confirm', status(true)]]));
+
+    expect(clearSessionAttention).toHaveBeenCalledExactlyOnceWith('s-confirm');
+
+    vi.mocked(getSessionAttentionKind).mockReturnValue('done');
+    await emitSnapshot(new Map([['s-confirm', {
+      ...status(true),
+      hasPendingPermission: true,
+    }]]));
+    vi.mocked(clearSessionAttention).mockClear();
+    await emitSnapshot(new Map([['s-confirm', status(true)]]));
+
+    expect(clearSessionAttention).not.toHaveBeenCalled();
+  });
+
+  it('clears an orphaned error badge when a new turn starts and the terminal error is gone', async () => {
+    // 回归(#592 review):失焦时报错挂了 error 角标、用户从未处置 → scheduler 起新
+    // turn 把 store 的终止错误顶掉。running 上升沿必须把 orphan 角标 explicit 清掉,
+    // 否则活跃会话的 done 分支不覆写,红点永久残留。
+    renderHook(() => useSessionRunningStatus(undefined));
+
+    vi.mocked(getSessionAttentionKind).mockReturnValue('error');
+    storeMock.terminalErrorSessions.delete('s-orphan');
+    await emitSnapshot(new Map([['s-orphan', status(true)]]));
+
+    expect(vi.mocked(clearSessionAttention)).toHaveBeenCalledWith('s-orphan', {
+      intent: 'explicit',
+    });
+    expect(vi.mocked(noteSessionTurnStartedForAlerts)).toHaveBeenCalledWith('s-orphan');
+    vi.mocked(getSessionAttentionKind).mockReturnValue(undefined);
+  });
+
+  // #9317 review / unit: the sidebar hook is the production owner of the alert
+  // id. The same turn failing twice is one toast; the next turn failing is
+  // another, and only a different id lets main tell them apart.
+  it('names each failed turn once and the next failed turn differently', async () => {
+    const onSessionError = vi.fn();
+    renderHook(() => useSessionRunningStatus(undefined, { onSessionError }));
+
+    await emitSnapshot(new Map([['s-turn', { ...status(true), turnStartedAt: 1_000 }]]));
+    await emitSnapshot(new Map([['s-turn', { ...status(false, true), turnStartedAt: 1_000 }]]));
+    await emitSnapshot(new Map([['s-turn', { ...status(false, true), turnStartedAt: 1_000 }]]));
+    expect(onSessionError).toHaveBeenCalledTimes(1);
+    expect(onSessionError).toHaveBeenLastCalledWith('s-turn', 'turn:1000:error');
+
+    await emitSnapshot(new Map([['s-turn', { ...status(true), turnStartedAt: 2_000 }]]));
+    await emitSnapshot(new Map([['s-turn', { ...status(false, true), turnStartedAt: 2_000 }]]));
+    expect(onSessionError).toHaveBeenCalledTimes(2);
+    expect(onSessionError).toHaveBeenLastCalledWith('s-turn', 'turn:2000:error');
+  });
+
+  // 测试价值:生产入口 useSessionRunningStatus 的 onSessionError。第二个参数就是
+  // 发送方写进 IPC 载荷的 alertEventId；空着表示这次不带标识，主进程不会按上一次去重。
+  // Bug #9575:配额错误弹过之后，恢复尝试没有新的 running 帧，lastStartedAt 不推进，
+  // 失败仍用 turn:1000:error，第二次回调到了但桌面通知被吞。
+  // 现有「下一轮失败用新时间」盖不住「同一时间、中间只靠恢复标记再跑起来」。
+  // 最小失败输入:先错误停在 turnStartedAt 1000，再以 hasSessionRecoveryPending 跑起来，
+  // 仍用 1000 以错误停下。tier: unit。
+  it('配额错误弹过之后，恢复尝试失败不再沿用原来的轮次标识', async () => {
+    const onSessionError = vi.fn();
+    renderHook(() => useSessionRunningStatus(undefined, { onSessionError }));
+
+    await emitSnapshot(new Map([['quota', { ...status(true), turnStartedAt: 1_000 }]]));
+    storeMock.terminalErrorSessions.add('quota');
+    await emitSnapshot(new Map([['quota', { ...status(false, true), turnStartedAt: 1_000 }]]));
+    expect(onSessionError).toHaveBeenNthCalledWith(1, 'quota', 'turn:1000:error');
+
+    storeMock.terminalErrorSessions.delete('quota');
+    storeMock.recoverySessions.add('quota');
+    await emitSnapshot(new Map([['quota', { ...status(true), turnStartedAt: 1_000 }]]));
+    storeMock.recoverySessions.delete('quota');
+    storeMock.terminalErrorSessions.add('quota');
+    await emitSnapshot(new Map([['quota', { ...status(false, true), turnStartedAt: 1_000 }]]));
+
+    expect(onSessionError).toHaveBeenCalledTimes(2);
+    expect(onSessionError.mock.calls[1]).toEqual(['quota']);
+  });
+
+  it('keeps a still-real error badge when a new turn starts while the terminal error persists', async () => {
+    renderHook(() => useSessionRunningStatus(undefined));
+
+    vi.mocked(getSessionAttentionKind).mockReturnValue('error');
+    storeMock.terminalErrorSessions.add('s-real');
+    await emitSnapshot(new Map([['s-real', status(true)]]));
+
+    expect(vi.mocked(clearSessionAttention)).not.toHaveBeenCalledWith('s-real', {
+      intent: 'explicit',
+    });
+    expect(vi.mocked(noteSessionTurnStartedForAlerts)).toHaveBeenCalledWith('s-real');
+    vi.mocked(getSessionAttentionKind).mockReturnValue(undefined);
+    storeMock.terminalErrorSessions.delete('s-real');
+  });
+
+  // 回归:静默 run 仍在飞行(还没 completed)时,session 的 running→done 会翻转多次
+  // —— 主 turn done 只是中间态,runner 还在等在途后台 subagent;subagent 完成后 SDK
+  // 自动续 turn,silent-stop 守卫也会在 1.5s 后自动续跑。标记以前被第一次中间 done
+  // 消费掉,最终那次真 done 就走了普通完成路径,把 macOS toast / 飞书 / 手机推送全发
+  // 一遍。上面那些静默用例都先调了 scheduleClearSilencedRun(即 completed 已到),
+  // 正好绕开了这个缝隙,所以长期没被抓到。
+  it('never fires the done callback across a multi-turn silenced run', async () => {
+    vi.useFakeTimers();
+    const onSessionDone = vi.fn();
+    // 只有 silenced,没有 scheduleClearSilencedRun —— run 仍在飞行。
+    markNextSessionDoneSilenced('run-multi', 'session-multi');
+
+    renderHook(() => useSessionRunningStatus(undefined, { onSessionDone }));
+
+    // 主 turn 跑完(中间态)。
+    await emitSnapshot(new Map([['session-multi', status(true)]]));
+    await emitSnapshot(new Map([['session-multi', status(false)]]));
+    // 推过 debounce:标记若被第一次 done 消费掉,这里还不会响 —— 真正漏出的是下一次。
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(600);
+    });
+    expect(onSessionDone).not.toHaveBeenCalled();
+
+    // 后台 subagent 完成 → 自动续 turn，产出最终 summary 后再次 done。
+    await emitSnapshot(new Map([['session-multi', status(true)]]));
+    await emitSnapshot(new Map([['session-multi', status(false)]]));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(600);
+    });
+
+    expect(onSessionDone).not.toHaveBeenCalled();
+    vi.useRealTimers();
+  });
+
+  it('keeps scheduler notification ownership across a multi-turn run', async () => {
+    // 同根因的第二个症状:标记被中间 done 消费后,最终 done 时 renderer 又发一条,
+    // 与 scheduler notifier 自己那条叠成两次通知。
+    vi.useFakeTimers();
+    const onSessionDone = vi.fn();
+    markNextSessionTerminalNotificationOwnedByScheduler('run-owned-multi', 'session-owned-multi');
+
+    renderHook(() => useSessionRunningStatus(undefined, { onSessionDone }));
+
+    await emitSnapshot(new Map([['session-owned-multi', status(true)]]));
+    await emitSnapshot(new Map([['session-owned-multi', status(false)]]));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(600);
+    });
+    await emitSnapshot(new Map([['session-owned-multi', status(true)]]));
+    await emitSnapshot(new Map([['session-owned-multi', status(false)]]));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(600);
+    });
+
+    expect(vi.mocked(addSessionAttention)).not.toHaveBeenCalledWith('session-owned-multi', 'done');
+    expect(onSessionDone).not.toHaveBeenCalled();
+    vi.useRealTimers();
+  });
+
+  // 回归(codex review P1):agent 在自己 turn 内调 schedule_silence_current_run 时,
+  // 标记建立时该 turn 已经 running、renderer 早过了 rising edge —— 任何依赖「事件序」
+  // 建立/撤销兜底的方案都会在这条路径上失守。标记的存续不能与时间挂钩。
+  it('keeps suppressing when the marker is created mid-turn and that turn runs long', async () => {
+    vi.useFakeTimers();
+    const onSessionDone = vi.fn();
+    renderHook(() => useSessionRunningStatus(undefined, { onSessionDone }));
+
+    // turn 先跑起来，之后 agent 才在 turn 内部请求静默。
+    await emitSnapshot(new Map([['session-mid', status(true)]]));
+    markNextSessionDoneSilenced('run-mid', 'session-mid');
+    // agent 请求静默后继续跑一个很长的工具调用：running 状态毫无变化，也没有任何
+    // scheduler 事件。跑多久都不该影响标记 —— run 的存活只由 scheduler 的权威状态
+    // 决定，不由挂钟决定。
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30 * 60_000);
+    });
+    expect(isSessionDoneSilenced('session-mid')).toBe(true);
+
+    // turn 真正结束。
+    await emitSnapshot(new Map([['session-mid', status(false)]]));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(600);
+    });
+
+    expect(onSessionDone).not.toHaveBeenCalled();
+    vi.useRealTimers();
+  });
+
+  it('holds an Orca Lead completion while Main keeps its team running', async () => {
+    vi.useFakeTimers();
+    const onSessionDone = vi.fn();
+    renderHook(() => useSessionRunningStatus(undefined, { onSessionDone }));
+
+    // The Lead only dispatched work; Agent Island defers its completion.
+    storeMock.heldByAgentIsland.add('lead');
+    await emitSnapshot(new Map([['lead', status(true)]]));
+    await emitSnapshot(new Map([['lead', status(false)]]));
+    await act(async () => { await vi.advanceTimersByTimeAsync(600); });
+    expect(onSessionDone).not.toHaveBeenCalled();
+    expect(addSessionAttention).not.toHaveBeenCalledWith('lead', 'done');
+
+    // The Worker report wakes the Lead; that turn's done is the team's completion.
+    storeMock.heldByAgentIsland.delete('lead');
+    await emitSnapshot(new Map([['lead', status(true)]]));
+    await emitSnapshot(new Map([['lead', status(false)]]));
+    await act(async () => { await vi.advanceTimersByTimeAsync(600); });
+    expect(onSessionDone).toHaveBeenCalledExactlyOnceWith('lead');
+    expect(addSessionAttention).toHaveBeenCalledWith('lead', 'done');
+  });
+
+  it('keeps the completion of a session whose paused queue holds Agent Island', async () => {
+    vi.useFakeTimers();
+    const onSessionDone = vi.fn();
+    renderHook(() => useSessionRunningStatus(undefined, { onSessionDone }));
+    storeMock.heldByAgentIsland.add('paused');
+    storeMock.pausedQueueSessions.add('paused');
+
+    await emitSnapshot(new Map([['paused', status(true)]]));
+    await emitSnapshot(new Map([['paused', status(false)]]));
+    await act(async () => { await vi.advanceTimersByTimeAsync(600); });
+
+    expect(onSessionDone).toHaveBeenCalledExactlyOnceWith('paused');
+  });
+});
+
+describe('useSessionRunningStatus stale error dot', () => {
+  afterEach(() => {
+    storeMock.snapshot = new Map();
+    storeMock.listeners.clear();
+    storeMock.terminalErrorSessions.clear();
+    vi.clearAllMocks();
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it('retires the error dot when the next turn finishes cleanly after the start missed it', async () => {
+    vi.useFakeTimers();
+    let kind: ReturnType<typeof getSessionAttentionKind>;
+    vi.mocked(addSessionAttention).mockImplementation((_sessionId, next) => {
+      kind = next;
+    });
+    vi.mocked(clearSessionAttention).mockImplementation(() => {
+      kind = undefined;
+      return true;
+    });
+    vi.mocked(getSessionAttentionKind).mockImplementation(() => kind);
+    renderHook(() => useSessionRunningStatus(undefined));
+    await emitSnapshot(new Map([['s', status(true)]]));
+    storeMock.terminalErrorSessions.add('s');
+    await emitSnapshot(new Map([['s', status(false, true)]]));
+    expect(kind).toBe('error');
+
+    // 自动续跑(换电脑后继续、额度恢复后继续)启动那一刻还读到旧错误：当时没收掉。
+    await emitSnapshot(new Map([['s', status(true)]]));
+    expect(kind).toBe('error');
+    storeMock.terminalErrorSessions.clear();
+    await emitSnapshot(new Map([['s', status(false)]]));
+    expect(clearSessionAttention).toHaveBeenCalledWith('s', { intent: 'explicit' });
+    // 派生账本重算：仍有未处置的错误尾行会重新点亮。
+    expect(refreshPendingAlerts).toHaveBeenCalled();
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+    expect(kind).toBe('done');
+  });
+
+  it('stops owning its dot once the user handled it, so a later dot from elsewhere stays', async () => {
+    vi.useFakeTimers();
+    let kind: ReturnType<typeof getSessionAttentionKind>;
+    vi.mocked(addSessionAttention).mockImplementation((_sessionId, next) => {
+      kind = next;
+    });
+    vi.mocked(getSessionAttentionKind).mockImplementation(() => kind);
+    renderHook(() => useSessionRunningStatus(undefined));
+    await emitSnapshot(new Map([['s', status(true)]]));
+    storeMock.terminalErrorSessions.add('s');
+    await emitSnapshot(new Map([['s', status(false, true)]]));
+    // 用户关掉横幅：红点被处置。
+    kind = undefined;
+    storeMock.terminalErrorSessions.clear();
+    await emitSnapshot(new Map([['s', status(true)]]));
+    // 这一轮里别的来源(如 Make 卡片失败)点了红点，但这一轮本身正常结束。
+    kind = 'error';
+    vi.mocked(clearSessionAttention).mockClear();
+    await emitSnapshot(new Map([['s', status(false)]]));
+    expect(clearSessionAttention).not.toHaveBeenCalledWith('s', { intent: 'explicit' });
+  });
+
+  it('leaves an error dot it did not set to the pending-alert ledger', async () => {
+    vi.useFakeTimers();
+    vi.mocked(getSessionAttentionKind).mockReturnValue('error');
+    renderHook(() => useSessionRunningStatus(undefined));
+    storeMock.terminalErrorSessions.add('s');
+    await emitSnapshot(new Map([['s', status(true)]]));
+    storeMock.terminalErrorSessions.clear();
+    await emitSnapshot(new Map([['s', status(false)]]));
+    expect(clearSessionAttention).not.toHaveBeenCalledWith('s', { intent: 'explicit' });
+    expect(refreshPendingAlerts).toHaveBeenCalled();
+  });
+});

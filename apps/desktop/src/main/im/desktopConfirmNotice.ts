@@ -1,0 +1,104 @@
+/**
+ * im/desktopConfirmNotice.ts — 桌面专属确认卡挂起时的 IM 侧提示(#926)。
+ *
+ * issue_confirm / rename confirm / ghost_grant_confirm 这类确认卡**有意**只在
+ * 桌面端出现(见 issueConfirmBridge 头注:它们不进 agent 的 InteractionRequest
+ * union,feishu /ctr 接管路径对未知 kind 会直接 deny)。但飞书驱动的会话里用户
+ * 人在 IM 侧,看不到卡片,只能等到 CONFIRM_TIMEOUT 才知道出了事。
+ *
+ * 这里补的是**不可交互的文字提示**:卡片仍然只在桌面(不动既有设计边界),
+ * IM 侧即时收到「有确认卡在桌面等你」。best-effort:提示失败绝不影响确认流程
+ * (fire-and-forget,桥不等待、不感知失败)。
+ *
+ * 本文件只放纯逻辑(零 db 依赖,electron 仅经界面语言模块间接引入且单测有桩,单测直接引);生产接线在
+ * desktopConfirmNoticeWiring.ts(按 architecture-invariants §2 顶层静态 import)。
+ *
+ * 提示文案跟随主人的 Cindy 界面语言(`imBot.text.shared.desktopConfirm.*`),发送时现取。
+ */
+
+import { imText } from './shared/imText';
+
+const K = 'imBot.text.shared.desktopConfirm';
+
+/** 桌面专属确认卡的种类;`desktopConfirmSubject` 给出当前语言下的卡片称呼。 */
+export type DesktopConfirmSubject = 'githubIssue' | 'renameSessions' | 'pluginFileGrant';
+
+/** 「「提交 GitHub issue」的确认卡」这类称呼,作 `buildDesktopConfirmNoticeText` 的 `what`。 */
+export function desktopConfirmSubject(subject: DesktopConfirmSubject): string {
+  return imText(`${K}.subject.${subject}`);
+}
+
+export interface DesktopConfirmNoticeDeps {
+  /** 会话绑定的飞书 openId;非飞书会话返回 null(桌面本来就是唯一交互面)。 */
+  getFeishuOpenId(sessionId: string): Promise<string | null>;
+  sendFeishuText(openId: string, markdown: string): Promise<unknown>;
+  /**
+   * 该任务开了「消息免打扰」→ IM 侧提示也不发,与 toast / 灵动岛 / 手机推送
+   * 同一口径。桌面卡片本身不受影响:提示是提醒,卡片是交互面。
+   */
+  isSuppressed?(sessionId: string): boolean;
+  logWarn?(message: string): void;
+}
+
+/** 飞书目标解析的注入面(纯逻辑可单测;生产接线见 desktopConfirmNoticeWiring.ts)。 */
+export interface FeishuNoticeTargetDeps {
+  /** bindingStore.findByTarget:/ctr 接管的普通会话,接管者身份在 binding 而非 session 行。 */
+  findBinding(sessionId: string): { channel: string; userId: string } | null;
+  /** sessions 行的 feishuOpenId(飞书原生会话)。 */
+  getSessionOpenId(sessionId: string): Promise<string | null>;
+}
+
+/**
+ * 解析确认提示应发往的飞书 openId。优先接管绑定(review P1:/ctr 接管的普通
+ * desktop 会话,session 行的 feishuOpenId 为 null,接管者身份保存在 bindingStore),
+ * 其次才是飞书原生会话的 session 行;两者皆无 → null(非飞书场景,零动作)。
+ */
+export async function resolveFeishuNoticeTarget(
+  deps: FeishuNoticeTargetDeps,
+  sessionId: string,
+): Promise<string | null> {
+  const bound = deps.findBinding(sessionId);
+  if (bound?.channel === 'feishu' && bound.userId) return bound.userId;
+  return deps.getSessionOpenId(sessionId);
+}
+
+/** 提示文案(纯函数,便于单测锚定)。 */
+export function buildDesktopConfirmNoticeText(what: string): string {
+  return imText(`${K}.notice`, { what });
+}
+
+/**
+ * 代输入提示:只给任务名与入口,不含界面内容,也不接收输入(值只走签名加密通道)。
+ * 任务名是原样数据,模板只做拼接。
+ */
+export function buildInputHandoffNoticeText(taskTitle: string): string {
+  return imText(`${K}.inputHandoff`, { taskTitle });
+}
+
+/**
+ * 组装 fire-and-forget 通知函数(DI 便于单测;生产接线见
+ * desktopConfirmNoticeWiring.ts)。返回提醒是否已接管(含免打扰),而非是否发送成功;
+ * 忽略返回值的既有调用方仍为 best-effort,不抛出。
+ */
+export function createDesktopConfirmNotifier(
+  deps: DesktopConfirmNoticeDeps,
+  buildText: (what: string) => string = buildDesktopConfirmNoticeText,
+): (sessionId: string, what: string) => Promise<boolean> {
+  return async (sessionId, what) => {
+    if (deps.isSuppressed?.(sessionId)) return true;
+    let handled = false;
+    try {
+      const openId = await deps.getFeishuOpenId(sessionId);
+      if (deps.isSuppressed?.(sessionId)) return true;
+      if (!openId) return false;
+      // Finding a target claims this notice, even when best-effort delivery fails.
+      handled = true;
+      await deps.sendFeishuText(openId, buildText(what));
+    } catch (err) {
+      deps.logWarn?.(
+        `desktop-confirm IM notice failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    return handled;
+  };
+}

@@ -1,0 +1,355 @@
+import { runSessionCreationAttempt, captureSessionCreationCancellation } from '../../localDb/sessionRuntimeCleanup';
+import { describe, expect, it, vi } from 'vitest';
+
+import { MAKER_INVOKE } from '../channels';
+import { registerMakerSessionCreateHandler } from '../sessionCreateHandler';
+import { IpcHarness } from './helpers/ipcHarness';
+import { CredentialModeSwitchBusyError } from '../../maker-host/codex-credential-switch';
+
+function createSessionStub(overrides: Record<string, unknown> = {}) {
+  return {
+    id: 'session-1',
+    agentKind: 'codex',
+    workDir: 'C:\\repo',
+    capabilities: { sameTurnSteer: { supported: true } },
+    ...overrides,
+  };
+}
+
+function createDeps(overrides: Record<string, unknown> = {}) {
+  return {
+    bootstrapSession: vi.fn().mockResolvedValue({
+      session: createSessionStub(),
+      didInjectOrcaInstructions: false,
+      didInjectProjectContext: true,
+    }),
+    markOrcaRoleIfNeeded: vi.fn(),
+    markKnownNonOrcaIfApplicable: vi.fn(),
+    sendWorkerReadyMessage: vi.fn(),
+    broadcastSessionCreated: vi.fn(),
+    logCreateSession: vi.fn(),
+    warnStderr: vi.fn(),
+    ...overrides,
+  };
+}
+
+describe('maker session CREATE_SESSION IPC handler', () => {
+  it.each([true, false])('passes initial plan mode %s to the creation transaction', async (planMode) => {
+    const harness = new IpcHarness();
+    const deps = createDeps();
+    registerMakerSessionCreateHandler(harness, deps);
+    await harness.invoke(MAKER_INVOKE.CREATE_SESSION, {
+      agentKind: 'codex', workingDir: 'C:\\repo', model: 'gpt-5.4', planMode,
+    });
+    expect(deps.bootstrapSession).toHaveBeenCalledWith(expect.objectContaining({ planMode }));
+    expect(deps.bootstrapSession.mock.invocationCallOrder[0]).toBeLessThan(
+      deps.broadcastSessionCreated.mock.invocationCallOrder[0],
+    );
+  });
+
+  it('rejects invalid plan flags before creation and propagates persistence failures', async () => {
+    const harness = new IpcHarness();
+    const deps = createDeps();
+    registerMakerSessionCreateHandler(harness, deps);
+    const args = { agentKind: 'codex', workingDir: 'C:\\repo', model: 'gpt-5.4' };
+    await expect(harness.invoke(MAKER_INVOKE.CREATE_SESSION, { ...args, planMode: 'true' }))
+      .rejects.toMatchObject({ code: 'INVALID_PARAMS' });
+    expect(deps.bootstrapSession).not.toHaveBeenCalled();
+    deps.bootstrapSession.mockRejectedValue(new Error('storage unavailable'));
+    await expect(harness.invoke(MAKER_INVOKE.CREATE_SESSION, { ...args, planMode: true }))
+      .rejects.toThrow('storage unavailable');
+    expect(deps.broadcastSessionCreated).not.toHaveBeenCalled();
+  });
+
+  it('bootstraps a session and returns the public create-session payload', async () => {
+    const harness = new IpcHarness();
+    const deps = createDeps();
+    registerMakerSessionCreateHandler(harness, deps);
+
+    await expect(
+      harness.invoke(MAKER_INVOKE.CREATE_SESSION, {
+        agentKind: 'codex',
+        workingDir: 'C:\\repo',
+        model: 'gpt-5.4',
+        workspaceKind: 'dialogue',
+      }),
+    ).resolves.toEqual({
+      sessionId: 'session-1',
+      agentKind: 'codex',
+      workDir: 'C:\\repo',
+      capabilities: { sameTurnSteer: { supported: true } },
+      usedProjectContext: true,
+    });
+
+    expect(deps.bootstrapSession).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentKind: 'codex',
+        workingDir: 'C:\\repo',
+        model: 'gpt-5.4',
+        workspaceKind: 'dialogue',
+        vendorOptions: expect.objectContaining({ onStderrLine: expect.any(Function) }),
+      }),
+    );
+    expect(deps.logCreateSession).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentKind: 'codex',
+        model: 'gpt-5.4',
+        workDir: 'C:\\repo',
+        usedProjectContext: true,
+      }),
+    );
+    expect(deps.markKnownNonOrcaIfApplicable).toHaveBeenCalled();
+    expect(deps.broadcastSessionCreated).toHaveBeenCalledWith('session-1');
+  });
+
+  it('allocates a controlled dialogue workspace before bootstrapping folderless dialogue sessions', async () => {
+    const harness = new IpcHarness();
+    const allocateDialogueWorkspace = vi.fn(
+      (sessionId: string, nowMs: number) => `/userData/dialogues/${nowMs}/${sessionId}`,
+    );
+    const bootstrapSession = vi.fn(async (opts: { id?: string; workingDir: string }) => ({
+      session: createSessionStub({ id: opts.id, workDir: opts.workingDir }),
+      didInjectOrcaInstructions: false,
+      didInjectProjectContext: false,
+    }));
+    const deps = createDeps({
+      allocateDialogueWorkspace,
+      bootstrapSession,
+      createSessionId: () => 'dialogue-session-1',
+      now: () => 1710000000000,
+    });
+    registerMakerSessionCreateHandler(harness, deps);
+
+    await expect(
+      harness.invoke(MAKER_INVOKE.CREATE_SESSION, {
+        agentKind: 'codex',
+        workspaceKind: 'dialogue',
+        model: 'gpt-5.4',
+      }),
+    ).resolves.toEqual({
+      sessionId: 'dialogue-session-1',
+      agentKind: 'codex',
+      workDir: '/userData/dialogues/1710000000000/dialogue-session-1',
+      capabilities: { sameTurnSteer: { supported: true } },
+      usedProjectContext: false,
+    });
+
+    expect(allocateDialogueWorkspace).toHaveBeenCalledWith('dialogue-session-1', 1710000000000);
+    expect(bootstrapSession).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: 'dialogue-session-1',
+        workspaceKind: 'dialogue',
+        workingDir: '/userData/dialogues/1710000000000/dialogue-session-1',
+      }),
+    );
+  });
+
+  it('rejects invalid create-session payloads before bootstrapping', async () => {
+    const harness = new IpcHarness();
+    const deps = createDeps();
+    registerMakerSessionCreateHandler(harness, deps);
+
+    await expect(
+      harness.invoke(MAKER_INVOKE.CREATE_SESSION, {
+        agentKind: 'codex',
+        workingDir: 'C:\\repo',
+      }),
+    ).rejects.toMatchObject({ code: 'INVALID_PARAMS' });
+    expect(deps.bootstrapSession).not.toHaveBeenCalled();
+  });
+
+  it('maps credential mode busy from bootstrap to CREDENTIAL_SWITCH_BUSY', async () => {
+    const harness = new IpcHarness();
+    const deps = createDeps({
+      bootstrapSession: vi
+        .fn()
+        .mockRejectedValue(new CredentialModeSwitchBusyError(['busy-session'])),
+    });
+    registerMakerSessionCreateHandler(harness, deps);
+
+    await expect(
+      harness.invoke(MAKER_INVOKE.CREATE_SESSION, {
+        agentKind: 'codex',
+        workingDir: 'C:\\repo',
+        model: 'gpt-5.4',
+      }),
+    ).rejects.toMatchObject({ code: 'CREDENTIAL_SWITCH_BUSY' });
+
+    expect(deps.broadcastSessionCreated).not.toHaveBeenCalled();
+    expect(deps.sendWorkerReadyMessage).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['[REMOTE_PROVIDER_UPDATING] provider "p" credentials are being updated; retry in a moment', 'REMOTE_PROVIDER_UPDATING'],
+    ['[REMOTE_PROVIDER_UNSUPPORTED] provider "p" has no claude-code route on this desktop', 'REMOTE_PROVIDER_UNSUPPORTED'],
+    ['[REMOTE_NATIVE_OAUTH_UNAVAILABLE] Anthropic subscription is not connected on this desktop', 'REMOTE_NATIVE_OAUTH_UNAVAILABLE'],
+    ['[CLAUDE_SUBSCRIPTION_WORKSPACE_OVERRIDE] /repo/.claude/settings.json sets ANTHROPIC_BASE_URL', 'CLAUDE_SUBSCRIPTION_WORKSPACE_OVERRIDE'],
+    // 轮 40-w4-t3 HIGH:远端 Pi 会话启动时 Cindy AI gateway 未就绪 —— 必须映射
+    // 到 IPC code, renderer 走 5 语言可行动文案, 不显示 raw 英文。
+    ['[REMOTE_GATEWAY_ENDPOINT_UNAVAILABLE] Remote Pi sessions need the XD gateway endpoint issued after sign-in (runtimeConfig.remoteEndpoint is empty)', 'REMOTE_GATEWAY_ENDPOINT_UNAVAILABLE'],
+  ])('maps remote route error %s to %s', async (message, code) => {
+    const harness = new IpcHarness();
+    const deps = createDeps({
+      bootstrapSession: vi.fn().mockRejectedValue(new Error(message)),
+    });
+    registerMakerSessionCreateHandler(harness, deps);
+
+    await expect(
+      harness.invoke(MAKER_INVOKE.CREATE_SESSION, {
+        agentKind: 'claude-code',
+        workingDir: 'C:\\repo',
+        model: 'claude-opus-4-6',
+      }),
+    ).rejects.toMatchObject({ code });
+  });
+
+  it('rethrows non-remote errors unchanged', async () => {
+    const harness = new IpcHarness();
+    const deps = createDeps({
+      bootstrapSession: vi.fn().mockRejectedValue(new Error('some other failure')),
+    });
+    registerMakerSessionCreateHandler(harness, deps);
+
+    await expect(
+      harness.invoke(MAKER_INVOKE.CREATE_SESSION, {
+        agentKind: 'claude-code',
+        workingDir: 'C:\\repo',
+        model: 'claude-opus-4-6',
+      }),
+    ).rejects.toThrow('some other failure');
+  });
+
+  it('preserves explicit providerId=null through create-session parsing', async () => {
+    const harness = new IpcHarness();
+    const deps = createDeps();
+    registerMakerSessionCreateHandler(harness, deps);
+
+    await harness.invoke(MAKER_INVOKE.CREATE_SESSION, {
+      agentKind: 'codex',
+      workingDir: 'C:\\repo',
+      model: 'gpt-5.4',
+      providerId: null,
+    });
+
+    expect(deps.bootstrapSession).toHaveBeenCalledWith(
+      expect.objectContaining({
+        providerId: null,
+      }),
+    );
+  });
+
+  it('marks lead role inside create-session', async () => {
+    const harness = new IpcHarness();
+    const deps = createDeps();
+    registerMakerSessionCreateHandler(harness, deps);
+
+    await harness.invoke(MAKER_INVOKE.CREATE_SESSION, {
+      agentKind: 'codex',
+      workingDir: 'C:\\repo',
+      model: 'gpt-5.4',
+      orcaRole: 'lead',
+    });
+    expect(deps.markOrcaRoleIfNeeded).toHaveBeenCalledWith('session-1', 'lead');
+  });
+
+  it('does not mark worker role until addWorker creates the team link', async () => {
+    const harness = new IpcHarness();
+    const deps = createDeps();
+
+    registerMakerSessionCreateHandler(harness, deps);
+
+    await harness.invoke(MAKER_INVOKE.CREATE_SESSION, {
+      agentKind: 'codex',
+      workingDir: 'C:\\repo',
+      model: 'gpt-5.4',
+      orcaRole: 'worker',
+    });
+    expect(deps.markOrcaRoleIfNeeded).not.toHaveBeenCalled();
+    expect(deps.sendWorkerReadyMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'session-1' }),
+    );
+  });
+
+  it('runs an explicit-id create transaction under the injected session lock', async () => {
+    const harness = new IpcHarness();
+    const order: string[] = [];
+    const withSessionLock = vi.fn(async (sessionId: string, task: () => Promise<unknown>) => {
+      order.push(`lock:${sessionId}:start`);
+      const result = await task();
+      order.push(`lock:${sessionId}:end`);
+      return result;
+    });
+    const deps = createDeps({
+      withSessionLock,
+      bootstrapSession: vi.fn(async (opts: { id?: string }) => {
+        order.push(`bootstrap:${opts.id}`);
+        return {
+          session: createSessionStub({ id: opts.id }),
+          didInjectOrcaInstructions: false,
+          didInjectProjectContext: false,
+        };
+      }),
+    });
+    registerMakerSessionCreateHandler(harness, deps);
+
+    await harness.invoke(MAKER_INVOKE.CREATE_SESSION, {
+      id: 'preset-session-1',
+      agentKind: 'codex',
+      workingDir: 'C:\\repo',
+      model: 'gpt-5.4',
+    });
+
+    expect(withSessionLock).toHaveBeenCalledWith('preset-session-1', expect.any(Function));
+    expect(order).toEqual([
+      'lock:preset-session-1:start',
+      'bootstrap:preset-session-1',
+      'lock:preset-session-1:end',
+    ]);
+  });
+});
+
+// Unit, F6: a validated terminal request may resume after the old creation finished.
+// Capture its attempt before validation awaits; never cancel a replacement with the same UUID.
+it('a late terminal cancellation snapshot cannot cancel a replacement or sibling creation', async () => {
+  const owner = {};
+  let finishOld!: () => void, finishNew!: () => void, finishSibling!: () => void;
+  const old = runSessionCreationAttempt('same', () => owner, () => new Promise<void>(done => { finishOld = done; }));
+  const cancelOld = captureSessionCreationCancellation(owner, 'same');
+  finishOld(); await old;
+  let newState = 'pending', siblingState = 'pending';
+  const replacement = runSessionCreationAttempt('same', () => owner, () => new Promise<void>(done => { finishNew = done; }))
+    .then(() => { newState = 'resolved'; }, () => { newState = 'rejected'; });
+  const sibling = runSessionCreationAttempt('sibling', () => owner, () => new Promise<void>(done => { finishSibling = done; }))
+    .then(() => { siblingState = 'resolved'; }, () => { siblingState = 'rejected'; });
+  cancelOld(); await Promise.resolve(); await Promise.resolve();
+  expect(newState).toBe('pending'); expect(siblingState).toBe('pending');
+  finishNew(); finishSibling(); await Promise.all([replacement, sibling]);
+  expect(newState).toBe('resolved'); expect(siblingState).toBe('resolved');
+});
+
+// Unit, F6: once bootstrap returns, cancellation still owns that exact handle
+// until IPC publication. Delayed role persistence must not send/broadcast it.
+it('closes the returned instance once when terminal cancellation interrupts publication', async () => {
+  const harness = new IpcHarness(), owner = {};
+  let finishRole!: () => void;
+  const role = new Promise<void>(done => { finishRole = done; });
+  const close = vi.fn(async () => {});
+  const deps = createDeps({ creationOwner: () => owner,
+    closeCancelledSession: close,
+    markOrcaRoleIfNeeded: vi.fn(() => role),
+  });
+  registerMakerSessionCreateHandler(harness, deps);
+  let failure: unknown;
+  const pending = harness.invoke(MAKER_INVOKE.CREATE_SESSION, {
+    id: 'session-1', agentKind: 'codex', model: 'm', workingDir: '/fixture', orcaRole: 'lead',
+  }).catch(error => { failure = error; });
+  await vi.waitFor(() => expect(deps.markOrcaRoleIfNeeded).toHaveBeenCalledOnce(), { interval: 1 });
+  captureSessionCreationCancellation(owner, 'session-1')();
+  await pending;
+  expect(String(failure)).toContain('REMOTE_AGENT_EXPIRED');
+  expect(close).toHaveBeenCalledExactlyOnceWith((await deps.bootstrapSession.mock.results[0]!.value).session);
+  finishRole(); await Promise.resolve(); await Promise.resolve();
+  expect(deps.broadcastSessionCreated).not.toHaveBeenCalled();
+  expect(deps.sendWorkerReadyMessage).not.toHaveBeenCalled();
+  expect(close).toHaveBeenCalledOnce();
+});

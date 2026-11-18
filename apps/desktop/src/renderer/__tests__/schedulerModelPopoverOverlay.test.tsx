@@ -1,0 +1,232 @@
+// @vitest-environment jsdom
+
+import { act, fireEvent, render, screen } from '@testing-library/react';
+import React from 'react';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+vi.mock('react-i18next', () => ({
+  useTranslation: () => ({
+    t: (key: string) => key,
+  }),
+}));
+
+vi.mock('@/components/ui/popover', () => {
+  const PopoverState = React.createContext<{
+    open: boolean;
+    onOpenChange?: (open: boolean) => void;
+  }>({ open: false });
+  return {
+    Popover: ({
+      children,
+      open = false,
+      onOpenChange,
+    }: {
+      children: React.ReactNode;
+      open?: boolean;
+      onOpenChange?: (open: boolean) => void;
+    }) => (
+      <PopoverState.Provider value={{ open, onOpenChange }}>
+        {children}
+      </PopoverState.Provider>
+    ),
+    PopoverTrigger: ({ children }: { children: React.ReactNode }) => {
+      const state = React.useContext(PopoverState);
+      const child = children as React.ReactElement<{ onClick?: React.MouseEventHandler }>;
+      return React.cloneElement(child, {
+        onClick: (event) => {
+          child.props.onClick?.(event);
+          state.onOpenChange?.(!state.open);
+        },
+      });
+    },
+    PopoverContent: ({
+      children,
+      className,
+      onWheel,
+    }: {
+      children: React.ReactNode;
+      className?: string;
+      onWheel?: React.WheelEventHandler<HTMLDivElement>;
+    }) => (
+      <div data-testid="model-popover" className={className} onWheel={onWheel}>
+        {children}
+      </div>
+    ),
+  };
+});
+
+vi.mock('@/components/new-chat/ModelSelector', () => ({
+  ModelSelectorContent: ({
+    overlayContentClassName,
+    selectedRowClickOpensConfiguration,
+    reselectEmitsChange,
+    onProviderChange,
+  }: {
+    overlayContentClassName?: string;
+    selectedRowClickOpensConfiguration?: boolean;
+    reselectEmitsChange?: boolean;
+    onProviderChange?: (providerId: string | null) => void;
+  }) => (
+    <div
+      data-testid="model-selector-content"
+      data-overlay-class={overlayContentClassName}
+      data-selected-row-click-opens-configuration={String(
+        selectedRowClickOpensConfiguration === true,
+      )}
+      data-reselect-emits-change={String(reselectEmitsChange === true)}
+      data-provider-change={String(onProviderChange !== undefined)}
+      onClick={() => onProviderChange?.('openai')}
+    />
+  ),
+  ModelIconMark: () => null,
+}));
+
+vi.mock('@/hooks/useAvailableAgents', () => ({ useModelPickerAgents: () => ['claude-code', 'codex', 'pi'] }));
+// These cases exercise the popover; location discovery is covered by useWorkerAgentDevices.
+vi.mock('@/hooks/useModelRouteDevices', () => ({ useModelRouteDevices: () => ({ devices: undefined }) }));
+
+// PR #6832: these local popover interaction tests now also import remote location
+// discovery. Keep the unit fixture local; loading real account/chat state made
+// collection fail before the existing selection/refresh assertions could run.
+vi.mock('@/hooks/useModelRouteDevices', () => ({
+  useModelRouteDevices: () => ({ leadAgentDeviceId: null, devices: [] }),
+}));
+
+vi.mock('@/hooks/useAgentCapabilities', () => ({
+  getCachedCapabilities: () => null,
+  useAgentCapabilities: () => ({
+    capabilities: {
+      availableModels: [
+        {
+          id: 'claude-opus-4-8',
+          displayName: 'Opus 4.8',
+          efforts: ['high'],
+          defaultEffort: 'high',
+        },
+      ],
+    },
+  }),
+}));
+
+vi.mock('@/hooks/useProviders', () => ({
+  useProviders: () => ({ providers: [{
+    id: 'openai', name: 'OpenAI', connected: true, agents: ['codex'],
+    auth: { method: 'oauth' }, source: 'builtin', routing: { codex: {} },
+    models: { codex: [{ id: 'gpt-5.5', name: 'GPT', contextWindow: 272000, efforts: [] }] },
+  }] }),
+}));
+
+import { ModelEffortChip } from '@/features/scheduler/components/ScheduleChips';
+
+const requestProviderModelsAutoRefresh = vi.fn(async () => ({ ok: true as const }));
+
+beforeEach(() => {
+  requestProviderModelsAutoRefresh.mockClear();
+  (window as unknown as { electronAPI: unknown }).electronAPI = {
+    maker: { requestProviderModelsAutoRefresh },
+  };
+});
+
+describe('scheduler model popover overlay behavior', () => {
+  it('pins an explicitly selected native default instead of storing automatic selection', () => {
+    const onChangeProviderId = vi.fn();
+    render(<ModelEffortChip onSelect={vi.fn()} onFollowSession={vi.fn()}
+      agentKind="codex" modelValue="gpt-5.5"
+      onChangeModel={vi.fn()} effortValue="" onChangeEffort={vi.fn()}
+      providerId="" onChangeProviderId={onChangeProviderId} />);
+    fireEvent.click(screen.getByTestId('model-selector-content'));
+    expect(onChangeProviderId).toHaveBeenCalledWith('openai');
+  });
+  it('keeps wheel events inside the model popover and raises nested model options above it', () => {
+    const onOuterWheel = vi.fn();
+
+    render(
+      <div onWheel={onOuterWheel}>
+        <ModelEffortChip
+          onSelect={vi.fn()}
+          onFollowSession={vi.fn()}
+          agentKind="claude-code"
+          modelValue="claude-opus-4-8"
+          onChangeModel={vi.fn()}
+          effortValue="high"
+          onChangeEffort={vi.fn()}
+          providerId=""
+          onChangeProviderId={vi.fn()}
+        />
+      </div>,
+    );
+
+    fireEvent.wheel(screen.getByTestId('model-selector-content'), { deltaY: 120 });
+
+    expect(onOuterWheel).not.toHaveBeenCalled();
+    expect(screen.getByTestId('model-selector-content').getAttribute('data-overlay-class')).toBe(
+      'z-[10020]',
+    );
+    expect(
+      screen
+        .getByTestId('model-selector-content')
+        .getAttribute('data-selected-row-click-opens-configuration'),
+    ).toBe('true');
+    expect(screen.getByTestId('model-selector-content').getAttribute('data-reselect-emits-change')).toBe(
+      'true',
+    );
+    expect(screen.getByTestId('model-selector-content').getAttribute('data-provider-change')).toBe(
+      'true',
+    );
+  });
+
+  it('requests a silent refresh when the scheduler model selector opens', async () => {
+    render(
+      <ModelEffortChip
+          onSelect={vi.fn()}
+          onFollowSession={vi.fn()}
+        agentKind="claude-code"
+        modelValue="claude-opus-4-8"
+        onChangeModel={vi.fn()}
+        effortValue="high"
+        onChangeEffort={vi.fn()}
+        providerId=""
+        onChangeProviderId={vi.fn()}
+      />,
+    );
+
+    // 打开既发起刷新、又把「发现在途」状态推给下拉内容(见 useModelDiscoveryPending):
+    // 那次刷新 resolve 后还有一次 setPending(false) 落在微任务里,所以要走 act。
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /Opus 4\.8/ }));
+    });
+    expect(requestProviderModelsAutoRefresh).toHaveBeenCalledWith('model-selector-open');
+  });
+
+  it('keeps an effort-only bound override labeled as following the session model', () => {
+    render(
+      <ModelEffortChip
+          onSelect={vi.fn()}
+          onFollowSession={vi.fn()}
+        agentKind="claude-code"
+        modelValue=""
+        onChangeModel={vi.fn()}
+        effortValue="high"
+        onChangeEffort={vi.fn()}
+        followSession
+        providerId=""
+        onChangeProviderId={vi.fn()}
+      />,
+    );
+    expect(
+      screen.getByRole('button', {
+        name: 'scheduler.chips.model.followSession · effortLevels.high',
+      }),
+    ).toBeTruthy();
+  });
+});
+
+// Acceptance P1: form cleared an unavailable route but the real chip invented a
+// second default. Existing tests always supplied modelValue. Unit/jsdom, empty
+// model plus a connected catalog: the button must not advertise that catalog model.
+it('shows an empty selection without independently resolving a model or effort', () => {
+  render(<ModelEffortChip onSelect={vi.fn()} onFollowSession={vi.fn()}
+    agentKind="codex" modelValue="" providerId="" effortValue="high"
+    onChangeModel={vi.fn()} onChangeProviderId={vi.fn()} onChangeEffort={vi.fn()} />);
+  expect(screen.getByRole('button', {name:'newChat.modelSelector.trigger.agent.codex \u00b7 scheduler.chips.model.default'})).toBeTruthy();
+});

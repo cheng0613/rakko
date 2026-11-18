@@ -1,0 +1,1543 @@
+// @vitest-environment jsdom
+
+import { act, fireEvent, render, renderHook, screen, waitFor } from '@testing-library/react';
+import { useState } from 'react';
+import { MemoryRouter } from 'react-router-dom';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { CODEX_RESUME_NOT_READY_WIRE_MESSAGE } from '@cindy/maker-shared/agent-input-projection';
+import { sharedTaskHostPeer } from '@cindy/device-link';
+
+import { ErrorBanner } from '../ErrorBanner';
+import { ErrorTailErrorBanner } from '../InterruptedTurnBanner';
+import { useCodexAuth } from '@/hooks/useCodexAuth';
+import { useCodexSessionExpiredPrompt } from '@/hooks/useCodexSessionExpiredPrompt';
+import {
+  CLAUDE_GATEWAY_OPUS_PLAN_MISMATCH_REASON,
+  CLAUDE_SUBSCRIPTION_OPUS_PLAN_MISMATCH_REASON,
+} from '../../../../shared/claudeGatewayError';
+
+// jsdom 没有布局引擎，也尚未实现 checkVisibility；只补本组需要的 CSS 显隐语义。
+Object.defineProperty(HTMLElement.prototype, 'checkVisibility', {
+  configurable: true,
+  value(this: HTMLElement) {
+    for (let element: HTMLElement | null = this; element; element = element.parentElement) {
+      const style = getComputedStyle(element);
+      if (style.display === 'none' || style.visibility === 'hidden') return false;
+    }
+    return true;
+  },
+});
+
+type AuthStateChangedPayload = {
+  agentKind: 'claude-code' | 'codex';
+  authenticated: boolean;
+  identity?: string;
+  expiresAt?: number;
+  errorReason?: string;
+  authSource?: 'oauth' | 'api-key';
+  credentialScope?: 'system-shared' | 'instance-isolated' | 'unknown';
+  recoveryRequiredReason?: string;
+};
+
+const mocks = vi.hoisted(() => ({
+  confirm: vi.fn(),
+  confirmThree: vi.fn(),
+  getState: vi.fn(),
+  triggerLogin: vi.fn(),
+  cancelLogin: vi.fn(),
+  logout: vi.fn(),
+  onStateChanged: vi.fn(),
+  onLoginProgress: vi.fn(),
+  getCodexRateLimits: vi.fn(),
+  consumeReset: vi.fn(),
+  openChatGPTApp: vi.fn(),
+  toastSuccess: vi.fn(),
+  toastError: vi.fn(),
+  runtimeRoute: vi.fn(() => ({ authInjection: 'env-key' as const })),
+  stateChangedListeners: new Set<(payload: AuthStateChangedPayload) => void>(),
+}));
+
+function emitCodexStateChanged(payload: Omit<AuthStateChangedPayload, 'agentKind'>): void {
+  for (const listener of mocks.stateChangedListeners) {
+    listener({ agentKind: 'codex', ...payload });
+  }
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<T>((done, fail) => {
+    resolve = done;
+    reject = fail;
+  });
+  return { promise, resolve, reject };
+}
+
+vi.mock('react-i18next', () => ({
+  useTranslation: () => ({
+    t: (key: string) => key,
+    i18n: { language: 'en', exists: (key: string) => [
+      'chat.remoteError.REMOTE_AGENT_GROUP_USAGE_LIMIT',
+      'chat.remoteError.REMOTE_AGENT_RESUME_UNAVAILABLE',
+      'chat.remoteError.REMOTE_AGENT_INVALID',
+      'chat.remoteError.REMOTE_AGENT_OFFLINE',
+    ].includes(key) },
+  }),
+}));
+
+vi.mock('@/components/ui/confirm-dialog-provider', () => ({
+  useConfirmDialog: () => ({ confirm: mocks.confirm, confirmThree: mocks.confirmThree }),
+}));
+
+vi.mock('@/hooks/useCodexRuntimeRoute', () => ({
+  // invalidate 会在横幅渲染前把已收割的 OAuth host 回落为 env-key；明确失效原因
+  // 仍必须保留 ChatGPT 重连入口。
+  useCodexRuntimeRoute: mocks.runtimeRoute,
+}));
+
+vi.mock('@/lib/toast', () => ({
+  toast: { success: mocks.toastSuccess, error: mocks.toastError },
+}));
+
+describe('ErrorBanner OpenAI connection recovery', () => {
+  // #10187: both live and restored tail errors keep the existing recovery action
+  // and hide unchanged retry, even when the failed input has a retryText (unit).
+  it.each(['live', 'tail'] as const)('offers a route change for %s rejected shared history', surface => {
+    const raw = 'LAZY_CREATE_FAILED: [REMOTE_AGENT_INVALID] this conversation cannot be resumed on this computer';
+    const recover = vi.fn();
+    const retry = vi.fn();
+    render(surface === 'live'
+      ? <ErrorBanner error={raw} agentKind="codex" agentDeviceId="share:one" retryText="original"
+          onRetry={retry} onChooseComputer={recover} />
+      : <ErrorTailErrorBanner errorText={raw} agentKind="codex" agentDeviceId="share:one"
+          onContinue={retry} onDismiss={vi.fn()} onChooseComputer={recover} />);
+    expect(screen.getByText('chat.remoteError.REMOTE_AGENT_RESUME_UNAVAILABLE')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'chat.errorBanner.retry' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'sharedTaskRecovery.choose' }));
+    expect(recover).toHaveBeenCalledOnce();
+    expect(retry).not.toHaveBeenCalled();
+  });
+  // #10187, unit: the real banner must replace communication/update guidance
+  // and suppress both original-input retry and hidden continuation for this refusal.
+  it.each([['original input', false], [null, false], ['original input', true], [null, true]] as const)(
+    'explains rejected guest resume with retry text %s (Pi refusal=%s)', (retryText, piRefusal) => {
+    const retry = vi.fn();
+    const continueAfterError = vi.fn();
+    const error = piRefusal
+      ? '[REMOTE_AGENT_INVALID] This conversation cannot be resumed on this computer.'
+      : 'LAZY_CREATE_FAILED: [REMOTE_AGENT_INVALID] this conversation cannot be resumed on this computer';
+    render(<ErrorBanner error={error} retryText={retryText} onRetry={retry}
+      onContinueAfterError={continueAfterError} agentKind="codex" agentDeviceId="shared-computer" />);
+    expect(screen.getByText('chat.remoteError.REMOTE_AGENT_RESUME_UNAVAILABLE')).toBeTruthy();
+    expect(screen.queryByText('chat.remoteError.REMOTE_AGENT_INVALID')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'chat.errorBanner.retry' })).toBeNull();
+    expect(retry).not.toHaveBeenCalled();
+    expect(continueAfterError).not.toHaveBeenCalled();
+  });
+  it.each([
+    '[REMOTE_AGENT_INVALID] invalid request',
+    '[REMOTE_AGENT_OFFLINE] connection timed out',
+  ])('keeps existing guidance and retry for %s', error => {
+    render(<ErrorBanner error={error} retryText="original input" onRetry={vi.fn()} />);
+    expect(screen.queryByText('chat.remoteError.REMOTE_AGENT_RESUME_UNAVAILABLE')).toBeNull();
+    expect(screen.getByRole('button', { name: 'chat.errorBanner.retry' })).toBeTruthy();
+  });
+  // #9855, unit/jsdom: startup details used to hide the only actionable cloud
+  // file hint. Exercise the real ErrorBanner/ErrorNotice before expanding it.
+  it.each(['', 'LAZY_CREATE_FAILED: ', "Error invoking remote method 'send': Error: [IPC_ERROR] LAZY_CREATE_FAILED: "])(
+    'shows the Pi cloud-file recovery hint without expanding details through %s', (prefix) => {
+      const hint = 'Download ~/Desktop/AGENTS.md in Finder; this cloud-only file may delay Pi startup.';
+      const timeout = 'pi rpc timeout after 30000ms: set_thinking_level';
+      render(<ErrorBanner agentKind="pi" error={`${prefix}[PI_STARTUP_CLOUD_CONTEXT_FILE] ${hint}\n${timeout}`} onRetry={vi.fn()} />);
+      expect(screen.getByText(hint)).toBeDefined();
+      expect(screen.queryByText(timeout)).toBeNull();
+      fireEvent.click(screen.getByRole('button', { name: 'chat.errorBanner.networkShowRaw' }));
+      expect(screen.getByText((text) => text.includes(timeout))).toBeDefined();
+    },
+  );
+
+  // PR #10049: ordinary OpenAI 401 recovery must unlock the original input only
+  // after the existing account probe verifies it, including after remounting.
+  it.each([false, true])('restores generic authentication retry after verification (remount=%s)', async remount => {
+    const retry = vi.fn();
+    mocks.getState.mockResolvedValue({ authenticated: false });
+    const banner = <MemoryRouter><ErrorBanner error="401 Unauthorized" agentKind="codex"
+      providerId="openai" retryText="original input" onRetry={retry} /></MemoryRouter>;
+    const view = render(banner);
+    await act(async () => {});
+    expect(screen.queryByRole('button', { name: 'chat.errorBanner.retry' })).toBeNull();
+    const verification = deferred<unknown>();
+    mocks.getCodexRateLimits.mockImplementationOnce(() => verification.promise);
+    const restored = { authenticated: true, authSource: 'oauth' as const };
+    mocks.getState.mockResolvedValue(restored);
+    if (remount) {
+      view.unmount();
+      render(banner);
+    } else {
+      await act(async () => emitCodexStateChanged(restored));
+    }
+    await waitFor(() => expect(mocks.getCodexRateLimits).toHaveBeenCalledOnce());
+    expect(screen.queryByRole('button', { name: 'chat.errorBanner.retry' })).toBeNull();
+    await act(async () => verification.resolve({ rateLimits: null }));
+    fireEvent.click(await screen.findByRole('button', { name: 'chat.errorBanner.retry' }));
+    expect(retry).toHaveBeenCalledExactlyOnceWith('original input');
+    expect(screen.getByText('chatgptAuthRecovery.recovered')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'logic.confirm.goToSettings' })).toBeNull();
+  });
+  const streamClosed = 'stream disconnected before completion: stream closed before response.completed';
+  it.each([undefined, 'controlled-device'])('offers manual recovery and keeps retry on device %s', async deviceLinkDeviceId => {
+    const recover = vi.fn();
+    const retry = vi.fn();
+    render(<ErrorBanner error={streamClosed} agentKind="codex" deviceLinkDeviceId={deviceLinkDeviceId}
+      silentEncryptedRetryEnabled onForkStripEncrypted={recover} onRetry={retry} retryText="original" />);
+    expect(recover).not.toHaveBeenCalled();
+    expect(screen.getByText('chat.errorBanner.readableHistoryRecoveryDescription')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'chat.errorBanner.retry' }));
+    expect(retry).toHaveBeenCalledWith('original');
+    expect(recover).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'chat.errorBanner.readableHistoryRecovery' }));
+    expect(recover).toHaveBeenCalledOnce();
+  });
+
+  it.each(['live', 'persisted'])('preserves a hidden %s error when Escape exits sidebar maximize', (kind) => {
+    const dismiss = vi.fn();
+    const retry = vi.fn();
+    const exitMaximize = vi.fn();
+    const banner = kind === 'live'
+      ? <ErrorBanner error="hidden error" onRetry={retry} onCancel={dismiss} dismissOnEscape />
+      : <ErrorTailErrorBanner errorText="hidden error" onContinue={retry} onDismiss={dismiss} dismissOnEscape />;
+    const { rerender } = render(<main style={{ display: 'none' }}>{banner}</main>);
+    // 与 MainLayout 一样，退出最大化的监听不 preventDefault，且晚于横幅注册。
+    window.addEventListener('keydown', exitMaximize);
+    try {
+      fireEvent.keyDown(window, { key: 'Escape' });
+      expect(exitMaximize).toHaveBeenCalledOnce();
+      expect(dismiss).not.toHaveBeenCalled();
+      expect(retry).not.toHaveBeenCalled();
+    } finally {
+      window.removeEventListener('keydown', exitMaximize);
+    }
+    rerender(<main>{banner}</main>);
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(dismiss).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    { isRecoverable: true }, { remoteHostId: 'ssh' }, { agentDeviceId: 'hosted' },
+    { deviceLinkDeviceId: sharedTaskHostPeer('shared-task', 'owner-device') },
+    { agentKind: 'cc' as const }, { onForkStripEncrypted: undefined },
+    { error: 'Connection reset' },
+  ])('hides manual history recovery when unavailable: %s', props => {
+    render(<ErrorBanner error={streamClosed} agentKind="codex" onRetry={vi.fn()}
+      onForkStripEncrypted={vi.fn()} {...props} />);
+    expect(screen.queryByRole('button', { name: 'chat.errorBanner.readableHistoryRecovery' })).toBeNull();
+  });
+
+  it('offers the same recovery for a persisted error and disables it while pending', () => {
+    const recover = vi.fn();
+    const retry = vi.fn();
+    const { rerender } = render(<ErrorTailErrorBanner errorText={streamClosed} agentKind="codex" onContinue={retry}
+      onDismiss={vi.fn()} onForkStripEncrypted={recover} forkStripEncryptedRunning />);
+    const button = screen.getByRole('button', { name: 'chat.errorBanner.readableHistoryRecovery' });
+    expect((button as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(button);
+    expect(recover).not.toHaveBeenCalled();
+    const retryButton = screen.getByRole('button', { name: 'chat.errorBanner.retry' }) as HTMLButtonElement;
+    expect(retryButton.disabled).toBe(true);
+    fireEvent.click(retryButton);
+    expect(retry).not.toHaveBeenCalled();
+    rerender(<ErrorTailErrorBanner errorText={streamClosed} agentKind="codex" onContinue={retry}
+      onDismiss={vi.fn()} onForkStripEncrypted={recover} />);
+    fireEvent.click(screen.getByRole('button', { name: 'chat.errorBanner.retry' }));
+    expect(retry).toHaveBeenCalledOnce();
+  });
+
+  it('blocks live retry until recovery settles and restores it on recovery failure', async () => {
+    const retry = vi.fn();
+    const pending = deferred<void>();
+    function Harness() {
+      const [busy, setBusy] = useState(false);
+      return <ErrorBanner error={streamClosed} agentKind="codex" retryText="original" onRetry={retry}
+        forkStripEncryptedRunning={busy} onForkStripEncrypted={async () => {
+          setBusy(true);
+          try { await pending.promise; } catch { /* parent displays recovery error */ }
+          finally { setBusy(false); }
+        }} />;
+    }
+    render(<Harness />);
+    fireEvent.click(screen.getByRole('button', { name: 'chat.errorBanner.readableHistoryRecovery' }));
+    const retryButton = screen.getByRole('button', { name: 'chat.errorBanner.retry' }) as HTMLButtonElement;
+    expect(retryButton.disabled).toBe(true);
+    fireEvent.click(retryButton);
+    expect(retry).not.toHaveBeenCalled();
+    await act(async () => pending.reject(new Error('recovery unavailable')));
+    expect(retryButton.disabled).toBe(false);
+    fireEvent.click(retryButton);
+    expect(retry).toHaveBeenCalledWith('original');
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.stateChangedListeners.clear();
+    mocks.confirm.mockResolvedValue(true);
+    mocks.confirmThree.mockResolvedValue('confirm');
+    mocks.getState.mockResolvedValue({
+      authenticated: false,
+      errorReason: 'refresh_token_reused',
+    });
+    mocks.triggerLogin.mockImplementation(async () => {
+      const result = {
+        authenticated: true,
+        identity: 'user@example.com',
+        authSource: 'oauth' as const,
+      };
+      mocks.getState.mockResolvedValue(result);
+      emitCodexStateChanged(result);
+      return result;
+    });
+    mocks.cancelLogin.mockResolvedValue(undefined);
+    mocks.logout.mockResolvedValue(undefined);
+    mocks.getCodexRateLimits.mockResolvedValue({
+      account: { email: null, accountId: null, planType: null },
+      rateLimits: {}, rateLimitsByLimitId: null, rateLimitResetCredits: null, resetOffer: null,
+    });
+    mocks.openChatGPTApp.mockResolvedValue({ success: true });
+    mocks.consumeReset.mockResolvedValue({ outcome: 'reset', rateLimits: null });
+    mocks.onStateChanged.mockImplementation(
+      (listener: (payload: AuthStateChangedPayload) => void) => {
+        mocks.stateChangedListeners.add(listener);
+        return () => mocks.stateChangedListeners.delete(listener);
+      },
+    );
+    mocks.onLoginProgress.mockReturnValue(() => undefined);
+    (
+      window as unknown as {
+        electronAPI: {
+          maker: {
+            auth: {
+              getState: typeof mocks.getState;
+              triggerLogin: typeof mocks.triggerLogin;
+              cancelLogin: typeof mocks.cancelLogin;
+              logout: typeof mocks.logout;
+              onStateChanged: typeof mocks.onStateChanged;
+              onLoginProgress: typeof mocks.onLoginProgress;
+            };
+            usage: { getCodexRateLimits: typeof mocks.getCodexRateLimits; consumeCodexRateLimitReset: typeof mocks.consumeReset };
+          };
+          openChatGPTApp: typeof mocks.openChatGPTApp;
+        };
+      }
+    ).electronAPI = {
+      maker: {
+        auth: {
+          getState: mocks.getState,
+          triggerLogin: mocks.triggerLogin,
+          cancelLogin: mocks.cancelLogin,
+          logout: mocks.logout,
+          onStateChanged: mocks.onStateChanged,
+          onLoginProgress: mocks.onLoginProgress,
+        },
+        usage: { getCodexRateLimits: mocks.getCodexRateLimits, consumeCodexRateLimitReset: mocks.consumeReset },
+      },
+      openChatGPTApp: mocks.openChatGPTApp,
+    };
+  });
+
+  it.each(['live', 'persisted'])('dismisses only the active %s error from the composer with Escape', (kind) => {
+    const dismiss = vi.fn();
+    const inactiveDismiss = vi.fn();
+    const retry = vi.fn();
+    const { unmount } = render(<>
+      <textarea aria-label="composer" />
+      <ErrorBanner error="inactive error" onRetry={retry} onCancel={inactiveDismiss} />
+      {kind === 'live'
+        ? <ErrorBanner error="active error" onRetry={retry} onCancel={dismiss} dismissOnEscape />
+        : <ErrorTailErrorBanner errorText="active error" onContinue={retry} onDismiss={dismiss} dismissOnEscape />}
+    </>);
+    fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Escape' });
+    expect(dismiss).toHaveBeenCalledOnce();
+    expect(inactiveDismiss).not.toHaveBeenCalled();
+    expect(retry).not.toHaveBeenCalled();
+    unmount();
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(dismiss).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    { key: 'Enter' }, { key: 'Escape', repeat: true },
+    { key: 'Escape', isComposing: true }, { key: 'Escape', keyCode: 229 },
+    { key: 'Escape', altKey: true }, { key: 'Escape', ctrlKey: true },
+    { key: 'Escape', metaKey: true }, { key: 'Escape', shiftKey: true },
+  ])('does not dismiss errors for an unrelated or composing key: %s', (event) => {
+    const dismiss = vi.fn();
+    render(<ErrorBanner error="error" onRetry={vi.fn()} onCancel={dismiss} dismissOnEscape />);
+    fireEvent.keyDown(window, event);
+    expect(dismiss).not.toHaveBeenCalled();
+  });
+
+  it('lets a composer consume Escape before dismissing the error', () => {
+    const dismiss = vi.fn();
+    render(<>
+      <textarea onKeyDown={(event) => event.preventDefault()} />
+      <ErrorBanner error="error" onRetry={vi.fn()} onCancel={dismiss} dismissOnEscape />
+    </>);
+    fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Escape' });
+    expect(dismiss).not.toHaveBeenCalled();
+  });
+
+  it.each(['dialog', 'alertdialog', 'menu', 'listbox', 'morph'])('lets the %s layer handle Escape first', (layer) => {
+    const dismiss = vi.fn();
+    const banner = <ErrorBanner error="error" onRetry={vi.fn()} onCancel={dismiss} dismissOnEscape />;
+    const { rerender } = render(<>
+      {banner}
+      {layer === 'morph' ? <div data-morph-side="bottom" /> : <div role={layer} />}
+    </>);
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(dismiss).not.toHaveBeenCalled();
+    rerender(banner);
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(dismiss).toHaveBeenCalledOnce();
+  });
+
+  // Unit regression: startup account errors need actionable copy, not replyFailed.
+  it.each([
+    ['[SUBSCRIPTION_ACCOUNT_LIMITED] diagnostic', 'limited'],
+    ['[SUBSCRIPTION_ACCOUNT_LOGIN_REQUIRED] diagnostic', 'loginRequired'],
+    ['The task subscription account requires login or quota reset', 'legacy'],
+  ])('localizes subscription startup failure %s', (message, key) => {
+    const error = `LAZY_CREATE_FAILED: ${message}`;
+    render(<ErrorBanner error={error} retryText="original" onRetry={vi.fn()} agentKind="cc" />);
+    expect(screen.getByText(`chat.subscriptionAccountError.${key}`)).toBeTruthy();
+    expect(screen.queryByText(error)).toBeNull();
+  });
+
+  it('localizes the Codex resume preflight marker without exposing the host envelope', () => {
+    const error = `LAZY_CREATE_FAILED: ${CODEX_RESUME_NOT_READY_WIRE_MESSAGE}`;
+    render(
+      <ErrorBanner error={error} retryText="retry this turn" onRetry={vi.fn()} agentKind="codex" />,
+    );
+
+    expect(screen.getByText('chat.errorBanner.codexResumeNotReady')).toBeTruthy();
+    expect(screen.queryByText(error)).toBeNull();
+  });
+
+  it('replaces an unsettled account boundary error with retry guidance', () => {
+    const error =
+      'LAZY_CREATE_FAILED: Ghost skill projection is not stable for the active owner';
+    const onRetry = vi.fn();
+    render(
+      <ErrorBanner error={error} retryText="retry this turn" onRetry={onRetry} agentKind="codex" />,
+    );
+
+    expect(screen.getByText('chat.errorBanner.accountBoundaryPending')).toBeTruthy();
+    expect(screen.queryByText(error)).toBeNull();
+    expect(screen.getByRole('button', { name: 'chat.errorBanner.retry' })).toBeTruthy();
+  });
+
+  it('uses cause-neutral Codex app-server retirement copy and does not suggest switching models', () => {
+    render(
+      <ErrorBanner
+        error="app-server force-retired: Codex desktop auth login"
+        errorReason="app-server-force-retired"
+        retryText="retry this turn"
+        onRetry={vi.fn()}
+        agentKind="codex"
+        modelId="codex/gpt-5.6-sol"
+      />,
+    );
+
+    expect(screen.getByText('chat.errorBanner.codexAppServerRetired')).toBeTruthy();
+    expect(screen.queryByText('chat.errorBanner.codexAppServerRestarted')).toBeNull();
+    expect(screen.queryByText('app-server force-retired: Codex desktop auth login')).toBeNull();
+    expect(screen.getByRole('button', { name: 'chat.errorBanner.retry' })).toBeTruthy();
+  });
+
+  it.each([
+    { label: 'SSH', remoteHostId: 'ssh-1' },
+    { label: 'device-link', deviceLinkDeviceId: 'device-1' },
+  ])(
+    'uses neutral force-retired copy for $label Codex sessions',
+    ({ remoteHostId, deviceLinkDeviceId }) => {
+      render(
+        <ErrorBanner
+          error="app-server force-retired: CodexAgent auth invalidated: remote credentials changed"
+          errorReason="app-server-force-retired"
+          retryText="retry this turn"
+          onRetry={vi.fn()}
+          agentKind="codex"
+          modelId="gpt-5.6-sol"
+          remoteHostId={remoteHostId}
+          deviceLinkDeviceId={deviceLinkDeviceId}
+        />,
+      );
+
+      expect(screen.getByText('chat.errorBanner.codexAppServerRetired')).toBeTruthy();
+      expect(screen.queryByText('chat.errorBanner.codexAppServerRestarted')).toBeNull();
+      expect(screen.getByRole('button', { name: 'chat.errorBanner.retry' })).toBeTruthy();
+    },
+  );
+
+  it('opens ChatGPT App without starting Cindy OAuth for an invalidated system-shared login', async () => {
+    mocks.getState.mockResolvedValue({
+      authenticated: false,
+      errorReason: 'token_revoked',
+      credentialScope: 'system-shared',
+    });
+    render(
+      <ErrorBanner
+        error="token_revoked"
+        retryText="retry this turn"
+        onRetry={vi.fn()}
+        agentKind="codex"
+        modelId="gpt-5.4"
+        providerId="openai"
+      />,
+    );
+
+    expect(await screen.findByText('chatgptAuthRecovery.systemSharedInvalidated')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'chatgptAuthRecovery.openApp' }));
+
+    await waitFor(() => expect(mocks.openChatGPTApp).toHaveBeenCalledOnce());
+    expect(mocks.triggerLogin).not.toHaveBeenCalled();
+    expect(screen.queryByRole('button', { name: 'chat.errorBanner.retry' })).toBeNull();
+  });
+
+  it('keeps the recovery action disabled until the credential source is known', async () => {
+    const initialState = deferred<AuthStateChangedPayload>();
+    mocks.getState.mockImplementationOnce(() => initialState.promise);
+    render(
+      <ErrorBanner
+        error="token_revoked"
+        retryText="retry this turn"
+        onRetry={vi.fn()}
+        agentKind="codex"
+        modelId="gpt-5.4"
+        providerId="openai"
+      />,
+    );
+
+    const checkingButton = screen.getByRole('button', {
+      name: 'chatgptAuthRecovery.checking',
+    }) as HTMLButtonElement;
+    expect(checkingButton.disabled).toBe(true);
+    fireEvent.click(checkingButton);
+    expect(mocks.triggerLogin).not.toHaveBeenCalled();
+    expect(mocks.openChatGPTApp).not.toHaveBeenCalled();
+
+    await act(async () => {
+      initialState.resolve({
+        agentKind: 'codex',
+        authenticated: false,
+        errorReason: 'token_revoked',
+        credentialScope: 'system-shared',
+      });
+      await initialState.promise;
+    });
+    expect(await screen.findByRole('button', { name: 'chatgptAuthRecovery.openApp' })).toBeTruthy();
+  });
+
+  it('does not restore retry on a fresh mount until the replacement account probe succeeds', async () => {
+    const verification = deferred<{ rateLimits: null; resetOffer: null }>();
+    mocks.getState
+      .mockResolvedValueOnce({
+        authenticated: true,
+        identity: 'user@example.com',
+        authSource: 'oauth',
+        credentialScope: 'system-shared',
+        recoveryRequiredReason: 'token_revoked',
+      })
+      .mockResolvedValueOnce({
+        authenticated: true,
+        identity: 'user@example.com',
+        authSource: 'oauth',
+        credentialScope: 'system-shared',
+      });
+    mocks.getCodexRateLimits.mockImplementationOnce(() => verification.promise);
+    render(
+      <ErrorBanner
+        error="token_revoked"
+        retryText="retry this turn"
+        onRetry={vi.fn()}
+        agentKind="codex"
+        modelId="gpt-5.4"
+        providerId="openai"
+      />,
+    );
+
+    expect(await screen.findByText('chatgptAuthRecovery.systemSharedInvalidated')).toBeTruthy();
+    expect(screen.queryByText('chatgptAuthRecovery.recovered')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'chat.errorBanner.retry' })).toBeNull();
+
+    await act(async () => {
+      verification.resolve({ rateLimits: null, resetOffer: null });
+      await verification.promise;
+    });
+    expect(await screen.findByText('chatgptAuthRecovery.recovered')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'chat.errorBanner.retry' })).toBeTruthy();
+  });
+
+  it('opens the ChatGPT App instead of starting Cindy OAuth for system-shared recovery', async () => {
+    mocks.getState.mockResolvedValue({
+      authenticated: false,
+      errorReason: 'token_revoked',
+      credentialScope: 'system-shared',
+    });
+    render(
+      <ErrorBanner
+        error="token_revoked"
+        retryText="retry this turn"
+        onRetry={vi.fn()}
+        agentKind="codex"
+        modelId="gpt-5.4"
+        providerId="openai"
+      />,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: 'chatgptAuthRecovery.openApp' }));
+
+    await waitFor(() => expect(mocks.openChatGPTApp).toHaveBeenCalledOnce());
+    expect(mocks.toastError).not.toHaveBeenCalled();
+    expect(mocks.triggerLogin).not.toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: 'chatgptAuthRecovery.openApp' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'chat.errorBanner.retry' })).toBeNull();
+  });
+
+  it('does not start Cindy OAuth after opening ChatGPT App for system-shared recovery', async () => {
+    mocks.getState.mockResolvedValue({
+      authenticated: false,
+      errorReason: 'token_revoked',
+      credentialScope: 'system-shared',
+    });
+    render(
+      <ErrorBanner
+        error="token_revoked"
+        retryText="retry this turn"
+        onRetry={vi.fn()}
+        agentKind="codex"
+        modelId="gpt-5.4"
+        providerId="openai"
+      />,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: 'chatgptAuthRecovery.openApp' }));
+
+    await waitFor(() => expect(mocks.openChatGPTApp).toHaveBeenCalledOnce());
+    expect(mocks.triggerLogin).not.toHaveBeenCalled();
+    expect(mocks.toastError).not.toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: 'chatgptAuthRecovery.openApp' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'chat.errorBanner.retry' })).toBeNull();
+  });
+
+  it('uses Cindy OAuth for an invalidated instance-isolated login', async () => {
+    mocks.getState.mockResolvedValue({
+      authenticated: false,
+      errorReason: 'token_revoked',
+      credentialScope: 'instance-isolated',
+    });
+    render(
+      <ErrorBanner
+        error="token_revoked"
+        retryText="retry this turn"
+        onRetry={vi.fn()}
+        agentKind="codex"
+        modelId="gpt-5.4"
+        providerId="openai"
+      />,
+    );
+
+    expect(await screen.findByText('chatgptAuthRecovery.instanceIsolatedInvalidated')).toBeTruthy();
+    fireEvent.click(await screen.findByRole('button', { name: 'chatgptAuthRecovery.relogin' }));
+
+    await waitFor(() => expect(mocks.triggerLogin).toHaveBeenCalledOnce());
+    expect(mocks.openChatGPTApp).not.toHaveBeenCalled();
+  });
+
+  it('waits for an explicit inline action and restores retry after success', async () => {
+    const { rerender } = render(
+      <ErrorBanner
+        error="refresh_token_reused"
+        retryText="retry this turn"
+        onRetry={vi.fn()}
+        agentKind="codex"
+        modelId="gpt-5.4"
+        providerId="openai"
+      />,
+    );
+
+    expect(screen.getByText('chatgptAuthRecovery.unknownInvalidated')).toBeTruthy();
+    expect(mocks.confirm).not.toHaveBeenCalled();
+    expect(mocks.triggerLogin).not.toHaveBeenCalled();
+    expect(screen.queryByRole('button', { name: 'chat.errorBanner.retry' })).toBeNull();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'chatgptAuthRecovery.relogin' }));
+
+    await waitFor(() =>
+      expect(mocks.triggerLogin).toHaveBeenCalledWith(
+        'codex',
+        expect.objectContaining({ ownerId: expect.any(String) }),
+      ),
+    );
+    expect(mocks.confirm).not.toHaveBeenCalled();
+    await waitFor(() =>
+      expect(mocks.toastSuccess).toHaveBeenCalledWith('logic.toasts.codexConnected'),
+    );
+    expect(await screen.findByText('chatgptAuthRecovery.recovered')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'chat.errorBanner.retry' })).toBeTruthy();
+
+    act(() => {
+      emitCodexStateChanged({ authenticated: false, errorReason: 'token_invalidated' });
+      rerender(
+        <ErrorBanner
+          error="token_invalidated"
+          retryText="retry another turn"
+          onRetry={vi.fn()}
+          agentKind="codex"
+          modelId="gpt-5.4"
+          providerId="openai"
+        />,
+      );
+    });
+    expect(screen.getByText('chatgptAuthRecovery.unknownInvalidated')).toBeTruthy();
+    expect(screen.queryByText('chatgptAuthRecovery.recovered')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'chat.errorBanner.retry' })).toBeNull();
+  });
+
+  it('keeps the reconnect action after user cancellation without showing an error toast', async () => {
+    mocks.triggerLogin.mockResolvedValue({
+      authenticated: false,
+      errorReason: 'login_cancelled',
+    });
+    render(
+      <ErrorBanner
+        error="token_revoked"
+        retryText="retry this turn"
+        onRetry={vi.fn()}
+        agentKind="codex"
+        modelId="gpt-5.4"
+      />,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: 'chatgptAuthRecovery.relogin' }));
+
+    await waitFor(() =>
+      expect(mocks.triggerLogin).toHaveBeenCalledWith(
+        'codex',
+        expect.objectContaining({ ownerId: expect.any(String) }),
+      ),
+    );
+    expect(mocks.toastError).not.toHaveBeenCalled();
+    expect(screen.getByText('chatgptAuthRecovery.unknownInvalidated')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'chatgptAuthRecovery.relogin' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'chat.errorBanner.retry' })).toBeNull();
+  });
+
+  it('keeps the reconnect action and shows actionable copy after timeout', async () => {
+    mocks.triggerLogin.mockResolvedValue({
+      authenticated: false,
+      errorReason: 'login_timeout',
+    });
+    render(
+      <ErrorBanner
+        error="token_invalidated"
+        retryText="retry this turn"
+        onRetry={vi.fn()}
+        agentKind="codex"
+        modelId="gpt-5.4"
+      />,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: 'chatgptAuthRecovery.relogin' }));
+
+    await waitFor(() => {
+      expect(mocks.toastError).toHaveBeenCalledWith('settings.connections.codex.toast.loginFailed');
+    });
+    expect(screen.getByText('chatgptAuthRecovery.unknownInvalidated')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'chatgptAuthRecovery.relogin' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'chat.errorBanner.retry' })).toBeNull();
+  });
+
+  it('uses the same inline recovery for Claude models backed by ChatGPT', async () => {
+    render(
+      <ErrorBanner
+        error="bridge auth unavailable for chatgpt/ (subscription login may have expired)"
+        retryText="retry this turn"
+        onRetry={vi.fn()}
+        agentKind="cc"
+        modelId="chatgpt/gpt-5.4"
+      />,
+    );
+
+    expect(screen.getByText('chatgptAuthRecovery.unknownInvalidated')).toBeTruthy();
+    expect(mocks.confirm).not.toHaveBeenCalled();
+    fireEvent.click(await screen.findByRole('button', { name: 'chatgptAuthRecovery.relogin' }));
+
+    await waitFor(() =>
+      expect(mocks.triggerLogin).toHaveBeenCalledWith(
+        'codex',
+        expect.objectContaining({ ownerId: expect.any(String) }),
+      ),
+    );
+    expect(await screen.findByText('chatgptAuthRecovery.recovered')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'chat.errorBanner.retry' })).toBeTruthy();
+  });
+
+  it('classifies the wrapped thread/resume refresh-token failure as reconnect, not retry', async () => {
+    render(
+      <ErrorBanner
+        error="LAZY_CREATE_FAILED: Failed to resume Codex thread: Error: codex app-server thread/resume error -32600: failed to load configuration: Your access token could not be refreshed because your refresh token was revoked. Please log out and sign in again."
+        retryText="retry this turn"
+        onRetry={vi.fn()}
+        agentKind="codex"
+        modelId="gpt-5.4"
+        providerId="openai"
+      />,
+    );
+
+    expect(screen.getByText('chatgptAuthRecovery.unknownInvalidated')).toBeTruthy();
+    expect(await screen.findByRole('button', { name: 'chatgptAuthRecovery.relogin' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'chat.errorBanner.retry' })).toBeNull();
+  });
+
+  it('does not classify a non-OpenAI provider error as ChatGPT reconnect', () => {
+    render(
+      <ErrorBanner
+        error="token_revoked"
+        retryText="retry this turn"
+        onRetry={vi.fn()}
+        agentKind="codex"
+        modelId="xai/grok-4"
+        providerId="xai"
+      />,
+    );
+
+    expect(screen.getByText('chat.errorBanner.replyFailed')).toBeTruthy();
+    expect(screen.queryByText('token_revoked')).toBeNull();
+    fireEvent.click(screen.getByText('chat.errorBanner.networkShowRaw'));
+    expect(screen.getByText('token_revoked')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'chatgptAuthRecovery.relogin' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'chat.errorBanner.retry' })).toBeTruthy();
+    expect(mocks.getState).not.toHaveBeenCalled();
+    expect(mocks.stateChangedListeners.size).toBe(0);
+  });
+
+  it('does not redirect an explicit custom provider OAuth failure to ChatGPT reconnect', () => {
+    render(
+      <ErrorBanner
+        error="token_revoked"
+        retryText="retry this turn"
+        onRetry={vi.fn()}
+        agentKind="codex"
+        modelId="custom-model"
+        providerId="custom-oauth"
+      />,
+    );
+
+    expect(screen.getByText('chat.errorBanner.replyFailed')).toBeTruthy();
+    expect(screen.queryByText('token_revoked')).toBeNull();
+    fireEvent.click(screen.getByText('chat.errorBanner.networkShowRaw'));
+    expect(screen.getByText('token_revoked')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'chatgptAuthRecovery.relogin' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'chat.errorBanner.retry' })).toBeTruthy();
+    expect(mocks.getState).not.toHaveBeenCalled();
+    expect(mocks.stateChangedListeners.size).toBe(0);
+  });
+
+  it.each([
+    {
+      label: 'device-link Codex',
+      agentKind: 'codex' as const,
+      error: 'token_invalidated',
+      modelId: 'gpt-5.4',
+      providerId: 'openai',
+      deviceLinkDeviceId: 'device-1',
+    },
+    {
+      label: 'device-link Claude ChatGPT bridge',
+      agentKind: 'cc' as const,
+      error: 'bridge auth unavailable for chatgpt/ (subscription login may have expired)',
+      modelId: 'chatgpt/gpt-5.4',
+      providerId: 'openai',
+      deviceLinkDeviceId: 'device-1',
+    },
+    {
+      label: 'SSH Claude ChatGPT bridge',
+      agentKind: 'cc' as const,
+      error: 'bridge auth unavailable for chatgpt/ (subscription login may have expired)',
+      modelId: 'chatgpt/gpt-5.4',
+      providerId: 'openai',
+      remoteHostId: 'ssh-1',
+    },
+  ])('does not reconnect the controller for a $label failure', (props) => {
+    render(<ErrorBanner {...props} retryText="retry this turn" onRetry={vi.fn()} />);
+
+    expect(screen.getByText('chat.errorBanner.replyFailed')).toBeTruthy();
+    expect(screen.queryByText(props.error)).toBeNull();
+    fireEvent.click(screen.getByText('chat.errorBanner.networkShowRaw'));
+    expect(screen.getByText(props.error)).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'chatgptAuthRecovery.relogin' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'chat.errorBanner.retry' })).toBeTruthy();
+    expect(mocks.getState).not.toHaveBeenCalled();
+    expect(mocks.stateChangedListeners.size).toBe(0);
+    if (props.agentKind === 'codex') {
+      expect(mocks.runtimeRoute).toHaveBeenLastCalledWith({ enabled: false });
+    }
+  });
+
+  it('restores retry after reconnect succeeds from the settings auth hook', async () => {
+    const settingsAuth = renderHook(() => useCodexAuth());
+    render(
+      <ErrorBanner
+        error="refresh_token_reused"
+        retryText="retry this turn"
+        onRetry={vi.fn()}
+        agentKind="codex"
+        modelId="gpt-5.4"
+      />,
+    );
+
+    await waitFor(() => expect(settingsAuth.result.current.state.kind).toBe('reconnect-required'));
+    expect(screen.getByText('chatgptAuthRecovery.unknownInvalidated')).toBeTruthy();
+    expect(mocks.triggerLogin).not.toHaveBeenCalled();
+
+    await act(async () => {
+      await expect(settingsAuth.result.current.triggerLogin()).resolves.toBe('authenticated');
+    });
+
+    expect(await screen.findByText('chatgptAuthRecovery.recovered')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'chat.errorBanner.retry' })).toBeTruthy();
+    expect(mocks.triggerLogin).toHaveBeenCalledOnce();
+  });
+
+  it('does not reuse recovered state after auth observation was disabled by another error', async () => {
+    const refreshedState = deferred<AuthStateChangedPayload>();
+    mocks.getState
+      .mockResolvedValueOnce({
+        authenticated: true,
+        identity: 'user@example.com',
+        authSource: 'oauth',
+      })
+      .mockResolvedValueOnce({
+        authenticated: true,
+        identity: 'user@example.com',
+        authSource: 'oauth',
+      })
+      .mockImplementationOnce(() => refreshedState.promise);
+    const { rerender } = render(
+      <ErrorBanner
+        error="refresh_token_reused"
+        retryText="retry this turn"
+        onRetry={vi.fn()}
+        agentKind="codex"
+        modelId="gpt-5.4"
+      />,
+    );
+
+    expect(await screen.findByText('chatgptAuthRecovery.recovered')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'chat.errorBanner.retry' })).toBeTruthy();
+
+    rerender(
+      <ErrorBanner
+        error="unrelated failure"
+        retryText="retry this turn"
+        onRetry={vi.fn()}
+        agentKind="codex"
+        modelId="gpt-5.4"
+      />,
+    );
+    expect(mocks.stateChangedListeners.size).toBe(0);
+    emitCodexStateChanged({ authenticated: false, errorReason: 'token_revoked' });
+
+    rerender(
+      <ErrorBanner
+        error="token_revoked"
+        retryText="retry another turn"
+        onRetry={vi.fn()}
+        agentKind="codex"
+        modelId="gpt-5.4"
+      />,
+    );
+
+    expect(screen.getByText('chatgptAuthRecovery.unknownInvalidated')).toBeTruthy();
+    expect(screen.queryByText('chatgptAuthRecovery.recovered')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'chat.errorBanner.retry' })).toBeNull();
+
+    await act(async () => {
+      refreshedState.resolve({
+        agentKind: 'codex',
+        authenticated: false,
+        errorReason: 'token_revoked',
+      });
+      await refreshedState.promise;
+    });
+    expect(screen.getByText('chatgptAuthRecovery.unknownInvalidated')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'chat.errorBanner.retry' })).toBeNull();
+  });
+
+  it('joins an OAuth flow already started from the settings auth hook', async () => {
+    const login = deferred<{ authenticated: boolean; authSource: 'oauth' }>();
+    mocks.triggerLogin.mockImplementation(() => login.promise);
+    const settingsAuth = renderHook(() => useCodexAuth());
+    await waitFor(() => expect(settingsAuth.result.current.state.kind).toBe('reconnect-required'));
+
+    let settingsOutcome!: ReturnType<typeof settingsAuth.result.current.triggerLogin>;
+    act(() => {
+      settingsOutcome = settingsAuth.result.current.triggerLogin();
+    });
+
+    render(
+      <ErrorBanner
+        error="refresh_token_reused"
+        retryText="retry this turn"
+        onRetry={vi.fn()}
+        agentKind="codex"
+        modelId="gpt-5.4"
+      />,
+    );
+    fireEvent.click(await screen.findByRole('button', { name: 'chatgptAuthRecovery.relogin' }));
+
+    await waitFor(() => expect(mocks.triggerLogin).toHaveBeenCalledOnce());
+    await act(async () => {
+      mocks.getState.mockResolvedValue({ authenticated: true, authSource: 'oauth' });
+      emitCodexStateChanged({ authenticated: true, authSource: 'oauth' });
+      login.resolve({ authenticated: true, authSource: 'oauth' });
+      await expect(settingsOutcome).resolves.toBe('authenticated');
+    });
+
+    expect(await screen.findByText('chatgptAuthRecovery.recovered')).toBeTruthy();
+    expect(mocks.triggerLogin).toHaveBeenCalledWith(
+      'codex',
+      expect.objectContaining({ ownerId: expect.any(String) }),
+    );
+  });
+
+  it('cancels an owned reconnect when its prompt owner unmounts', async () => {
+    const login = deferred<AuthStateChangedPayload>();
+    mocks.triggerLogin.mockImplementation(() => login.promise);
+    const prompt = renderHook(() => useCodexSessionExpiredPrompt({ confirmBeforeLogin: false }));
+
+    act(() => {
+      expect(prompt.result.current('token_revoked')).toBe(true);
+    });
+    await waitFor(() =>
+      expect(mocks.triggerLogin).toHaveBeenCalledWith(
+        'codex',
+        expect.objectContaining({ ownerId: expect.any(String) }),
+      ),
+    );
+
+    prompt.unmount();
+    expect(mocks.cancelLogin).toHaveBeenCalledOnce();
+    expect(mocks.cancelLogin).toHaveBeenCalledWith('codex', {
+      releaseOwner: true,
+      ownerId: expect.any(String),
+    });
+
+    await act(async () => {
+      login.resolve({
+        agentKind: 'codex',
+        authenticated: false,
+        errorReason: 'login_cancelled',
+      });
+      await login.promise;
+    });
+  });
+
+  it('does not start reconnect after unmount while confirmation is pending', async () => {
+    const confirmation = deferred<boolean>();
+    mocks.confirm.mockImplementationOnce(() => confirmation.promise);
+    const prompt = renderHook(() => useCodexSessionExpiredPrompt());
+
+    act(() => {
+      expect(prompt.result.current('token_revoked')).toBe(true);
+    });
+    await waitFor(() => expect(mocks.confirm).toHaveBeenCalledOnce());
+
+    prompt.unmount();
+    await act(async () => {
+      confirmation.resolve(true);
+      await confirmation.promise;
+    });
+
+    expect(mocks.triggerLogin).not.toHaveBeenCalled();
+    expect(mocks.cancelLogin).not.toHaveBeenCalled();
+  });
+
+  it('uses the existing single confirmation before opening ChatGPT App for voice recovery', async () => {
+    mocks.getState.mockResolvedValue({
+      authenticated: false,
+      errorReason: 'token_revoked',
+      credentialScope: 'system-shared',
+    });
+    const prompt = renderHook(() => useCodexSessionExpiredPrompt());
+
+    act(() => {
+      expect(prompt.result.current('token_revoked')).toBe(true);
+    });
+
+    await waitFor(() =>
+      expect(mocks.confirmThree).toHaveBeenCalledWith({
+        title: 'chatgptAuthRecovery.title',
+        description: 'chatgptAuthRecovery.systemSharedInvalidated',
+        confirmText: 'chatgptAuthRecovery.openApp',
+        tertiaryText: 'chatgptAuthRecovery.relogin',
+        cancelText: 'chatgptAuthRecovery.later',
+        maxWidth: 520,
+        autoFocusConfirm: true,
+      }),
+    );
+    await waitFor(() => expect(mocks.openChatGPTApp).toHaveBeenCalledOnce());
+    expect(mocks.triggerLogin).not.toHaveBeenCalled();
+  });
+
+  it('cleans the inline lease so the same voice error can recover again', async () => {
+    mocks.getState.mockResolvedValue({
+      authenticated: false,
+      errorReason: 'token_revoked',
+      credentialScope: 'system-shared',
+    });
+    const onInlineRecoveryRequired = vi.fn();
+    const onPromptClosed = vi.fn();
+    const prompt = renderHook(() => useCodexSessionExpiredPrompt({
+      onInlineRecoveryRequired,
+      onPromptClosed,
+    }));
+
+    act(() => {
+      expect(prompt.result.current('token_revoked')).toBe(true);
+    });
+
+    await waitFor(() =>
+      expect(onInlineRecoveryRequired).toHaveBeenCalledWith('token_revoked', 'system-shared'),
+    );
+    expect(onPromptClosed).toHaveBeenCalledOnce();
+
+    act(() => {
+      expect(prompt.result.current('token_revoked')).toBe(true);
+    });
+    await waitFor(() => expect(onInlineRecoveryRequired).toHaveBeenCalledTimes(2));
+    expect(onPromptClosed).toHaveBeenCalledTimes(2);
+    expect(mocks.confirm).not.toHaveBeenCalled();
+    expect(mocks.confirmThree).not.toHaveBeenCalled();
+    expect(mocks.openChatGPTApp).not.toHaveBeenCalled();
+  });
+
+  it('offers only the ChatGPT App when dev policy blocks OAuth writes', async () => {
+    mocks.getState.mockResolvedValue({
+      authenticated: false,
+      errorReason: 'token_revoked',
+      credentialScope: 'system-shared',
+      oauthWritesBlocked: true,
+    });
+    const prompt = renderHook(() => useCodexSessionExpiredPrompt());
+
+    act(() => {
+      expect(prompt.result.current('token_revoked')).toBe(true);
+    });
+
+    await waitFor(() => expect(mocks.openChatGPTApp).toHaveBeenCalledOnce());
+    expect(mocks.triggerLogin).not.toHaveBeenCalled();
+  });
+
+  it('starts Cindy login when an authenticated system-shared hint cannot be verified', async () => {
+    mocks.getState.mockResolvedValue({
+      authenticated: true,
+      identity: 'user@example.com',
+      authSource: 'oauth',
+      credentialScope: 'system-shared',
+    });
+    mocks.getCodexRateLimits.mockRejectedValueOnce(new Error('network unavailable'));
+    const prompt = renderHook(() => useCodexSessionExpiredPrompt());
+
+    act(() => {
+      expect(prompt.result.current('token_revoked')).toBe(true);
+    });
+
+    await waitFor(() =>
+      expect(mocks.confirmThree).toHaveBeenCalledWith({
+        title: 'chatgptAuthRecovery.title',
+        description: 'chatgptAuthRecovery.systemSharedInvalidated',
+        confirmText: 'chatgptAuthRecovery.openApp',
+        tertiaryText: 'chatgptAuthRecovery.relogin',
+        cancelText: 'chatgptAuthRecovery.later',
+        maxWidth: 520,
+        autoFocusConfirm: true,
+      }),
+    );
+    await waitFor(() => expect(mocks.openChatGPTApp).toHaveBeenCalledOnce());
+    expect(mocks.triggerLogin).not.toHaveBeenCalled();
+  });
+
+  it('localizes event-loop terminal errors from the stable reason key', () => {
+    render(
+      <ErrorBanner
+        error="Session event loop stopped unexpectedly without a terminal event"
+        errorReason="session_event_loop_crashed"
+        retryText="retry this turn"
+        onRetry={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText('logic.errors.turnFailed')).toBeTruthy();
+    expect(
+      screen.queryByText('Session event loop stopped unexpectedly without a terminal event'),
+    ).toBeNull();
+  });
+
+  it('localizes tool-loop terminal errors and keeps guard details out of the copy', () => {
+    render(
+      <ErrorBanner
+        error="tool_use_loop_detected: missing_required_field"
+        errorReason="tool_use_loop_detected"
+        toolLoop={{ kind: 'contract', count: 3 }}
+        retryText="retry this turn"
+        onRetry={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText('logic.errors.toolUseLoopDetectedWithCount')).toBeTruthy();
+    expect(screen.queryByText('tool_use_loop_detected: missing_required_field')).toBeNull();
+  });
+
+  it('describes a detection-window loop count instead of calling it failures', () => {
+    render(
+      <ErrorBanner
+        error="tool_use_loop_detected: pingpong"
+        errorReason="tool_use_loop_detected"
+        toolLoop={{ kind: 'pingpong', count: 12 }}
+        retryText="retry this turn"
+        onRetry={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText('logic.errors.toolUseLoopDetectedPingPongWithCount')).toBeTruthy();
+    expect(screen.queryByText('logic.errors.toolUseLoopDetectedWithCount')).toBeNull();
+  });
+
+  it('shows the automatic continuation time and a cancel action only while waiting', () => {
+    const onCancelUsageLimitWait = vi.fn();
+    const { rerender } = render(
+      <ErrorBanner
+        error="usageLimitExceeded"
+        retryText="retry this turn"
+        onRetry={vi.fn()}
+        agentKind="codex"
+        usageLimitWait={{ resumeAt: Date.now() + 60 * 60 * 1000 }}
+        onCancelUsageLimitWait={onCancelUsageLimitWait}
+        usageLimitRecovery={{ resetAtMs: null, isAccountUsageLimit: true }}
+      />,
+    );
+
+    expect(screen.getByText('chat.errorBanner.codexUsageLimit')).toBeTruthy();
+    expect(screen.getByText('chat.errorBanner.usageLimitAutoContinueAt')).toBeTruthy();
+    // 等待期间手动重试仍可用。
+    expect(screen.getByRole('button', { name: 'chat.errorBanner.retry' })).toBeTruthy();
+    fireEvent.click(
+      screen.getByRole('button', { name: 'chat.errorBanner.usageLimitAutoContinueCancel' }),
+    );
+    expect(onCancelUsageLimitWait).toHaveBeenCalledOnce();
+
+    rerender(
+      <ErrorBanner
+        error="usageLimitExceeded"
+        retryText="retry this turn"
+        onRetry={vi.fn()}
+        agentKind="codex"
+        usageLimitWait={null}
+        onCancelUsageLimitWait={onCancelUsageLimitWait}
+      />,
+    );
+    expect(screen.queryByText('chat.errorBanner.usageLimitAutoContinueAt')).toBeNull();
+    expect(
+      screen.queryByRole('button', { name: 'chat.errorBanner.usageLimitAutoContinueCancel' }),
+    ).toBeNull();
+  });
+
+  // model-groups.md §6.1：换来源继续只在用户点了、且真的换成了之后才走原有的重试；取消确认则什么都不动。
+  it.each([[true, 1], [false, 0]] as const)('retries through the existing path only after a model group switch applied=%s', async (applied, retries) => {
+    const retry = vi.fn();
+    const onSwitch = vi.fn(async () => applied);
+    render(<ErrorBanner error="usageLimitExceeded" retryText="retry this turn" onRetry={retry} agentKind="cc"
+      usageLimitWait={{ resumeAt: Date.now() + 60 * 60 * 1000 }} onCancelUsageLimitWait={vi.fn()}
+      usageLimitRecovery={{ resetAtMs: null, isAccountUsageLimit: true }}
+      modelGroupSwitch={{ label: 'modelGroups.switchOffer.action', onSwitch }} />);
+    await act(async () => fireEvent.click(screen.getByRole('button', { name: 'modelGroups.switchOffer.action' })));
+    expect(onSwitch).toHaveBeenCalledOnce();
+    expect(retry).toHaveBeenCalledTimes(retries);
+    if (retries) expect(retry).toHaveBeenCalledWith('retry this turn');
+    expect(screen.getByText('chat.errorBanner.usageLimitAutoContinueAt')).toBeTruthy();
+  });
+
+  it('offers a confirmed reset at a local ChatGPT limit without retrying the turn', async () => {
+    const key = '00000000-0000-4000-8000-000000000001';
+    mocks.getCodexRateLimits.mockResolvedValue({
+      account: { email: 'te***@example.test', accountId: '…123456', planType: 'plus' },
+      rateLimits: { primary: { usedPercent: 100 } }, rateLimitsByLimitId: null,
+      rateLimitResetCredits: { availableCount: 2, credits: null },
+      resetOffer: { idempotencyKey: key, expiresAt: null, validUntil: Date.now() + 60_000 },
+    });
+    const retry = vi.fn();
+    render(<ErrorBanner error="usageLimitExceeded" retryText="retry this turn" onRetry={retry}
+      agentKind="codex" providerId="openai" usageLimitRecovery={{ resetAtMs: null, isAccountUsageLimit: true }} />);
+    const action = await screen.findByRole('button', { name: 'codexResets.limitAction' });
+    expect(mocks.consumeReset).not.toHaveBeenCalled();
+    await act(async () => fireEvent.click(action));
+    expect(mocks.consumeReset).toHaveBeenCalledExactlyOnceWith(key, 'openai');
+    expect(retry).not.toHaveBeenCalled();
+  });
+
+  it.each([{ remoteHostId: 'ssh-host' }, { deviceLinkDeviceId: 'other-device' }, { agentDeviceId: 'agent-device' }])(
+    'does not offer local reset credits in a remote task %j', async (remote) => {
+      render(<ErrorBanner error="usageLimitExceeded" retryText="retry this turn" onRetry={vi.fn()}
+        agentKind="codex" providerId="openai" usageLimitRecovery={{ resetAtMs: null, isAccountUsageLimit: true }} {...remote} />);
+      await act(async () => {});
+      expect(screen.queryByRole('button', { name: 'codexResets.limitAction' })).toBeNull();
+      expect(mocks.getCodexRateLimits).not.toHaveBeenCalled();
+    },
+  );
+
+  // Unit regression: a pending switch still has the previous local route in its projection.
+  // Group quota exhaustion must not offer spending a reset card on that unrelated account.
+  it('keeps group quota waits without reading the previous local account reset credits', async () => {
+    render(<ErrorBanner error="[REMOTE_AGENT_GROUP_USAGE_LIMIT] usage_limit_reached"
+      retryText="retry this turn" onRetry={vi.fn()} agentKind="codex" providerId="openai"
+      usageLimitRecovery={{ resetAtMs: null, isAccountUsageLimit: true }}
+      usageLimitWait={{ resumeAt: Date.now() + 60 * 60 * 1000 }} onCancelUsageLimitWait={vi.fn()} />);
+    await act(async () => {});
+    expect(screen.getByText('chat.remoteError.REMOTE_AGENT_GROUP_USAGE_LIMIT')).toBeTruthy();
+    expect(screen.getByText('chat.errorBanner.usageLimitAutoContinueAt')).toBeTruthy();
+    expect(mocks.getCodexRateLimits).not.toHaveBeenCalled();
+    expect(screen.queryByRole('button', { name: 'codexResets.limitAction' })).toBeNull();
+  });
+
+  it('explains an organization Codex limit and keeps the raw 429 response available', () => {
+    const rawError =
+      'API Error: Request rejected (429) · {"error":{"type":"usage_limit_reached","plan_type":"business","resets_at":1788220709}}';
+    render(
+      <ErrorBanner
+        error={rawError}
+        retryText="retry this turn"
+        onRetry={vi.fn()}
+        agentKind="codex"
+        usageLimitRecovery={{
+          resetAtMs: Date.parse('2026-08-31T23:58:29.000Z'),
+          isAccountUsageLimit: true,
+          planType: 'business',
+        }}
+      />,
+    );
+
+    expect(screen.getByText('chat.errorBanner.codexOrganizationUsageLimitWithReset')).toBeTruthy();
+    expect(screen.queryByText(rawError)).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: 'chat.errorBanner.networkShowRaw' }));
+    expect(screen.getByText(rawError)).toBeTruthy();
+  });
+
+  it('falls back to the no-reset-time copy for an out-of-range reset timestamp', () => {
+    render(
+      <ErrorBanner
+        error="usageLimitExceeded"
+        retryText="retry this turn"
+        onRetry={vi.fn()}
+        agentKind="codex"
+        usageLimitRecovery={{
+          resetAtMs: Number.MAX_VALUE,
+          isAccountUsageLimit: true,
+          planType: 'business',
+        }}
+      />,
+    );
+
+    expect(screen.getByText('chat.errorBanner.codexOrganizationUsageLimit')).toBeTruthy();
+    expect(screen.queryByText('chat.errorBanner.codexOrganizationUsageLimitWithReset')).toBeNull();
+  });
+
+  it('keeps a transient Codex 429 on its normal rate-limit path', () => {
+    const rawError = 'Too many requests (429)';
+    render(
+      <ErrorBanner
+        error={rawError}
+        retryText="retry this turn"
+        onRetry={vi.fn()}
+        agentKind="codex"
+        usageLimitRecovery={{ resetAtMs: null }}
+      />,
+    );
+
+    expect(screen.getByText('chat.errorBanner.replyFailed')).toBeTruthy();
+    expect(screen.queryByText(rawError)).toBeNull();
+    fireEvent.click(screen.getByText('chat.errorBanner.networkShowRaw'));
+    expect(screen.getByText(rawError)).toBeTruthy();
+    expect(screen.queryByText('chat.errorBanner.codexUsageLimit')).toBeNull();
+  });
+
+  it('rebuilds the organization usage-limit hint for a persisted error tail', () => {
+    const rawError =
+      'API Error: Request rejected (429) · {"error":{"type":"usage_limit_reached","plan_type":"business"}}';
+    render(
+      <ErrorTailErrorBanner
+        errorText={rawError}
+        onContinue={vi.fn()}
+        onDismiss={vi.fn()}
+        agentKind="codex"
+      />,
+    );
+
+    expect(screen.getByText('chat.errorBanner.codexOrganizationUsageLimit')).toBeTruthy();
+    expect(screen.queryByText(rawError)).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: 'chat.errorBanner.networkShowRaw' }));
+    expect(screen.getByText(rawError)).toBeTruthy();
+  });
+
+  it('does not relabel another agent usage limit as a Codex account limit', () => {
+    render(
+      <ErrorBanner
+        error="You've hit your Claude session limit"
+        retryText="retry this turn"
+        onRetry={vi.fn()}
+        agentKind="cc"
+        usageLimitRecovery={{ resetAtMs: null }}
+      />,
+    );
+
+    expect(screen.getByText('chat.errorBanner.replyFailed')).toBeTruthy();
+    expect(screen.queryByText("You've hit your Claude session limit")).toBeNull();
+    fireEvent.click(screen.getByText('chat.errorBanner.networkShowRaw'));
+    expect(screen.getByText("You've hit your Claude session limit")).toBeTruthy();
+    expect(screen.queryByText('chat.errorBanner.codexUsageLimit')).toBeNull();
+  });
+
+  it('replaces the misleading Claude Pro error with its XD Gateway attribution', () => {
+    render(
+      <ErrorBanner
+        error="Claude Opus is not available with the Claude Pro plan. Run /logout and /login."
+        errorReason={CLAUDE_GATEWAY_OPUS_PLAN_MISMATCH_REASON}
+        retryText="retry this turn"
+        onRetry={vi.fn()}
+        agentKind="cc"
+        modelId="claude-opus-5"
+      />,
+    );
+
+    expect(screen.getByText('chat.errorBanner.claudeGatewayOpusPlanMismatch')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'chat.errorBanner.retry' })).toBeNull();
+    expect(
+      screen.queryByRole('button', { name: 'chat.errorBanner.switchClaudeSubscription' }),
+    ).toBeNull();
+  });
+
+  it('replaces unsupported Claude slash-command advice for subscription errors', () => {
+    render(
+      <ErrorBanner
+        error="Claude Opus is not available with the Claude Pro plan. Run /logout and /login."
+        errorReason={CLAUDE_SUBSCRIPTION_OPUS_PLAN_MISMATCH_REASON}
+        retryText="retry this turn"
+        onRetry={vi.fn()}
+        agentKind="cc"
+        modelId="claude-opus-5"
+      />,
+    );
+
+    expect(screen.getByText('chat.errorBanner.claudeSubscriptionOpusPlanMismatch')).toBeTruthy();
+    expect(screen.queryByText(/logout|login/i)).toBeNull();
+    expect(screen.getByRole('button', { name: 'chat.errorBanner.retry' })).toBeTruthy();
+  });
+
+  it('switches the conversation to Claude.ai through the explicit recovery action', async () => {
+    const switching = deferred<void>();
+    const onSwitchToClaudeSubscription = vi.fn(() => switching.promise);
+    render(
+      <ErrorBanner
+        error="Claude Opus is not available with the Claude Pro plan."
+        errorReason={CLAUDE_GATEWAY_OPUS_PLAN_MISMATCH_REASON}
+        retryText="retry this turn"
+        onRetry={vi.fn()}
+        onSwitchToClaudeSubscription={onSwitchToClaudeSubscription}
+        agentKind="cc"
+        modelId="claude-opus-5"
+      />,
+    );
+
+    fireEvent.click(
+      screen.getByRole('button', { name: 'chat.errorBanner.switchClaudeSubscription' }),
+    );
+    expect(onSwitchToClaudeSubscription).toHaveBeenCalledOnce();
+    expect(
+      (
+        screen.getByRole('button', {
+          name: 'chat.errorBanner.switchingClaudeSubscription',
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true);
+
+    await act(async () => {
+      switching.resolve();
+      await switching.promise;
+    });
+    expect(
+      (
+        screen.getByRole('button', {
+          name: 'chat.errorBanner.switchClaudeSubscription',
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(false);
+  });
+
+  it('restores the Claude.ai recovery action when switching fails', async () => {
+    const onSwitchToClaudeSubscription = vi.fn(async () => {
+      throw new Error('route update failed');
+    });
+    render(
+      <ErrorBanner
+        error="Claude Opus is not available with the Claude Pro plan."
+        errorReason={CLAUDE_GATEWAY_OPUS_PLAN_MISMATCH_REASON}
+        retryText="retry this turn"
+        onRetry={vi.fn()}
+        onSwitchToClaudeSubscription={onSwitchToClaudeSubscription}
+        agentKind="cc"
+        modelId="claude-opus-5"
+      />,
+    );
+
+    fireEvent.click(
+      screen.getByRole('button', { name: 'chat.errorBanner.switchClaudeSubscription' }),
+    );
+
+    await waitFor(() =>
+      expect(mocks.toastError).toHaveBeenCalledWith(
+        'chat.errorBanner.claudeSubscriptionSwitchFailed',
+      ),
+    );
+    expect(
+      (
+        screen.getByRole('button', {
+          name: 'chat.errorBanner.switchClaudeSubscription',
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(false);
+  });
+
+  it('shows model access guidance instead of authentication advice for a custom provider', () => {
+    render(<ErrorBanner
+      error="Failed to authenticate. API Error: 403 user not allowed to access model"
+      errorReason="user_model_access_denied"
+      agentKind="cc"
+      providerId="custom-provider"
+      modelId="claude-opus-5"
+      retryText="retry after changing access"
+      onRetry={vi.fn()}
+    />);
+    expect(screen.getByText('chat.errorBanner.modelAccessDenied')).toBeTruthy();
+    expect(screen.queryByText(/Failed to authenticate/)).toBeNull();
+  });
+});
+
+
+describe('output-limit guidance', () => {
+  it.each([131064, 1000])('renders reasoning-aware usage and guidance (%s)', (reasoningTokens) => {
+    render(<ErrorBanner error="limit" errorReason="output-limit" outputLimit={{ outputTokens: 131072, reasoningTokens }} onRetry={vi.fn()} />);
+    const expected = reasoningTokens === 131064 ? 'logic.errors.outputLimitReasoning' : 'logic.errors.outputLimit';
+    expect(screen.getByText(`logic.errors.outputLimitUsage ${expected}`)).toBeTruthy();
+  });
+});

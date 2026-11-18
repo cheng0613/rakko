@@ -1,0 +1,5954 @@
+import { EventEmitter } from 'node:events';
+import path from 'node:path';
+import os from 'node:os';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { app, powerMonitor } from 'electron';
+import { PassThrough } from 'node:stream';
+import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from 'vitest';
+import { BRAND_NAME } from '@cindy/maker-shared/branding';
+import { COMPUTER_TOOLS } from '@cindy/mcps/computer';
+import { readForRecovery } from '../../../../../../packages/lizi-mcps/src/computer/recovery';
+import { HumanDesktopInput, HUMAN_INPUT_QUIET_MS } from '../../remote-desktop/inputOwnership';
+import * as inputOwnership from '../../remote-desktop/inputOwnership';
+import { runPluginHostToolCall } from '../hostToolCaller.js';
+
+const {
+  existsSyncMock,
+  readlinkSyncMock,
+  spawnMock,
+  mcpCallToolMock,
+  mcpCloseMock,
+  mcpConnectMock,
+  mcpListToolsMock,
+  transportCloseMock,
+  transportCtorMock,
+  resolveDesktopOutboundProxyMock,
+} = vi.hoisted(() => ({
+  existsSyncMock: vi.fn(),
+  readlinkSyncMock: vi.fn(),
+  spawnMock: vi.fn(),
+  mcpCallToolMock: vi.fn(),
+  mcpCloseMock: vi.fn(),
+  mcpConnectMock: vi.fn(),
+  mcpListToolsMock: vi.fn(),
+  transportCloseMock: vi.fn(),
+  transportCtorMock: vi.fn(),
+  resolveDesktopOutboundProxyMock: vi.fn(),
+}));
+
+const originalPlatform = process.platform;
+const driverResolutionEnvKeys = [
+  'XDT_CUA_DRIVER_PATH',
+  'LOCALAPPDATA',
+  'LocalAppData',
+  'HTTPS_PROXY',
+  'https_proxy',
+  'HTTP_PROXY',
+  'http_proxy',
+  'ALL_PROXY',
+  'all_proxy',
+  'NO_PROXY',
+  'no_proxy',
+] as const;
+const originalDriverResolutionEnv = new Map<string, string | undefined>(
+  driverResolutionEnvKeys.map((key) => [key, process.env[key]]),
+);
+
+function setPlatform(platform: NodeJS.Platform): void {
+  Object.defineProperty(process, 'platform', {
+    value: platform,
+    configurable: true,
+  });
+}
+
+vi.mock('../../input-handoff/macDriver.js', () => ({ isSecureInputTarget: vi.fn(async () => false) }));
+
+vi.mock('node:child_process', () => ({
+  spawn: spawnMock,
+}));
+
+vi.mock('node:fs', async () => {
+  const actual = await vi.importActual<typeof import('node:fs')>('node:fs');
+  return {
+    ...actual,
+    existsSync: existsSyncMock,
+    readlinkSync: readlinkSyncMock,
+  };
+});
+
+vi.mock('@modelcontextprotocol/sdk/client/index.js', () => ({
+  Client: vi.fn().mockImplementation(() => ({
+    callTool: mcpCallToolMock,
+    request: (request: { params: unknown }, _schema: unknown, options: unknown) =>
+      mcpCallToolMock(request.params, undefined, options),
+    close: mcpCloseMock,
+    connect: mcpConnectMock,
+    listTools: mcpListToolsMock,
+  })),
+}));
+
+vi.mock('@modelcontextprotocol/sdk/client/stdio.js', () => ({
+  StdioClientTransport: vi.fn().mockImplementation((params) => {
+    transportCtorMock(params);
+    return {
+      close: transportCloseMock,
+      stderr: new PassThrough(),
+    };
+  }),
+}));
+
+vi.mock('../../maker-host/outbound-proxy-resolver.js', () => ({
+  resolveDesktopOutboundProxy: resolveDesktopOutboundProxyMock,
+}));
+
+const powerMonitorState = vi.hoisted(() => ({
+  idleSeconds: 3600,
+  idleState: 'active' as 'active' | 'idle' | 'locked' | 'unknown',
+  listeners: new Map<string, () => void>(),
+}));
+
+vi.mock('electron', () => ({
+  app: {
+    getPath: vi.fn((name: string) => (name === 'temp' ? '/tmp' : '/Users/tester')),
+  },
+  powerMonitor: {
+    getSystemIdleTime: () => powerMonitorState.idleSeconds,
+    getSystemIdleState: () => powerMonitorState.idleState,
+    on: (event: string, listener: () => void) => { powerMonitorState.listeners.set(event, listener); },
+  },
+}));
+
+import {
+  callComputerDriverTool,
+  cancelComputerDriverPermissionGrant,
+  checkComputerDriverUpdate,
+  cleanupAllComputerDriverSessions,
+  cleanupComputerDriverSession,
+  compareSemver,
+  buildCuaInstallerProxyEnv,
+  extractDriverSemver,
+  getCuaDriverReleaseAssetName,
+  resolveCuaDriverHostArch,
+  getComputerMcpDeps,
+  getComputerDriverStatus,
+  grantComputerDriverPermissions,
+  installComputerDriver,
+  listComputerWindowsForAtMention,
+  pauseComputerDriverPermissionProbe,
+  pickLatestCuaDriverVersion,
+  resetComputerDriverPermissionProbeCacheForTests,
+  resetAtMentionWindowCacheForTests,
+  resetDesktopInputGuardStateForTests,
+  seedDesktopScreenLocked,
+  setPhysicalInputShielded,
+  resetComputerDriverUpdateStateForTests,
+  runProcessWithActivityTimeout,
+  sampleInstallProcessTree,
+  clearStaleCuaInstallLock,
+  extractCurlOutputPath,
+  installIdleTimeoutForPlatform,
+  matchAssetSizeByFilename,
+  pickLatestCuaDriverRelease,
+  updateComputerDriver,
+} from '../computer.desktop.js';
+
+interface MockSpawnOptions {
+  stdout?: string;
+  stderr?: string;
+  exitCode?: number;
+  error?: Error;
+  stdinError?: Error;
+}
+
+const driverStdinWrites: string[] = [];
+
+function mockDriverSpawn(options: MockSpawnOptions) {
+  spawnMock.mockImplementationOnce(() => {
+    const child = new EventEmitter() as EventEmitter & {
+      stdin: PassThrough;
+      stdout: EventEmitter;
+      stderr: EventEmitter;
+      kill: ReturnType<typeof vi.fn>;
+      unref: ReturnType<typeof vi.fn>;
+    };
+    child.stdin = new PassThrough();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.kill = vi.fn();
+    child.unref = vi.fn();
+    child.stdin.on('data', (chunk: Buffer) => {
+      driverStdinWrites.push(chunk.toString('utf8'));
+      if (options.stdinError) {
+        child.stdin.emit('error', options.stdinError);
+      }
+    });
+
+    queueMicrotask(() => {
+      if (options.error) {
+        child.emit('error', options.error);
+        return;
+      }
+      if (options.stdout) child.stdout.emit('data', Buffer.from(options.stdout));
+      if (options.stderr) child.stderr.emit('data', Buffer.from(options.stderr));
+      child.emit('close', options.exitCode ?? 0, null);
+    });
+
+    return child;
+  });
+}
+
+function mockNeverSettlingSpawn() {
+  spawnMock.mockImplementationOnce(() => {
+    const child = new EventEmitter() as EventEmitter & {
+      stdout: EventEmitter;
+      stderr: EventEmitter;
+      kill: ReturnType<typeof vi.fn>;
+      unref: ReturnType<typeof vi.fn>;
+    };
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.kill = vi.fn();
+    child.unref = vi.fn();
+    return child;
+  });
+}
+
+function mockProcessSnapshotSpawn(processes: Array<{
+  pid: number;
+  parentPid?: number;
+  name: string;
+  command: string;
+  executable?: string;
+}>) {
+  if (process.platform === 'win32') {
+    mockDriverSpawn({
+      stdout: JSON.stringify(processes.map((processInfo) => ({
+        ProcessId: processInfo.pid,
+        ParentProcessId: processInfo.parentPid ?? 0,
+        Name: processInfo.name,
+        ExecutablePath: processInfo.executable ?? null,
+        CommandLine: processInfo.command,
+      }))),
+    });
+    return;
+  }
+  mockDriverSpawn({
+    stdout: processes
+      .map((processInfo) => (
+        `${processInfo.pid} ${processInfo.parentPid ?? 0} ${processInfo.command}`
+      ))
+      .join('\n'),
+  });
+}
+
+function mockWin32FallbackSpawn(input: {
+  windows: Array<{
+    windowId: number;
+    pid: number;
+    title: string;
+    left: number;
+    top: number;
+    width: number;
+    height: number;
+    isVisible?: boolean;
+    isIconic?: boolean;
+    isOnScreen?: boolean;
+  }>;
+  processes: Array<{
+    pid: number;
+    name: string;
+    executable?: string;
+  }>;
+}) {
+  mockDriverSpawn({
+    stdout: JSON.stringify({
+      Windows: input.windows.map((windowInfo) => ({
+        WindowId: windowInfo.windowId,
+        ProcessId: windowInfo.pid,
+        Title: windowInfo.title,
+        Left: windowInfo.left,
+        Top: windowInfo.top,
+        Width: windowInfo.width,
+        Height: windowInfo.height,
+        IsVisible: windowInfo.isVisible ?? true,
+        IsIconic: windowInfo.isIconic ?? false,
+        IsOnScreen: windowInfo.isOnScreen ?? true,
+      })),
+      Processes: input.processes.map((processInfo) => ({
+        ProcessId: processInfo.pid,
+        Name: processInfo.name,
+        ExecutablePath: processInfo.executable ?? null,
+      })),
+    }),
+  });
+}
+
+function isWin32FallbackSpawnCall(call: unknown[]): boolean {
+  return call[0] === 'powershell.exe' &&
+    Array.isArray(call[1]) &&
+    call[1].some((part) => typeof part === 'string' && part.includes('XdtWin32WindowSnapshot'));
+}
+
+function mockRawProcessSnapshotSpawn(stdout: string) {
+  mockDriverSpawn({ stdout });
+}
+
+function createDeferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((promiseResolve, promiseReject) => {
+    resolve = promiseResolve;
+    reject = promiseReject;
+  });
+  return { promise, resolve, reject };
+}
+
+async function waitForCondition(predicate: () => boolean): Promise<void> {
+  const startedAt = Date.now();
+  while (!predicate()) {
+    if (Date.now() - startedAt > 1_000) {
+      throw new Error('timed out waiting for condition');
+    }
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
+  }
+}
+
+function driverSessionGeneration(session: string, base: string): number | null {
+  const prefix = `${base}-cua-`;
+  if (!session.startsWith(prefix)) return null;
+  const rest = session.slice(prefix.length);
+  const separatorIndex = rest.lastIndexOf('-');
+  if (separatorIndex < 0) return null;
+  const nonce = rest.slice(0, separatorIndex);
+  const generation = Number(rest.slice(separatorIndex + 1));
+  if (!/^[a-f0-9]{12}$/.test(nonce) || !Number.isInteger(generation)) return null;
+  return generation;
+}
+
+function expectDriverSessionGenerations(sessions: string[], base: string, generations: number[]): void {
+  expect(sessions.map((session) => driverSessionGeneration(session, base))).toEqual(generations);
+  const nonces = new Set(sessions.map((session) => session.slice(`${base}-cua-`.length, session.lastIndexOf('-'))));
+  expect(nonces.size).toBe(1);
+}
+
+function mockWorkspaceRootExists(workspaceRoot: string): void {
+  const markers = new Set([
+    path.win32.normalize(path.win32.join(workspaceRoot, '.git')).toLowerCase(),
+    path.win32.normalize(path.win32.join(workspaceRoot, 'pnpm-workspace.yaml')).toLowerCase(),
+  ]);
+  existsSyncMock.mockImplementation((candidate) => (
+    markers.has(path.win32.normalize(String(candidate)).toLowerCase())
+  ));
+}
+
+describe('computer mcp integration', () => {
+  // #9887: window-bound tokens cannot address status items. Tier unit: exercise
+  // production dispatch with desktop captures, which existing window tests lack.
+  it('requires fresh desktop evidence and yields after other input or failed capture', async () => {
+    mcpListToolsMock.mockResolvedValue({ tools: COMPUTER_TOOLS.map((tool) => ({
+      name: tool.name, inputSchema: { type: 'object', properties: { target: {}, capture_id: {} }, additionalProperties: true },
+    })) });
+    mcpCallToolMock.mockImplementation(async ({ name }) => ({ structuredContent: name === 'get_desktop_state'
+      ? { capture_id: 'capture-1', screenshot_frame_valid: true } : { ok: true, effect: 'confirmed' } }));
+    const context = { sessionId: 'desktop-evidence' };
+    const pointer = { target: { kind: 'desktop', display_id: 'primary' }, capture_id: 'capture-1', delivery_mode: 'foreground', x: 10, y: 20 };
+    powerMonitorState.idleSeconds = 3600;
+    await expect(callComputerDriverTool('click', pointer, context)).rejects.toMatchObject({ code: 'STALE_SNAPSHOT' });
+    await callComputerDriverTool('get_window_state', { pid: 123, window_id: 7 }, context);
+    await expect(callComputerDriverTool('click', pointer, context)).rejects.toMatchObject({ code: 'STALE_SNAPSHOT' });
+    await callComputerDriverTool('get_desktop_state', {}, context);
+    await expect(callComputerDriverTool('click', { ...pointer, capture_id: 'older-capture' }, context)).rejects.toMatchObject({ code: 'STALE_SNAPSHOT' });
+    await expect(callComputerDriverTool('click', pointer, context)).resolves.toBeDefined();
+    await expect(callComputerDriverTool('click', pointer, context)).rejects.toMatchObject({ code: 'STALE_SNAPSHOT' });
+    expect(mcpCallToolMock.mock.calls.find(([call]) => call.name === 'click')?.[0].arguments)
+      .toMatchObject(pointer);
+    const read = mcpCallToolMock.mock.calls.find(([call]) => call.name === 'get_desktop_state')?.[0].arguments;
+    expect(read?.screenshot_out_file).toMatch(/get_desktop_state/);
+    expect(read?.session).toBe(mcpCallToolMock.mock.calls.find(([call]) => call.name === 'click')?.[0].arguments.session);
+    await callComputerDriverTool('get_desktop_state', {}, context);
+    await callComputerDriverTool('launch_app', { name: 'Own app' }, context);
+    await expect(callComputerDriverTool('click', pointer, context)).rejects.toMatchObject({ code: 'STALE_SNAPSHOT' });
+    await callComputerDriverTool('get_desktop_state', {}, context);
+    await callComputerDriverTool('launch_app', { name: 'Other app' }, { sessionId: 'other-input' });
+    await expect(callComputerDriverTool('click', pointer, context)).rejects.toMatchObject({ code: 'STALE_SNAPSHOT' });
+    await callComputerDriverTool('get_desktop_state', {}, context);
+    mcpCallToolMock.mockImplementation(async () => ({ structuredContent: { screenshot_frame_valid: false } }));
+    await callComputerDriverTool('get_desktop_state', {}, context);
+    await expect(callComputerDriverTool('click', pointer, context)).rejects.toMatchObject({ code: 'STALE_SNAPSHOT' });
+  });
+  // PR #9919 P1: the three-second busy guard expires, but a picture taken before
+  // local HID input stays stale. Unit tier through production dispatch; the old
+  // coverage only invalidated captures for remote/Agent input or a failed read.
+  it.each(['click', 'drag'] as const)('rejects %s from before physical input even after the person pauses', async (tool) => {
+    vi.useFakeTimers();
+    resetDesktopInputGuardStateForTests();
+    try {
+      mcpListToolsMock.mockResolvedValue({ tools: COMPUTER_TOOLS.map((entry) => ({
+        name: entry.name, inputSchema: { type: 'object', properties: { target: {}, capture_id: {} }, additionalProperties: true },
+      })) });
+      mcpCallToolMock.mockImplementation(async ({ name }) => ({ structuredContent: name === 'get_desktop_state'
+        ? { capture_id: 'physical-input-capture', screenshot_frame_valid: true } : { ok: true, effect: 'confirmed' } }));
+      const context = { sessionId: `physical-input-${tool}` };
+      const pointer = { target: { kind: 'desktop', display_id: 'primary' }, capture_id: 'physical-input-capture',
+        delivery_mode: 'foreground', ...(tool === 'click' ? { x: 10, y: 20 } : { from_x: 10, from_y: 20, to_x: 30, to_y: 20 }) };
+      powerMonitorState.idleSeconds = 10;
+      await callComputerDriverTool('get_desktop_state', {}, context);
+      vi.advanceTimersByTime(6_000);
+      powerMonitorState.idleSeconds = 4; // User input two seconds after capture, now quiet.
+      await expect(callComputerDriverTool(tool, pointer, context)).rejects.toMatchObject({ code: 'STALE_SNAPSHOT' });
+      expect(mcpCallToolMock.mock.calls.filter(([call]) => call.name === tool)).toHaveLength(0);
+      await callComputerDriverTool('get_desktop_state', {}, context);
+      await expect(callComputerDriverTool(tool, pointer, context)).resolves.toBeDefined();
+      expect(mcpCallToolMock.mock.calls.filter(([call]) => call.name === tool)).toHaveLength(1);
+    } finally {
+      powerMonitorState.idleSeconds = 3600;
+      resetDesktopInputGuardStateForTests();
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps input during a slow desktop capture stale and rejects unknown idle time', async () => {
+    vi.useFakeTimers();
+    resetDesktopInputGuardStateForTests();
+    try {
+      mcpListToolsMock.mockResolvedValue({ tools: COMPUTER_TOOLS.map((entry) => ({
+        name: entry.name, inputSchema: { type: 'object', properties: { target: {}, capture_id: {} }, additionalProperties: true },
+      })) });
+      let duringCapture = true;
+      mcpCallToolMock.mockImplementation(async ({ name }) => {
+        if (name === 'get_desktop_state' && duringCapture) {
+          vi.advanceTimersByTime(6_000);
+          powerMonitorState.idleSeconds = 4;
+        }
+        return { structuredContent: name === 'get_desktop_state'
+          ? { capture_id: 'slow-capture', screenshot_frame_valid: true } : { ok: true, effect: 'confirmed' } };
+      });
+      const context = { sessionId: 'physical-input-during-capture' };
+      const pointer = { target: { kind: 'desktop', display_id: 'primary' }, capture_id: 'slow-capture', delivery_mode: 'foreground', x: 10, y: 20 };
+      powerMonitorState.idleSeconds = 10;
+      await callComputerDriverTool('get_desktop_state', {}, context);
+      await expect(callComputerDriverTool('click', pointer, context)).rejects.toMatchObject({ code: 'STALE_SNAPSHOT' });
+      duringCapture = false;
+      await callComputerDriverTool('get_desktop_state', {}, context);
+      powerMonitorState.idleSeconds = Number.NaN;
+      await expect(callComputerDriverTool('click', pointer, context)).rejects.toMatchObject({ code: 'USER_INPUT_ACTIVE' });
+      expect(mcpCallToolMock.mock.calls.filter(([call]) => call.name === 'click')).toHaveLength(0);
+    } finally {
+      powerMonitorState.idleSeconds = 3600;
+      resetDesktopInputGuardStateForTests();
+      vi.useRealTimers();
+    }
+  });
+  let revisionSpy: ReturnType<typeof vi.spyOn>;
+  // PR #9919 P1, unit: real dispatch must release only its generated desktop
+  // files. Existing screenshot tests checked arguments, not disk lifetime.
+  describe('desktop screenshot lifetime', () => {
+    let tempRoot: string;
+    let pathSpy: MockInstance<typeof app.getPath>;
+    let files: string[];
+    beforeEach(() => {
+      tempRoot = mkdtempSync(path.join(os.tmpdir(), 'cindy-capture-test-'));
+      const getPath = app.getPath;
+      pathSpy = vi.spyOn(app, 'getPath').mockImplementation((name) => name === 'temp' ? tempRoot : getPath(name));
+      files = [];
+      mcpCallToolMock.mockImplementation(async ({ name, arguments: args }) => {
+        if (name !== 'get_desktop_state') return { structuredContent: { ok: true } };
+        const file = args.screenshot_out_file as string;
+        writeFileSync(file, 'capture');
+        files.push(file);
+        return { structuredContent: { capture_id: file, screenshot_frame_valid: true, screenshot_file_path: file } };
+      });
+    });
+    afterEach(async () => {
+      await cleanupAllComputerDriverSessions();
+      pathSpy.mockRestore();
+      rmSync(tempRoot, { recursive: true, force: true });
+    });
+
+    it('replaces generated files per session and preserves explicit exports', async () => {
+      await callComputerDriverTool('get_desktop_state', {}, { sessionId: 'capture-a' });
+      await callComputerDriverTool('get_desktop_state', {}, { sessionId: 'capture-b' });
+      await callComputerDriverTool('get_desktop_state', {}, { sessionId: 'capture-a' });
+      expect(() => readFileSync(files[0])).toThrow(expect.objectContaining({ code: 'ENOENT' }));
+      expect(readFileSync(files[1], 'utf8')).toBe('capture');
+      expect(readFileSync(files[2], 'utf8')).toBe('capture');
+      const exported = path.join(tempRoot, 'keep.png');
+      await callComputerDriverTool('get_desktop_state', { screenshot_out_file: exported }, { sessionId: 'capture-a' });
+      expect(() => readFileSync(files[2])).toThrow(expect.objectContaining({ code: 'ENOENT' }));
+      await cleanupComputerDriverSession('capture-a');
+      expect(readFileSync(exported, 'utf8')).toBe('capture');
+      expect(readFileSync(files[1], 'utf8')).toBe('capture');
+      await cleanupAllComputerDriverSessions();
+      expect(() => readFileSync(files[1])).toThrow(expect.objectContaining({ code: 'ENOENT' }));
+      expect(readFileSync(exported, 'utf8')).toBe('capture');
+    });
+
+    it.each(['unavailable', 'error', 'cancelled'])('removes generated files after a read is %s', async (outcome) => {
+      const controller = new AbortController();
+      const capture = mcpCallToolMock.getMockImplementation()!;
+      mcpCallToolMock.mockImplementation(async (call, ...rest) => {
+        const result = await capture(call, ...rest);
+        if (call.name !== 'get_desktop_state') return result;
+        if (outcome === 'error') throw new Error('capture failed');
+        if (outcome === 'cancelled') controller.abort();
+        if (outcome === 'unavailable') result.structuredContent.screenshot_frame_valid = false;
+        return result;
+      });
+      await callComputerDriverTool('get_desktop_state', {}, { sessionId: 'capture-failure', signal: controller.signal }).catch(() => undefined);
+      expect(files).toHaveLength(1);
+      expect(() => readFileSync(files[0])).toThrow(expect.objectContaining({ code: 'ENOENT' }));
+    });
+
+    it.each([false, true])('cleans a late read without deleting its successor (session closed: %s)', async (close) => {
+      const entered = createDeferred<void>();
+      const release = createDeferred<void>();
+      const capture = mcpCallToolMock.getMockImplementation()!;
+      let first = true;
+      mcpCallToolMock.mockImplementation(async (call, ...rest) => {
+        if (call.name === 'get_desktop_state' && first) {
+          first = false;
+          entered.resolve();
+          await release.promise;
+        }
+        return capture(call, ...rest);
+      });
+      const context = { sessionId: 'capture-race' };
+      const pending = callComputerDriverTool('get_desktop_state', {}, context);
+      await entered.promise;
+      if (close) await cleanupComputerDriverSession(context.sessionId);
+      await callComputerDriverTool('get_desktop_state', {}, context);
+      release.resolve();
+      await pending;
+      expect(readFileSync(files[0], 'utf8')).toBe('capture');
+      expect(() => readFileSync(files[1])).toThrow(expect.objectContaining({ code: 'ENOENT' }));
+      await cleanupComputerDriverSession(context.sessionId);
+      expect(() => readFileSync(files[0])).toThrow(expect.objectContaining({ code: 'ENOENT' }));
+    });
+  });
+
+  let agentRevisionSpy: ReturnType<typeof vi.spyOn>;
+  beforeEach(async () => {
+    // Each test starts with a fresh process input history; cleanup of a driver
+    // session deliberately does not reset production remote-input revisions.
+    const readRevision = inputOwnership.desktopInputRevision;
+    const initialRevision = readRevision();
+    revisionSpy = vi.spyOn(inputOwnership, 'desktopInputRevision')
+      .mockImplementation(() => readRevision() - initialRevision);
+    const readAgentRevision = inputOwnership.agentDesktopInputRevision;
+    const initialAgentRevision = readAgentRevision();
+    agentRevisionSpy = vi.spyOn(inputOwnership, 'agentDesktopInputRevision')
+      .mockImplementation(() => readAgentRevision() - initialAgentRevision);
+    setPlatform(originalPlatform);
+    await cleanupAllComputerDriverSessions();
+    resetComputerDriverPermissionProbeCacheForTests();
+    resetAtMentionWindowCacheForTests();
+    existsSyncMock.mockReset().mockReturnValue(false);
+    spawnMock.mockReset();
+    driverStdinWrites.length = 0;
+    readlinkSyncMock.mockReset();
+    mcpCallToolMock.mockReset();
+    mcpCloseMock.mockReset().mockResolvedValue(undefined);
+    mcpConnectMock.mockReset().mockResolvedValue(undefined);
+    mcpListToolsMock
+      .mockReset()
+      .mockResolvedValue({
+        tools: [
+          ...COMPUTER_TOOLS.map((tool) => tool.name),
+          'set_agent_cursor_motion',
+          'set_agent_cursor_style',
+          'end_session',
+        ].map((name) => ({ name, inputSchema: { type: 'object', additionalProperties: true } })),
+      });
+    transportCloseMock.mockReset().mockResolvedValue(undefined);
+    transportCtorMock.mockReset();
+    resolveDesktopOutboundProxyMock.mockReset().mockResolvedValue(null);
+    for (const key of driverResolutionEnvKeys) {
+      delete process.env[key];
+    }
+  });
+
+  afterEach(() => {
+    revisionSpy.mockRestore();
+    agentRevisionSpy.mockRestore();
+    for (const key of driverResolutionEnvKeys) {
+      const value = originalDriverResolutionEnv.get(key);
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+  });
+
+  it('reports installed when cua-driver --version succeeds', async () => {
+    mockDriverSpawn({ stdout: 'cua-driver 0.1.0\n' });
+    mockDriverSpawn({ stdout: 'Cua Driver daemon is running\n' });
+    if (process.platform === 'darwin') {
+      mockDriverSpawn({
+        stdout:
+          '{"accessibility":true,"screen_recording":true,"screen_recording_capturable":true,"source":{"attribution":"driver-daemon"}}\n',
+      });
+    }
+
+    await expect(getComputerDriverStatus()).resolves.toMatchObject({
+      installed: true,
+      executablePath: expect.any(String),
+      version: 'cua-driver 0.1.0',
+      daemonRunning: true,
+      installCommand: expect.stringContaining('cua-driver'),
+      docsUrl: 'https://cua.ai/docs/cua-driver',
+      permissionState: {
+        platform: process.platform === 'darwin' ? 'macos' : process.platform === 'win32' ? 'windows' : 'linux',
+        status: process.platform === 'darwin' ? 'granted' : 'not_required',
+      },
+    });
+    expect(spawnMock).toHaveBeenCalledWith(expect.stringContaining('cua-driver'), ['--version'], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+    expect(spawnMock.mock.calls.some((call) => call[1]?.[0] === 'doctor')).toBe(false);
+  });
+
+  it('does not probe or autostart the permission daemon while waiting for the real app drag', async () => {
+    setPlatform('darwin');
+    await pauseComputerDriverPermissionProbe();
+    mockDriverSpawn({ stdout: 'cua-driver 0.7.1\n' });
+    mockDriverSpawn({ stdout: 'Cua Driver daemon is running\n  pid: 4242\n' });
+
+    await expect(getComputerDriverStatus({
+      forcePermissionProbe: true,
+      freshPermissionProbe: true,
+      bypassPermissionProbeCache: true,
+    })).resolves.toMatchObject({
+      installed: true,
+      daemonRunning: true,
+      permissionState: {
+        platform: 'macos',
+        status: 'missing',
+        accessibility: 'missing',
+        reason: 'Waiting for CuaDriver to be added in System Settings.',
+      },
+    });
+
+    expect(spawnMock).toHaveBeenCalledTimes(2);
+    expect(driverStdinWrites).toEqual([]);
+  });
+
+  it('runs cua-driver doctor only for explicit deep status checks', async () => {
+    mockDriverSpawn({ stdout: 'cua-driver 0.1.0\n' });
+    mockDriverSpawn({ stdout: 'Cua Driver daemon is running\n' });
+    mockDriverSpawn({ stdout: '{"ok":true,"probes":[]}\n' });
+    if (process.platform === 'darwin') {
+      mockDriverSpawn({
+        stdout:
+          '{"accessibility":true,"screen_recording":true,"screen_recording_capturable":true,"source":{"attribution":"driver-daemon"}}\n',
+      });
+    }
+
+    await expect(getComputerDriverStatus({ includeDoctor: true })).resolves.toMatchObject({
+      installed: true,
+      doctor: {
+        ok: true,
+        probes: [],
+      },
+    });
+    expect(spawnMock).toHaveBeenCalledWith(expect.stringContaining('cua-driver'), ['doctor', '--json'], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+  });
+
+  it('reports not installed when the driver cannot be spawned', async () => {
+    mockDriverSpawn({ error: new Error('ENOENT') });
+
+    await expect(getComputerDriverStatus()).resolves.toMatchObject({
+      installed: false,
+      executablePath: null,
+      version: null,
+      daemonRunning: false,
+      installCommand: expect.stringContaining('cua-driver'),
+      docsUrl: 'https://cua.ai/docs/cua-driver',
+      error: 'ENOENT',
+    });
+  });
+
+  it('passes tool calls through a long-lived cua-driver MCP session and parses JSON output', async () => {
+    const oldDisplay = process.env.DISPLAY;
+    process.env.DISPLAY = ':99';
+    mcpCallToolMock.mockResolvedValueOnce({
+      content: [{ type: 'text', text: '{"ok":true,"window_id":7}' }],
+    });
+
+    try {
+      await expect(callComputerDriverTool('list_windows', {
+        on_screen_only: true,
+        session: 'session-1',
+      }, { sessionId: 'session-1' })).resolves.toEqual({
+        ok: true,
+        window_id: 7,
+      });
+    } finally {
+      if (oldDisplay === undefined) {
+        delete process.env.DISPLAY;
+      } else {
+        process.env.DISPLAY = oldDisplay;
+      }
+    }
+    expect(transportCtorMock).toHaveBeenCalledWith(expect.objectContaining({
+      command: expect.stringContaining('cua-driver'),
+      args: ['mcp'],
+      env: expect.objectContaining({
+        DISPLAY: ':99',
+        PATH: expect.any(String),
+      }),
+      stderr: 'pipe',
+    }));
+    expect(mcpConnectMock).toHaveBeenCalledTimes(1);
+    const payload = mcpCallToolMock.mock.calls[0]?.[0]?.arguments as {
+      on_screen_only?: boolean;
+      session: string;
+    };
+    expect(payload.on_screen_only).toBe(true);
+    expectDriverSessionGenerations([payload.session], 'session-1', [0]);
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  it('prefers structured MCP content over human-readable text summaries', async () => {
+    mcpCallToolMock.mockResolvedValueOnce({
+      content: [{ type: 'text', text: '✅ Listed 2 windows' }],
+      structuredContent: {
+        ok: true,
+        windows: [
+          { window_id: 7, title: 'XDMaker' },
+          { window_id: 8, title: 'Terminal' },
+        ],
+      },
+    });
+
+    await expect(callComputerDriverTool('list_windows', {
+      on_screen_only: true,
+      session: 'session-1',
+    }, { sessionId: 'session-1' })).resolves.toEqual({
+      ok: true,
+      windows: [
+        { window_id: 7, title: 'XDMaker' },
+        { window_id: 8, title: 'Terminal' },
+      ],
+    });
+  });
+
+  it('does not invoke Win32 fallback when Cua list_windows succeeds on Windows', async () => {
+    setPlatform('win32');
+    mcpCallToolMock.mockResolvedValueOnce({
+      content: [{ type: 'text', text: '{"ok":true,"windows":[{"pid":123,"window_id":7,"app_name":"Electron","title":"XDMaker"}]}' }],
+    });
+    mockProcessSnapshotSpawn([
+      {
+        pid: 123,
+        name: 'Electron',
+        command: 'C:\\Tools\\electron.exe D:\\xdt-maker',
+        executable: 'C:\\Tools\\electron.exe',
+      },
+    ]);
+
+    await expect(callComputerDriverTool('list_windows', {
+      process_name: 'electron',
+      session: 'session-windows-cua-success',
+    }, { sessionId: 'session-windows-cua-success' })).resolves.toMatchObject({
+      ok: true,
+      windows: [
+        {
+          window_id: 7,
+          pid: 123,
+          process: {
+            name: 'Electron',
+          },
+        },
+      ],
+    });
+
+    expect(spawnMock.mock.calls.some(isWin32FallbackSpawnCall)).toBe(false);
+  });
+
+  it('does not use the reserved PowerShell $PID variable in the Win32 fallback script', async () => {
+    setPlatform('win32');
+    mcpCallToolMock.mockRejectedValueOnce(new Error('cua-driver mcp tool list_windows timed out after 45000ms'));
+    mockWin32FallbackSpawn({ windows: [], processes: [] });
+
+    await expect(callComputerDriverTool('list_windows', {}, { sessionId: 'session-win32-script-static' })).resolves.toMatchObject({
+      ok: true,
+      windows: [],
+    });
+
+    const scriptArgs = spawnMock.mock.calls.find(isWin32FallbackSpawnCall)?.[1] as unknown[] | undefined;
+    const script = scriptArgs
+      ?.find((part): part is string => typeof part === 'string' && part.includes('XdtWin32WindowSnapshot'));
+    expect(script).toContain('[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)');
+    expect(script).toContain('$procId');
+    expect(script).not.toMatch(/\$pid\b/i);
+  });
+
+  it('enriches list_windows with generic process identity without forwarding local filters', async () => {
+    const workspaceRoot = path.resolve(process.cwd(), '../..');
+    mcpCallToolMock.mockResolvedValueOnce({
+      content: [{ type: 'text', text: '{"ok":true,"windows":[{"pid":123,"window_id":7,"app_name":"Electron","title":"XDMaker"},{"pid":456,"window_id":8,"app_name":"Terminal","title":"zsh"}]}' }],
+    });
+    mockProcessSnapshotSpawn([
+      {
+        pid: 123,
+        parentPid: 42,
+        name: 'Electron',
+        command: `/Applications/Electron.app/Contents/MacOS/Electron ${workspaceRoot} --inspect`,
+        executable: '/Applications/Electron.app/Contents/MacOS/Electron',
+      },
+      {
+        pid: 456,
+        parentPid: 1,
+        name: 'Terminal',
+        command: '/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal',
+        executable: '/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal',
+      },
+    ]);
+
+    await expect(callComputerDriverTool('list_windows', {
+      on_screen_only: true,
+      query: 'xdmaker',
+      workspace_root: workspaceRoot,
+      process_name: 'electron',
+      session: 'session-1',
+    }, { sessionId: 'session-1' })).resolves.toMatchObject({
+      ok: true,
+      windows: [
+        {
+          pid: 123,
+          window_id: 7,
+          process: {
+            pid: 123,
+            parent_pid: 42,
+            name: 'Electron',
+            command: expect.stringContaining(workspaceRoot),
+          },
+          identity: {
+            kind: 'electron-dev',
+            confidence: 0.75,
+            labels: expect.arrayContaining(['electron']),
+          },
+        },
+      ],
+    });
+
+    const payload = mcpCallToolMock.mock.calls[0]?.[0]?.arguments as Record<string, unknown>;
+    expect(payload.on_screen_only).toBe(true);
+    expect(payload.query).toBeUndefined();
+    expect(payload.workspace_root).toBeUndefined();
+    expect(payload.process_name).toBeUndefined();
+  });
+
+  // CU-016 (2026-10 audit): nine simulator sessions tried synthetic clicks first;
+  // none worked. The identity names the route that does, before any action.
+  it('labels iOS Simulator / Device Hub windows and names the simctl route', async () => {
+    mcpCallToolMock.mockResolvedValueOnce({
+      content: [{ type: 'text', text: '{"ok":true,"windows":[{"pid":77,"window_id":9,"app_name":"Simulator","title":"iPhone 17 Pro"},{"pid":88,"window_id":10,"app_name":"Device Hub","title":"iPhone"},{"pid":99,"window_id":11,"app_name":"Google Chrome","title":"Docs"}]}' }],
+    });
+    mockProcessSnapshotSpawn([
+      { pid: 77, name: 'Simulator', command: '/Applications/Xcode.app/Contents/Developer/Applications/Simulator.app/Contents/MacOS/Simulator' },
+      { pid: 88, name: 'Device Hub', command: '/Applications/Cindy.app/Contents/Frameworks/Device Hub.app/Contents/MacOS/Device Hub' },
+      { pid: 99, name: 'Google Chrome', command: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' },
+    ]);
+
+    const result = await callComputerDriverTool('list_windows', { session: 'sim' }, { sessionId: 'sim' }) as {
+      windows: Array<{ pid: number; identity: { kind: string; hints?: string[] } }>;
+    };
+    const byPid = Object.fromEntries(result.windows.map((window) => [window.pid, window.identity]));
+    expect(byPid[77]).toMatchObject({ kind: 'ios-simulator', hints: [expect.stringContaining('xcrun simctl')] });
+    expect(byPid[88]).toMatchObject({ kind: 'ios-simulator', hints: [expect.stringContaining('xcrun simctl')] });
+    expect(byPid[99]).toMatchObject({ kind: 'browser', hints: [expect.stringContaining('set_value')] });
+  });
+
+  // Review (#8227): a page or document titled "Simulator" is not the simulator.
+  it('does not label a browser window as ios-simulator because of its title', async () => {
+    mcpCallToolMock.mockResolvedValueOnce({
+      content: [{ type: 'text', text: '{"ok":true,"windows":[{"pid":99,"window_id":11,"app_name":"Google Chrome","title":"iOS Simulator – Simulator.app guide"},{"pid":55,"window_id":12,"app_name":"Cursor","title":"simulator-notes.md"}]}' }],
+    });
+    mockProcessSnapshotSpawn([
+      { pid: 99, name: 'Google Chrome', command: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' },
+      { pid: 55, name: 'Cursor', command: '/Users/x/ios-simulator-tools/node_modules/.bin/cursor' },
+    ]);
+    const result = await callComputerDriverTool('list_windows', { session: 'sim-title' }, { sessionId: 'sim-title' }) as {
+      windows: Array<{ pid: number; identity: { kind: string } }>;
+    };
+    const byPid = Object.fromEntries(result.windows.map((window) => [window.pid, window.identity.kind]));
+    expect(byPid[99]).toBe('browser');
+    expect(byPid[55]).not.toBe('ios-simulator');
+  });
+
+  // Review (#8227 round 8): a title must not out-rank the real application.
+  it('classifies a browser by its process even when the tab title names node or vite', async () => {
+    mcpCallToolMock.mockResolvedValueOnce({
+      content: [{ type: 'text', text: '{"ok":true,"windows":[{"pid":99,"window_id":11,"app_name":"Google Chrome","title":"Node.js documentation – npm and vite guide"}]}' }],
+    });
+    mockProcessSnapshotSpawn([
+      { pid: 99, name: 'Google Chrome', command: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' },
+    ]);
+    const result = await callComputerDriverTool('list_windows', { session: 'title-node' }, { sessionId: 'title-node' }) as {
+      windows: Array<{ identity: { kind: string; hints?: string[] } }>;
+    };
+    expect(result.windows[0]!.identity.kind).toBe('browser');
+    expect(result.windows[0]!.identity.hints).toEqual([expect.stringContaining('set_value')]);
+  });
+
+  it('filters list_windows locally by process name', async () => {
+    mcpCallToolMock.mockResolvedValueOnce({
+      content: [{ type: 'text', text: '{"ok":true,"windows":[{"pid":123,"window_id":7,"app_name":"Electron","title":"App"},{"pid":456,"window_id":8,"app_name":"Safari","title":"Docs"}]}' }],
+    });
+    mockProcessSnapshotSpawn([
+      {
+        pid: 123,
+        name: 'Electron',
+        command: '/Applications/Electron.app/Contents/MacOS/Electron',
+      },
+      {
+        pid: 456,
+        name: 'Safari',
+        command: '/Applications/Safari.app/Contents/MacOS/Safari',
+      },
+    ]);
+
+    await expect(callComputerDriverTool('list_windows', {
+      process_name: 'safari',
+      session: 'session-filter',
+    }, { sessionId: 'session-filter' })).resolves.toMatchObject({
+      ok: true,
+      windows: [
+        {
+          pid: 456,
+          window_id: 8,
+          process: {
+            name: 'Safari',
+          },
+        },
+      ],
+    });
+  });
+
+  it('keeps macOS app paths with spaces intact when enriching windows', async () => {
+    if (process.platform === 'win32') return;
+
+    mcpCallToolMock.mockResolvedValueOnce({
+      content: [{ type: 'text', text: '{"ok":true,"windows":[{"pid":789,"window_id":9,"app_name":"Google Chrome","title":"Docs"}]}' }],
+    });
+    mockRawProcessSnapshotSpawn(
+      '789 1 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --type=renderer\n',
+    );
+
+    await expect(callComputerDriverTool('list_windows', {
+      process_name: 'chrome',
+      session: 'session-spaced-app',
+    }, { sessionId: 'session-spaced-app' })).resolves.toMatchObject({
+      ok: true,
+      windows: [
+        {
+          pid: 789,
+          process: {
+            name: 'Google Chrome',
+            command: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --type=renderer',
+            executable: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+          },
+          identity: {
+            kind: 'browser',
+          },
+        },
+      ],
+    });
+  });
+
+  it('keeps list_windows usable when process enrichment is unavailable', async () => {
+    mcpCallToolMock.mockResolvedValueOnce({
+      content: [{ type: 'text', text: '{"ok":true,"windows":[{"pid":123,"window_id":7,"app_name":"Electron","title":"XDMaker"}]}' }],
+    });
+    mockDriverSpawn({ error: new Error('ps unavailable') });
+
+    await expect(callComputerDriverTool('list_windows', {
+      query: 'xdmaker',
+      session: 'session-no-processes',
+    }, { sessionId: 'session-no-processes' })).resolves.toEqual({
+      ok: true,
+      windows: [
+        {
+          pid: 123,
+          window_id: 7,
+          app_name: 'Electron',
+          title: 'XDMaker',
+          process: { pid: 123 },
+        },
+      ],
+    });
+  });
+
+  it('marks process-backed list_windows filters unavailable when enrichment fails', async () => {
+    mcpCallToolMock.mockResolvedValueOnce({
+      content: [{ type: 'text', text: '{"ok":true,"windows":[{"pid":123,"window_id":7,"app_name":"Electron","title":"XDMaker"}]}' }],
+    });
+    mockDriverSpawn({ error: new Error('ps unavailable') });
+
+    await expect(callComputerDriverTool('list_windows', {
+      workspace_root: '/repo',
+      process_name: 'electron',
+      session: 'session-no-process-filter',
+    }, { sessionId: 'session-no-process-filter' })).resolves.toEqual({
+      ok: true,
+      enrichment: 'unavailable',
+      windows: [],
+    });
+  });
+
+  it('marks process-backed list_windows filters unavailable when process snapshot exits non-zero', async () => {
+    mcpCallToolMock.mockResolvedValueOnce({
+      content: [{ type: 'text', text: '{"ok":true,"windows":[{"pid":123,"window_id":7,"app_name":"Electron","title":"XDMaker"}]}' }],
+    });
+    mockDriverSpawn({ stderr: 'ps permission denied', exitCode: 1 });
+
+    await expect(callComputerDriverTool('list_windows', {
+      workspace_root: '/repo',
+      session: 'session-process-exit-failure',
+    }, { sessionId: 'session-process-exit-failure' })).resolves.toEqual({
+      ok: true,
+      enrichment: 'unavailable',
+      windows: [],
+    });
+  });
+
+  it('bypasses cached process snapshots for process-backed list_windows filters', async () => {
+    const workspaceRoot = path.join(process.cwd(), 'fixtures', 'fresh-app');
+    mcpCallToolMock
+      .mockResolvedValueOnce({
+        content: [{ type: 'text', text: '{"ok":true,"windows":[{"pid":111,"window_id":1,"app_name":"Electron","title":"Old"}]}' }],
+      })
+      .mockResolvedValueOnce({
+        content: [{ type: 'text', text: '{"ok":true,"windows":[{"pid":222,"window_id":2,"app_name":"Electron","title":"Fresh"}]}' }],
+      });
+    mockProcessSnapshotSpawn([
+      {
+        pid: 111,
+        name: 'Electron',
+        command: '/Applications/Electron.app/Contents/MacOS/Electron /tmp/old-app',
+      },
+    ]);
+    mockProcessSnapshotSpawn([
+      {
+        pid: 222,
+        name: 'Electron',
+        command: `/Applications/Electron.app/Contents/MacOS/Electron ${workspaceRoot}`,
+      },
+    ]);
+
+    await expect(callComputerDriverTool('list_windows', {
+      query: 'old',
+      session: 'session-process-cache',
+    }, { sessionId: 'session-process-cache' })).resolves.toMatchObject({
+      ok: true,
+      windows: [{ pid: 111 }],
+    });
+    await expect(callComputerDriverTool('list_windows', {
+      workspace_root: workspaceRoot,
+      session: 'session-process-cache',
+    }, { sessionId: 'session-process-cache' })).resolves.toMatchObject({
+      ok: true,
+      windows: [
+        {
+          pid: 222,
+          title: 'Fresh',
+        },
+      ],
+    });
+    expect(spawnMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('marks process-backed list_windows filters unavailable when Windows process JSON is invalid', async () => {
+    setPlatform('win32');
+    mcpCallToolMock.mockResolvedValueOnce({
+      content: [{ type: 'text', text: '{"ok":true,"windows":[{"pid":123,"window_id":7,"app_name":"Electron","title":"XDMaker"}]}' }],
+    });
+    mockDriverSpawn({ stdout: '{not-json', exitCode: 0 });
+
+    await expect(callComputerDriverTool('list_windows', {
+      process_name: 'electron',
+      session: 'session-windows-invalid-json',
+    }, { sessionId: 'session-windows-invalid-json' })).resolves.toEqual({
+      ok: true,
+      enrichment: 'unavailable',
+      windows: [],
+    });
+    expect(spawnMock.mock.calls.at(-1)?.[0]).toBe('powershell.exe');
+  });
+
+  it('keeps workspace_root matching case-sensitive outside Windows', async () => {
+    if (originalPlatform === 'win32') return;
+
+    setPlatform('linux');
+    const workspaceRoot = '/workspace/XDMaker';
+    const lowerCaseRoot = '/workspace/xdmaker';
+    mcpCallToolMock.mockResolvedValueOnce({
+      content: [{ type: 'text', text: '{"ok":true,"windows":[{"pid":123,"window_id":7,"app_name":"Electron","title":"Upper"},{"pid":456,"window_id":8,"app_name":"Electron","title":"Lower"}]}' }],
+    });
+    mockProcessSnapshotSpawn([
+      {
+        pid: 123,
+        name: 'Electron',
+        command: `/usr/bin/electron ${workspaceRoot}`,
+      },
+      {
+        pid: 456,
+        name: 'Electron',
+        command: `/usr/bin/electron ${lowerCaseRoot}`,
+      },
+    ]);
+
+    await expect(callComputerDriverTool('list_windows', {
+      workspace_root: workspaceRoot,
+      session: 'session-case-sensitive-workspace',
+    }, { sessionId: 'session-case-sensitive-workspace' })).resolves.toMatchObject({
+      ok: true,
+      windows: [
+        {
+          pid: 123,
+          title: 'Upper',
+        },
+      ],
+    });
+  });
+
+  it('reads Linux process cwd only for returned window pids', async () => {
+    setPlatform('linux');
+    readlinkSyncMock.mockImplementation((target: string) => {
+      if (target === '/proc/222/cwd') return '/workspace/fresh-app';
+      throw new Error(`unexpected readlink ${target}`);
+    });
+    mcpCallToolMock.mockResolvedValueOnce({
+      content: [{ type: 'text', text: '{"ok":true,"windows":[{"pid":222,"window_id":2,"app_name":"Electron","title":"Fresh"}]}' }],
+    });
+    mockProcessSnapshotSpawn([
+      {
+        pid: 111,
+        name: 'Electron',
+        command: '/usr/bin/electron /tmp/old-app',
+      },
+      {
+        pid: 222,
+        name: 'Electron',
+        command: '/usr/bin/electron',
+      },
+    ]);
+
+    await expect(callComputerDriverTool('list_windows', {
+      workspace_root: '/workspace/fresh-app',
+      session: 'session-linux-lazy-cwd',
+    }, { sessionId: 'session-linux-lazy-cwd' })).resolves.toMatchObject({
+      ok: true,
+      windows: [
+        {
+          pid: 222,
+          process: {
+            cwd: '/workspace/fresh-app',
+          },
+        },
+      ],
+    });
+    expect(readlinkSyncMock).toHaveBeenCalledTimes(1);
+    expect(readlinkSyncMock).toHaveBeenCalledWith('/proc/222/cwd');
+  });
+
+  it('matches workspace_root on path boundaries instead of raw prefixes', async () => {
+    const workspaceRoot = path.join(process.cwd(), 'fixtures', 'XDMaker');
+    const siblingRoot = `${workspaceRoot}-old`;
+    mcpCallToolMock.mockResolvedValueOnce({
+      content: [{ type: 'text', text: '{"ok":true,"windows":[{"pid":123,"window_id":7,"app_name":"Electron","title":"Target"},{"pid":456,"window_id":8,"app_name":"Electron","title":"Sibling"}]}' }],
+    });
+    mockProcessSnapshotSpawn([
+      {
+        pid: 123,
+        name: 'Electron',
+        command: `/Applications/Electron.app/Contents/MacOS/Electron ${workspaceRoot}`,
+      },
+      {
+        pid: 456,
+        name: 'Electron',
+        command: `/Applications/Electron.app/Contents/MacOS/Electron ${siblingRoot}`,
+      },
+    ]);
+
+    await expect(callComputerDriverTool('list_windows', {
+      workspace_root: workspaceRoot,
+      session: 'session-workspace-boundary',
+    }, { sessionId: 'session-workspace-boundary' })).resolves.toMatchObject({
+      ok: true,
+      windows: [
+        {
+          pid: 123,
+          window_id: 7,
+          title: 'Target',
+        },
+      ],
+    });
+  });
+
+  it('preserves non-text MCP content when no structured payload is available', async () => {
+    const mcpResult = {
+      content: [
+        { type: 'text', text: '✅ Captured screenshot' },
+        { type: 'image', data: 'iVBORw0KGgo=', mimeType: 'image/png' },
+      ],
+    };
+    mcpCallToolMock
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true}' }] })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true}' }] })
+      .mockResolvedValueOnce(mcpResult);
+
+    await expect(callComputerDriverTool('get_window_state', {
+      pid: 123,
+      window_id: 7,
+      capture_mode: 'vision',
+      session: 'session-1',
+    }, { sessionId: 'session-1' })).resolves.toEqual(mcpResult);
+  });
+
+  it('requires a host session before dispatching computer-use tool calls', async () => {
+    await expect(callComputerDriverTool('list_windows', {})).rejects.toThrow(
+      `Computer Use tool calls require an active ${BRAND_NAME} session`,
+    );
+
+    expect(mcpConnectMock).not.toHaveBeenCalled();
+    expect(mcpCallToolMock).not.toHaveBeenCalled();
+  });
+
+  // Item 26, unit: the real driver adapter previously required a task even
+  // after the public plugin gateway approved computer access. MCP-only fakes
+  // missed this boundary. One attested plugin must get its own native connection.
+  it('binds an approved plugin to its own driver connection and closes that connection', async () => {
+    const caller = { kind: 'plugin' as const, pluginId: 'driver-plugin', dataOwnerId: 'owner', ownerGeneration: 3 };
+    const context = { hostCaller: caller, agentKind: 'claude-code' };
+    const deps = getComputerMcpDeps();
+    mcpCallToolMock.mockResolvedValue({ content: [{ type: 'text', text: '{"ok":true,"windows":[]}' }] });
+    await expect(deps.callTool('list_windows', {}, context)).rejects.toThrow('PERMISSION_DENIED');
+    const run = () => runPluginHostToolCall({ caller, server: 'cindy_computer', tool: 'list_windows', argsJson: '{}', assertCurrent() {} },
+      () => deps.callTool('list_windows', {}, context));
+    await expect(run()).resolves.toEqual({ ok: true, windows: [] });
+    await expect(run()).resolves.toEqual({ ok: true, windows: [] });
+    expect(mcpConnectMock).toHaveBeenCalledOnce();
+    await deps.closeContext?.(context);
+    expect(mcpCloseMock).toHaveBeenCalledOnce();
+    await expect(run()).resolves.toEqual({ ok: true, windows: [] });
+    expect(mcpConnectMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('writes get_window_state screenshots to a temp file by default', async () => {
+    mcpCallToolMock
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true}' }] })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true}' }] })
+      .mockResolvedValueOnce({
+        content: [{ type: 'text', text: '{"ok":true,"screenshot_file_path":"/tmp/xdt-maker-cua/window.png"}' }],
+      });
+
+    await expect(callComputerDriverTool('get_window_state', {
+      pid: 123,
+      window_id: 7,
+      capture_mode: 'vision',
+      session: 'session-1',
+    }, { sessionId: 'session-1' })).resolves.toEqual({
+      ok: true,
+      screenshot_file_path: '/tmp/xdt-maker-cua/window.png',
+    });
+
+    const payload = mcpCallToolMock.mock.calls[2]?.[0]?.arguments as {
+      screenshot_out_file?: string;
+    };
+    expect(payload.screenshot_out_file).toMatch(/xdt-maker-cua[/\\]get_window_state-7-/);
+  });
+
+  it('preserves explicit get_window_state screenshot output paths', async () => {
+    mcpCallToolMock
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true}' }] })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true}' }] })
+      .mockResolvedValueOnce({
+        content: [{ type: 'text', text: '{"ok":true,"screenshot_file_path":"/tmp/custom.png"}' }],
+      });
+
+    await callComputerDriverTool('get_window_state', {
+      pid: 123,
+      window_id: 7,
+      capture_mode: 'vision',
+      screenshot_out_file: '/tmp/custom.png',
+      session: 'session-1',
+    }, { sessionId: 'session-1' });
+
+    const payload = mcpCallToolMock.mock.calls[2]?.[0]?.arguments as {
+      pid?: number;
+      window_id?: number;
+      capture_mode?: string;
+      screenshot_out_file?: string;
+      session: string;
+    };
+    expect(payload).toMatchObject({
+      pid: 123,
+      window_id: 7,
+      capture_mode: 'vision',
+      screenshot_out_file: '/tmp/custom.png',
+    });
+    expectDriverSessionGenerations([payload.session], 'session-1', [0]);
+  });
+
+  it('does not add screenshot output paths for ax-only window state reads', async () => {
+    mcpCallToolMock
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true}' }] })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true}' }] })
+      .mockResolvedValueOnce({
+        content: [{ type: 'text', text: '{"ok":true,"tree_markdown":"button"}' }],
+      });
+
+    await callComputerDriverTool('get_window_state', {
+      pid: 123,
+      window_id: 7,
+      capture_mode: 'ax',
+      session: 'session-1',
+    }, { sessionId: 'session-1' });
+
+    const payload = mcpCallToolMock.mock.calls[2]?.[0]?.arguments as {
+      pid?: number;
+      window_id?: number;
+      capture_mode?: string;
+      session: string;
+    };
+    expect(payload).toMatchObject({
+      pid: 123,
+      window_id: 7,
+      capture_mode: 'ax',
+    });
+    expectDriverSessionGenerations([payload.session], 'session-1', [0]);
+  });
+
+  it('styles the Cindy cursor once per long-lived MCP session before actions', async () => {
+    mcpCallToolMock
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true}' }] })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true}' }] })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true,"clicked":true}' }] })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true,"clicked":true}' }] });
+
+    await expect(callComputerDriverTool('click', {
+      pid: 123,
+      window_id: 7,
+      x: 10,
+      y: 20,
+      session: 'session-1',
+    }, { sessionId: 'session-1' })).resolves.toEqual({ ok: true, clicked: true });
+    await expect(callComputerDriverTool('click', {
+      pid: 123,
+      window_id: 7,
+      x: 11,
+      y: 21,
+      session: 'session-1',
+    }, { sessionId: 'session-1' })).resolves.toEqual({ ok: true, clicked: true });
+
+    const toolCalls = mcpCallToolMock.mock.calls.map((call) => call[0]?.name);
+    expect(toolCalls).toEqual([
+      'set_agent_cursor_motion',
+      'set_agent_cursor_style',
+      'click',
+      'click',
+    ]);
+    expect(mcpCallToolMock.mock.calls[0]?.[0]?.arguments).toMatchObject({
+      cursor_color: '#DF0C27',
+      cursor_label: BRAND_NAME,
+    });
+    expect(mcpCallToolMock.mock.calls[1]?.[0]?.arguments).toMatchObject({
+      gradient_colors: ['#DF0C27', '#A61629'],
+      bloom_color: '#DF0C27',
+    });
+    expect(mcpConnectMock).toHaveBeenCalledTimes(1);
+  });
+
+  // 测试价值：生产入口 callComputerDriverTool 必须在 cua-driver 0.38 的闭合 schema 下
+  // 跳过无法表达的旧光标装饰，同时继续派发用户动作。#6979；旧测试只覆盖开放 schema。
+  // 最小失败输入是只声明新运动字段且缺少旧 style 工具的 tools/list；unit tier，无真实驱动。
+  it('skips incompatible optional cursor setup before dispatching the requested action', async () => {
+    mcpListToolsMock.mockResolvedValueOnce({
+      tools: [
+        ...COMPUTER_TOOLS.map((tool) => ({
+          name: tool.name,
+          inputSchema: { type: 'object', additionalProperties: true },
+        })),
+        {
+          name: 'set_agent_cursor_motion',
+          inputSchema: {
+            type: 'object',
+            properties: { arc_flow: {}, style: {}, timing: {} },
+            additionalProperties: false,
+          },
+        },
+        { name: 'end_session', inputSchema: { type: 'object', additionalProperties: true } },
+      ],
+    });
+    mcpCallToolMock.mockResolvedValueOnce({
+      content: [{ type: 'text', text: '{"ok":true,"clicked":true}' }],
+    });
+
+    await expect(callComputerDriverTool('click', {
+      pid: 123,
+      window_id: 7,
+      x: 10,
+      y: 20,
+    }, { sessionId: 'session-cursor-v038' })).resolves.toEqual({ ok: true, clicked: true });
+
+    expect(mcpCallToolMock.mock.calls.map((call) => call[0]?.name)).toEqual(['click']);
+  });
+
+  it('dispatches only cursor fields advertised by a closed driver schema', async () => {
+    mcpListToolsMock.mockResolvedValueOnce({
+      tools: [
+        ...COMPUTER_TOOLS.map((tool) => ({
+          name: tool.name,
+          inputSchema: { type: 'object', additionalProperties: true },
+        })),
+        {
+          name: 'set_agent_cursor_motion',
+          inputSchema: {
+            type: 'object',
+            properties: { cursor_color: {} },
+            additionalProperties: false,
+          },
+        },
+        { name: 'end_session', inputSchema: { type: 'object', additionalProperties: true } },
+      ],
+    });
+    mcpCallToolMock
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true}' }] })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true,"clicked":true}' }] });
+
+    await expect(callComputerDriverTool('click', {
+      pid: 123,
+      window_id: 7,
+      x: 10,
+      y: 20,
+    }, { sessionId: 'session-cursor-partial' })).resolves.toEqual({ ok: true, clicked: true });
+
+    expect(mcpCallToolMock.mock.calls.map((call) => call[0]?.name)).toEqual([
+      'set_agent_cursor_motion',
+      'click',
+    ]);
+    expect(mcpCallToolMock.mock.calls[0]?.[0]?.arguments).toEqual({ cursor_color: '#DF0C27' });
+  });
+
+  it('names the run after its first goal and ignores later step descriptions', async () => {
+    mcpCallToolMock.mockResolvedValue({ content: [{ type: 'text', text: '{"ok":true}' }] });
+    await callComputerDriverTool('list_windows', { session_goal: '提交报销申请' }, { sessionId: 'goal-a' });
+    await callComputerDriverTool('type_text', { pid: 1, text: 'x'.repeat(850), session_goal: '输入文字' }, { sessionId: 'goal-a' });
+    const calls = mcpCallToolMock.mock.calls.map(([call]) => call)
+      .filter((call) => ['list_windows', 'type_text'].includes(call.name));
+    expect(calls).toHaveLength(4);
+    const driverSession = calls[0].arguments.session;
+    expect(driverSession).toMatch(/^提交报销申请 · \d+-cua-[a-f0-9]{12}-0$/);
+    expect(calls.every((call) => call.arguments.session === driverSession)).toBe(true);
+    expect(calls.every((call) => !('session_goal' in call.arguments))).toBe(true);
+    await cleanupComputerDriverSession('goal-a');
+    expect(mcpCallToolMock.mock.lastCall![0]).toEqual({ name: 'end_session', arguments: { session: driverSession } });
+    await callComputerDriverTool('list_windows', { session_goal: '调整通知设置' }, { sessionId: 'goal-a' });
+    expect(mcpCallToolMock.mock.lastCall![0].arguments.session).toMatch(/^调整通知设置 · \d+-cua-[a-f0-9]{12}-1$/);
+  });
+
+  it('claims the first goal before asynchronous startup and isolates identical goals', async () => {
+    const startup = createDeferred<void>();
+    mcpConnectMock.mockReturnValueOnce(startup.promise);
+    mcpCallToolMock.mockResolvedValue({ content: [{ type: 'text', text: '{"ok":true}' }] });
+    const first = callComputerDriverTool('list_windows', { session_goal: 'Configure notifications' }, { sessionId: 'goal-a' });
+    const second = callComputerDriverTool('list_windows', { session_goal: 'Click button' }, { sessionId: 'goal-a' });
+    startup.resolve();
+    await Promise.all([first, second]);
+    await callComputerDriverTool('list_windows', { session_goal: 'Configure notifications' }, { sessionId: 'goal-b' });
+    const ids = mcpCallToolMock.mock.calls.map(([call]) => call.arguments.session);
+    expect(ids[0]).toBe(ids[1]);
+    expect(ids[0]).toMatch(/^Configure notifications · /);
+    expect(ids[2]).toMatch(/^Configure notifications · /);
+    expect(ids[2]).not.toBe(ids[0]);
+  });
+
+  it('preserves the goal through transport recovery and only rotates the generation', async () => {
+    mcpCallToolMock.mockImplementation(async (call) => {
+      if (call.name === 'list_windows' && call.arguments.session.endsWith('-0')) {
+        return { content: [{ type: 'text', text: '"session ended; tool call ignored"' }] };
+      }
+      return { content: [{ type: 'text', text: '{"ok":true}' }] };
+    });
+    await callComputerDriverTool('list_windows', { session_goal: 'Submit report' }, { sessionId: 'goal-retry' });
+    const ids = mcpCallToolMock.mock.calls.map(([call]) => call)
+      .filter((call) => call.name === 'list_windows').map((call) => call.arguments.session);
+    expect(ids).toHaveLength(2);
+    expect(ids[0]).toMatch(/^Submit report · /);
+    expect(ids[1]).toBe(ids[0].replace(/-0$/, '-1'));
+  });
+
+  it('keeps legacy identity when the first call omits a goal and strips host metadata on old drivers', async () => {
+    mcpCallToolMock.mockResolvedValue({ content: [{ type: 'text', text: '{"ok":true}' }] });
+    await callComputerDriverTool('list_windows', {}, { sessionId: 'legacy' });
+    await callComputerDriverTool('list_windows', { session_goal: 'Late name' }, { sessionId: 'legacy' });
+    const calls = mcpCallToolMock.mock.calls.map(([call]) => call.arguments);
+    expectDriverSessionGenerations(calls.map((args) => args.session), 'legacy', [0, 0]);
+    expect(calls.every((args) => !('session_goal' in args))).toBe(true);
+  });
+
+  it('retries Cindy cursor styling after a transient styling failure', async () => {
+    mcpCallToolMock
+      .mockRejectedValueOnce(new Error('motion unavailable'))
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true}' }] })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true,"clicked":true}' }] })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true}' }] })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true,"clicked":true}' }] });
+
+    await expect(callComputerDriverTool('click', {
+      pid: 123,
+      window_id: 7,
+      x: 10,
+      y: 20,
+      session: 'session-1',
+    }, { sessionId: 'session-1' })).resolves.toEqual({ ok: true, clicked: true });
+    await expect(callComputerDriverTool('click', {
+      pid: 123,
+      window_id: 7,
+      x: 11,
+      y: 21,
+      session: 'session-1',
+    }, { sessionId: 'session-1' })).resolves.toEqual({ ok: true, clicked: true });
+
+    const toolCalls = mcpCallToolMock.mock.calls.map((call) => call[0]?.name);
+    expect(toolCalls).toEqual([
+      'set_agent_cursor_motion',
+      'set_agent_cursor_style',
+      'click',
+      'set_agent_cursor_motion',
+      'click',
+    ]);
+  });
+
+  it('stops retrying unsupported cursor setup tools for the current MCP session', async () => {
+    mcpCallToolMock
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true}' }] })
+      .mockResolvedValueOnce({
+        isError: true,
+        content: [{ type: 'text', text: "Permission denied: tool 'set_agent_cursor_style' has no reviewed risk classification" }],
+      })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true,"clicked":true}' }] })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true,"clicked":true}' }] });
+
+    await expect(callComputerDriverTool('click', {
+      pid: 123,
+      window_id: 7,
+      x: 10,
+      y: 20,
+    }, { sessionId: 'session-unsupported-style' })).resolves.toEqual({ ok: true, clicked: true });
+    await expect(callComputerDriverTool('click', {
+      pid: 123,
+      window_id: 7,
+      x: 11,
+      y: 21,
+    }, { sessionId: 'session-unsupported-style' })).resolves.toEqual({ ok: true, clicked: true });
+
+    expect(mcpCallToolMock.mock.calls.map((call) => call[0]?.name)).toEqual([
+      'set_agent_cursor_motion',
+      'set_agent_cursor_style',
+      'click',
+      'click',
+    ]);
+    expect(mcpConnectMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not retry unsupported cursor setup after stale driver recovery', async () => {
+    mcpCallToolMock
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true}' }] })
+      .mockResolvedValueOnce({
+        isError: true,
+        content: [{ type: 'text', text: "Permission denied: tool 'set_agent_cursor_style' has no reviewed risk classification" }],
+      })
+      .mockImplementationOnce((call: { name: string; arguments: Record<string, unknown> }) => ({
+        isError: true,
+        content: [{
+          type: 'text',
+          text: `session '${String(call.arguments.session)}' has ended; tool call '${call.name}' was rejected`,
+        }],
+      }))
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true}' }] })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true}' }] })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true,"clicked":true}' }] });
+
+    await expect(callComputerDriverTool('get_window_state', {
+      pid: 123,
+      window_id: 7,
+      x: 10,
+      y: 20,
+    }, { sessionId: 'session-style-stale-recovery' })).resolves.toEqual({ ok: true, clicked: true });
+
+    expect(mcpCallToolMock.mock.calls.map((call) => call[0]?.name)).toEqual([
+      'set_agent_cursor_motion',
+      'set_agent_cursor_style',
+      'get_window_state',
+      'end_session',
+      'set_agent_cursor_motion',
+      'get_window_state',
+    ]);
+    expect(mcpConnectMock).toHaveBeenCalledTimes(2);
+    expect(mcpCloseMock).toHaveBeenCalledTimes(1);
+    const clickSessions = mcpCallToolMock.mock.calls
+      .map((call) => call[0])
+      .filter((call) => call?.name === 'get_window_state')
+      .map((call) => (call?.arguments as { session: string }).session);
+    expectDriverSessionGenerations(clickSessions, 'session-style-stale-recovery', [0, 1]);
+  });
+
+  it('re-probes unsupported cursor setup after the logical MCP session is closed', async () => {
+    mcpCallToolMock
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true}' }] })
+      .mockResolvedValueOnce({
+        isError: true,
+        content: [{ type: 'text', text: "Permission denied: tool 'set_agent_cursor_style' has no reviewed risk classification" }],
+      })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true,"clicked":true}' }] })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true}' }] })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true}' }] })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true}' }] })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true,"clicked":true}' }] });
+
+    await callComputerDriverTool('click', {
+      pid: 123,
+      window_id: 7,
+      x: 10,
+      y: 20,
+    }, { sessionId: 'session-style-recreated' });
+    await cleanupComputerDriverSession('session-style-recreated');
+    mcpCallToolMock.mockResolvedValueOnce({ structuredContent: { ok: true, clicked: true } });
+    await callComputerDriverTool('get_window_state', { pid: 123, window_id: 7 }, { sessionId: 'session-style-recreated' });
+    await callComputerDriverTool('click', {
+      pid: 123,
+      window_id: 7,
+      x: 11,
+      y: 21,
+    }, { sessionId: 'session-style-recreated' });
+
+    expect(mcpCallToolMock.mock.calls.map((call) => call[0]?.name)).toEqual([
+      'set_agent_cursor_motion',
+      'set_agent_cursor_style',
+      'click',
+      'end_session',
+      'set_agent_cursor_motion',
+      'set_agent_cursor_style',
+      'get_window_state',
+      'click',
+    ]);
+    expect(mcpConnectMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('throws the driver stderr when a tool call exits non-zero', async () => {
+    mcpCallToolMock.mockResolvedValueOnce({
+      isError: true,
+      content: [{ type: 'text', text: 'permission denied' }],
+    });
+
+    await expect(callComputerDriverTool('list_windows', { session: 'session-1' }, { sessionId: 'session-1' })).rejects.toThrow(
+      'permission denied',
+    );
+  });
+
+  it('cleans up a broken CUA MCP client after transport failures so the session can recover', async () => {
+    mcpCallToolMock
+      .mockRejectedValueOnce(new Error('transport closed'))
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true}' }] })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true,"windows":[{"window_id":7}]}' }] });
+
+    await expect(callComputerDriverTool('list_windows', { session: 'session-recover' }, { sessionId: 'session-recover' })).rejects.toThrow(
+      'transport closed',
+    );
+    await expect(callComputerDriverTool('list_windows', { session: 'session-recover' }, { sessionId: 'session-recover' })).resolves.toEqual({
+      ok: true,
+      windows: [{ window_id: 7 }],
+    });
+
+    expect(mcpConnectMock).toHaveBeenCalledTimes(2);
+    expect(mcpCloseMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves a structured driver error after discovering output schemas', async () => {
+    mcpListToolsMock.mockResolvedValue({
+      tools: [
+        {
+          name: 'list_windows',
+          inputSchema: { type: 'object' },
+          outputSchema: { type: 'object', required: ['windows'] },
+        },
+      ],
+    });
+    mcpCallToolMock.mockResolvedValue({
+      isError: true,
+      content: [],
+      structuredContent: {
+        code: 'ax_window_unresolved',
+        message: 'Cannot resolve the target AX window',
+      },
+    });
+    await expect(
+      callComputerDriverTool('list_windows', {}, { sessionId: 'structured-error' }),
+    ).rejects.toMatchObject({
+      code: 'ax_window_unresolved',
+      message: 'Cannot resolve the target AX window',
+    });
+    expect(mcpCallToolMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('marks partial error delivery as unknown and never sends the next input chunk', async () => {
+    mcpCallToolMock.mockResolvedValue({
+      isError: true,
+      content: [{ type: 'text', text: 'type_text incomplete: delivered 12 of 13 characters' }],
+      structuredContent: { code: 'type_text_incomplete', effect: 'partial', delivered_chars: 12, requested_chars: 13 },
+    });
+    await expect(callComputerDriverTool('type_text', { pid: 1, window_id: 2, text: 'a'.repeat(850) }, { sessionId: 'partial-input-error' })).rejects.toMatchObject({
+      code: 'type_text_incomplete',
+      outcomeUnknown: true,
+    });
+    expect(mcpCallToolMock.mock.calls.filter(([request]) => request.name === 'type_text')).toHaveLength(1);
+  });
+
+  it('stops long input on malformed successful output and never sends the next chunk', async () => {
+    mcpListToolsMock.mockResolvedValue({
+      tools: [
+        {
+          name: 'type_text',
+          inputSchema: { type: 'object' },
+          outputSchema: { type: 'object', required: ['effect'] },
+        },
+      ],
+    });
+    mcpCallToolMock.mockResolvedValue({ content: [], structuredContent: { unexpected: true } });
+    await expect(
+      callComputerDriverTool(
+        'type_text',
+        { pid: 1, window_id: 2, text: 'a'.repeat(850) },
+        { sessionId: 'malformed-input-result' },
+      ),
+    ).rejects.toMatchObject({
+      code: 'DRIVER_OUTPUT_SCHEMA_MISMATCH',
+      outcomeUnknown: true,
+    });
+    expect(mcpCallToolMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['darwin', undefined, 'background'],
+    ['darwin', 'background', 'background'],
+    ['darwin', 'foreground', 'foreground'],
+    ['win32', undefined, undefined],
+    ['linux', undefined, undefined],
+  ] as const)(
+    'uses the platform drag default without overriding explicit mode: %s/%s',
+    async (platform, mode, expected) => {
+      setPlatform(platform);
+      mcpListToolsMock.mockResolvedValue({
+        tools: [
+          {
+            name: 'drag',
+            inputSchema: {
+              type: 'object',
+              properties: { delivery_mode: {} },
+              additionalProperties: true,
+            },
+          },
+        ],
+      });
+      mcpCallToolMock.mockResolvedValue({
+        content: [],
+        structuredContent: { effect: 'confirmed' },
+      });
+      const args = {
+        pid: 1,
+        window_id: 2,
+        from_x: 1,
+        from_y: 1,
+        to_x: 5,
+        to_y: 5,
+        ...(mode ? { delivery_mode: mode } : {}),
+      };
+      await callComputerDriverTool('drag', args, { sessionId: 'drag-default' });
+      const calls = mcpCallToolMock.mock.calls.filter(([call]) => call.name === 'drag');
+      expect(calls).toHaveLength(1);
+      expect(calls[0]![0].arguments.delivery_mode).toBe(expected);
+      expect(args).toEqual({
+        pid: 1,
+        window_id: 2,
+        from_x: 1,
+        from_y: 1,
+        to_x: 5,
+        to_y: 5,
+        ...(mode ? { delivery_mode: mode } : {}),
+      });
+    },
+  );
+
+  it('does not inject a delivery mode into a legacy driver that does not advertise it', async () => {
+    setPlatform('darwin');
+    const args = { pid: 1, window_id: 2, from_x: 1, from_y: 1, to_x: 5, to_y: 5 };
+    mcpListToolsMock.mockResolvedValue({
+      tools: [
+        {
+          name: 'drag',
+          inputSchema: {
+            type: 'object',
+            properties: Object.fromEntries(Object.keys(args).map((key) => [key, {}])),
+            additionalProperties: false,
+          },
+        },
+      ],
+    });
+    mcpCallToolMock.mockResolvedValue({ content: [], structuredContent: { effect: 'confirmed' } });
+    await callComputerDriverTool('drag', args, { sessionId: 'legacy-drag' });
+    expect(mcpCallToolMock).toHaveBeenCalledTimes(1);
+    expect(mcpCallToolMock.mock.calls[0]![0].arguments).toEqual(args);
+  });
+
+  // cua-driver 0.37 stopped naming the missing-app failure (2026-10-31 smoke run:
+  // `tool_invocation_failed` + "No installed macOS app found …"); the MCP recovery
+  // path and the smoke keep relying on the stable name.
+  it.each(['tool_invocation_failed', undefined])(
+    'names a missing app APP_NOT_INSTALLED when the driver reports it as %s', async (error) => {
+      mcpCallToolMock.mockResolvedValue({
+        isError: true,
+        content: [{ type: 'text', text: "No installed macOS app found for name 'Example'." }],
+        structuredContent: { ...(error ? { error } : {}), name: 'Example' },
+      });
+      await expect(
+        callComputerDriverTool('launch_app', { name: 'Example' }, { sessionId: 'app-error-generic' }),
+      ).rejects.toMatchObject({ code: 'APP_NOT_INSTALLED' });
+    },
+  );
+
+  it('keeps other snake_case driver codes instead of the generic code', async () => {
+    mcpCallToolMock.mockResolvedValue({
+      isError: true,
+      content: [{ type: 'text', text: 'step 1 of 1 failed' }],
+      structuredContent: { error: 'tool_invocation_failed' },
+    });
+    await expect(
+      callComputerDriverTool('get_window_state', { pid: 1, window_id: 2 }, { sessionId: 'snake-code' }),
+    ).rejects.toMatchObject({ code: 'tool_invocation_failed' });
+  });
+
+  it('preserves a named driver error stored in the error field', async () => {
+    mcpCallToolMock.mockResolvedValue({
+      isError: true,
+      content: [{ type: 'text', text: "No installed macOS app found for name 'Example'." }],
+      structuredContent: { error: 'APP_NOT_INSTALLED', name: 'Example' },
+    });
+    await expect(
+      callComputerDriverTool('launch_app', { name: 'Example' }, { sessionId: 'app-error-code' }),
+    ).rejects.toMatchObject({ code: 'APP_NOT_INSTALLED' });
+    expect(mcpCallToolMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([undefined, 'background'] as const)('does not escalate or repeat a refused background drag (%s)', async (mode) => {
+    setPlatform('darwin');
+    mcpListToolsMock.mockResolvedValue({
+      tools: [{
+        name: 'drag',
+        inputSchema: {
+          type: 'object',
+          properties: { delivery_mode: {} },
+          additionalProperties: true,
+        },
+      }],
+    });
+    mcpCallToolMock.mockImplementation(async ({ name }) =>
+      name === 'drag'
+        ? {
+            isError: true,
+            content: [{ type: 'text', text: 'background unavailable' }],
+            structuredContent: { code: 'background_unavailable' },
+          }
+        : { content: [], structuredContent: { ok: true } },
+    );
+    await expect(
+      callComputerDriverTool(
+        'drag',
+        {
+          pid: 1,
+          window_id: 2,
+          from_x: 1,
+          from_y: 1,
+          to_x: 5,
+          to_y: 5,
+          ...(mode ? { delivery_mode: mode } : {}),
+        },
+        { sessionId: 'explicit-background' },
+      ),
+    ).rejects.toMatchObject({ code: 'background_unavailable' });
+    const calls = mcpCallToolMock.mock.calls.filter(([call]) => call.name === 'drag');
+    expect(calls).toHaveLength(1);
+    expect(calls[0]![0].arguments.delivery_mode).toBe('background');
+  });
+
+  it('chunks long type_text calls before sending them to cua-driver', async () => {
+    const longText = 'a'.repeat(850);
+    mcpCallToolMock
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true}' }] })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true}' }] })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true,"inserted":400}' }] })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true,"inserted":400}' }] })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true,"inserted":50}' }] });
+
+    await expect(callComputerDriverTool('type_text', {
+      pid: 123,
+      window_id: 7,
+      text: longText,
+      session: 'caller-supplied',
+    }, { sessionId: 'session-long-text' })).resolves.toEqual({
+      ok: true,
+      inserted: 850,
+      chunks: 3,
+      chars: 850,
+      lastResult: { ok: true, inserted: 50 },
+    });
+
+    const typeCalls = mcpCallToolMock.mock.calls
+      .map((call) => call[0])
+      .filter((call) => call?.name === 'type_text');
+    expect(typeCalls).toHaveLength(3);
+    expect(typeCalls.map((call) => (call?.arguments as { text: string }).text.length)).toEqual([400, 400, 50]);
+    expectDriverSessionGenerations(
+      typeCalls.map((call) => (call?.arguments as { session: string }).session),
+      'session-long-text',
+      [0, 0, 0],
+    );
+  });
+
+  it('preserves a failed type_text chunk result without forcing aggregate success', async () => {
+    const longText = 'a'.repeat(850);
+    mcpCallToolMock
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true}' }] })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true}' }] })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true,"inserted":400}' }] })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":false,"error":"focused element rejected input","inserted":12}' }] });
+
+    await expect(callComputerDriverTool('type_text', {
+      pid: 123,
+      window_id: 7,
+      text: longText,
+      session: 'caller-supplied',
+    }, { sessionId: 'session-long-text-failure' })).resolves.toEqual({
+      ok: false,
+      error: 'focused element rejected input',
+      inserted: 412,
+      chunks: 2,
+      chars: 412,
+      lastResult: { ok: false, error: 'focused element rejected input', inserted: 12 },
+    });
+
+    const typeCalls = mcpCallToolMock.mock.calls
+      .map((call) => call[0])
+      .filter((call) => call?.name === 'type_text');
+    expect(typeCalls).toHaveLength(2);
+    expect(typeCalls.map((call) => (call?.arguments as { text: string }).text.length)).toEqual([400, 400]);
+  });
+
+  it('does not replay remaining text after an interrupted action', async () => {
+    let typed = 0;
+    mcpCallToolMock.mockImplementation(({ name }) => {
+      if (name === 'type_text' && ++typed === 2) throw new Error('session ended; tool call ignored');
+      return { content: [{ type: 'text', text: '{"ok":true,"inserted":400}' }] };
+    });
+    await expect(callComputerDriverTool('type_text', {
+      pid: 123, window_id: 7, text: 'a'.repeat(850),
+    }, { sessionId: 'text-interrupted' })).rejects.toMatchObject({
+      code: 'ACTION_OUTCOME_UNKNOWN', outcomeUnknown: true,
+    });
+    expect(typed).toBe(2);
+    expect(mcpConnectMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('stops chunked text on unknown effect and preserves the driver evidence', async () => {
+    mcpCallToolMock.mockImplementation(({ name }) => ({ structuredContent: name === 'type_text'
+      ? { effect: 'unverifiable', route: 'synthesized', event_count: 400 } : { ok: true } }));
+    const result = await callComputerDriverTool('type_text', { pid: 123, window_id: 7, text: 'a'.repeat(850) }, { sessionId: 'text-unknown' });
+    expect(result).toMatchObject({ effect: 'unverifiable', event_count: 400, completed_chars: 0, remaining_chars: 450 });
+    expect(mcpCallToolMock.mock.calls.filter(([call]) => call.name === 'type_text')).toHaveLength(1);
+  });
+
+  it('propagates cancellation and never dispatches the next text chunk', async () => {
+    const controller = new AbortController();
+    mcpCallToolMock.mockImplementation(({ name }, _schema, options) => {
+      if (name === 'type_text') {
+        expect(options.signal).toBe(controller.signal);
+        controller.abort();
+      }
+      return { structuredContent: { ok: true, effect: 'confirmed' } };
+    });
+    await expect(callComputerDriverTool('type_text', { pid: 123, window_id: 7, text: 'a'.repeat(850) }, {
+      sessionId: 'text-cancel', signal: controller.signal,
+    })).rejects.toMatchObject({ code: 'REQUEST_CANCELLED', outcomeUnknown: true });
+    expect(mcpCallToolMock.mock.calls.filter(([call]) => call.name === 'type_text')).toHaveLength(1);
+  });
+
+  it.each([false, true])('invalidates other tasks after Agent input, including session recreation=%s', async (recreate) => {
+    mcpCallToolMock.mockResolvedValue({ structuredContent: { ok: true } });
+    const target = { pid: 123, window_id: 7 };
+    const a = { sessionId: 'agent-a' }, b = { sessionId: 'agent-b' };
+    await callComputerDriverTool('get_window_state', target, a);
+    await callComputerDriverTool('get_window_state', target, b);
+    await callComputerDriverTool('click', { ...target, x: 1, y: 1 }, b);
+    if (recreate) await cleanupComputerDriverSession(a.sessionId);
+    await expect(callComputerDriverTool('click', { ...target, x: 1, y: 1 }, a))
+      .rejects.toMatchObject({ code: 'STALE_SNAPSHOT' });
+    await callComputerDriverTool('get_window_state', target, a);
+    await expect(callComputerDriverTool('click', { ...target, x: 1, y: 1 }, a)).resolves.toBeDefined();
+    // Own input does not invalidate a task's next primitive.
+    await expect(callComputerDriverTool('type_text', { ...target, text: 'hello' }, a)).resolves.toBeDefined();
+  });
+
+  it.each(['read-first', 'input-first'] as const)('does not authorize observations overlapping Agent input: %s', async (order) => {
+    const target = { pid: 123, window_id: 7 };
+    const read = createDeferred<unknown>();
+    const input = createDeferred<unknown>();
+    mcpCallToolMock.mockImplementation(({ name }) => name === 'get_window_state' ? read.promise
+      : name === 'click' ? input.promise : { structuredContent: { ok: true } });
+    const observe = () => callComputerDriverTool('get_window_state', target, { sessionId: 'reader' });
+    const act = () => callComputerDriverTool('click', { ...target, x: 1, y: 1 }, { sessionId: 'writer' });
+    const first = order === 'read-first' ? observe() : act();
+    await waitForCondition(() => mcpCallToolMock.mock.calls.some(([call]) => call.name === (order === 'read-first' ? 'get_window_state' : 'click')));
+    const second = order === 'read-first' ? act() : observe();
+    await waitForCondition(() => mcpCallToolMock.mock.calls.some(([call]) => call.name === 'click')
+      && mcpCallToolMock.mock.calls.some(([call]) => call.name === 'get_window_state'));
+    input.resolve({ structuredContent: { ok: true } });
+    read.resolve({ structuredContent: { ok: true } });
+    await Promise.all([first, second]);
+    await expect(callComputerDriverTool('click', { ...target, x: 1, y: 1 }, { sessionId: 'reader' }))
+      .rejects.toMatchObject({ code: 'STALE_SNAPSHOT' });
+  });
+
+  it('keeps text chunks together while another Agent waits', async () => {
+    const firstChunk = createDeferred<unknown>();
+    const events: string[] = [];
+    mcpCallToolMock.mockImplementation(({ name }) => {
+      if (name === 'type_text' || name === 'launch_app') events.push(name);
+      if (name === 'type_text' && events.length === 1) return firstChunk.promise;
+      return { structuredContent: { ok: true, effect: 'confirmed' } };
+    });
+    const typing = callComputerDriverTool('type_text', { pid: 123, window_id: 7, text: 'a'.repeat(850) }, { sessionId: 'typing' });
+    await waitForCondition(() => events.length === 1);
+    const launch = callComputerDriverTool('launch_app', { name: 'Calculator' }, { sessionId: 'launch' });
+    await waitForCondition(() => transportCtorMock.mock.calls.length === 2);
+    expect(events).toEqual(['type_text']);
+    firstChunk.resolve({ structuredContent: { ok: true, effect: 'confirmed' } });
+    await Promise.all([typing, launch]);
+    expect(events).toEqual(['type_text', 'type_text', 'type_text', 'launch_app']);
+  });
+
+  it('stops remaining text chunks on session close and releases input only after the in-flight call settles', async () => {
+    const first = createDeferred<unknown>();
+    const events: string[] = [];
+    mcpCallToolMock.mockImplementation(({ name }) => {
+      events.push(name);
+      if (name === 'type_text') return first.promise;
+      return { structuredContent: { ok: true, effect: 'confirmed' } };
+    });
+    const typing = callComputerDriverTool('type_text', { pid: 123, text: 'a'.repeat(850) }, { sessionId: 'closing-input' });
+    const rejected = expect(typing).rejects.toBeDefined();
+    await waitForCondition(() => events.includes('type_text'));
+    await cleanupComputerDriverSession('closing-input');
+    const next = callComputerDriverTool('launch_app', { name: 'Calculator' }, { sessionId: 'after-close' });
+    await waitForCondition(() => transportCtorMock.mock.calls.length === 2);
+    expect(events).not.toContain('launch_app');
+    first.resolve({ structuredContent: { ok: true, effect: 'confirmed' } });
+    await Promise.all([rejected, next]);
+    expect(events.filter((name) => name === 'type_text')).toHaveLength(1);
+    expect(events.filter((name) => name === 'launch_app')).toHaveLength(1);
+  });
+
+  it('holds ownership through failed-input teardown before admitting the next Agent', async () => {
+    const input = createDeferred<unknown>();
+    const teardown = createDeferred<unknown>();
+    const events: string[] = [];
+    mcpCallToolMock.mockImplementation(({ name }) => {
+      events.push(name);
+      if (name === 'type_text') return input.promise;
+      if (name === 'end_session') return teardown.promise;
+      return { structuredContent: { ok: true } };
+    });
+    const active = callComputerDriverTool('type_text', { pid: 123, text: 'hello' }, { sessionId: 'failing' });
+    const rejected = expect(active).rejects.toMatchObject({ code: 'ACTION_OUTCOME_UNKNOWN' });
+    await waitForCondition(() => events.includes('type_text'));
+    const next = callComputerDriverTool('launch_app', { name: 'Calculator' }, { sessionId: 'next' });
+    input.reject(new Error('transport closed'));
+    await waitForCondition(() => events.includes('end_session'));
+    expect(events).not.toContain('launch_app');
+    teardown.resolve({ structuredContent: { ok: true } });
+    await Promise.all([rejected, next]);
+    expect(events.filter((name) => ['type_text', 'end_session', 'launch_app'].includes(name)))
+      .toEqual(['type_text', 'end_session', 'launch_app']);
+  });
+
+  it('preserves the completed prefix and uncertain chunk after a typing transport failure', async () => {
+    let chunks = 0;
+    mcpCallToolMock.mockImplementation(({ name }) => {
+      if (name === 'type_text' && ++chunks === 2) throw new Error('transport closed');
+      return { structuredContent: { ok: true, effect: 'confirmed' } };
+    });
+    await expect(callComputerDriverTool('type_text', { pid: 123, text: 'a'.repeat(850) }, { sessionId: 'partial' }))
+      .rejects.toMatchObject({ code: 'ACTION_OUTCOME_UNKNOWN', outcomeUnknown: true,
+        inputProgress: { completed_chars: 400, attempted_chars: 400, remaining_chars: 50 } });
+    expect(chunks).toBe(2);
+  });
+
+  it('refuses an action prepared before another task changed the desktop', async () => {
+    const startup = createDeferred<void>();
+    mcpCallToolMock.mockResolvedValue({ structuredContent: { ok: true } });
+    const target = { pid: 123, window_id: 7 };
+    mcpConnectMock.mockReturnValueOnce(startup.promise);
+    const oldAction = callComputerDriverTool('click', { ...target, x: 1, y: 1 }, { sessionId: 'slow-start' });
+    const rejected = expect(oldAction).rejects.toMatchObject({ code: 'STALE_SNAPSHOT' });
+    await callComputerDriverTool('launch_app', { name: 'Calculator' }, { sessionId: 'other' });
+    startup.resolve();
+    await rejected;
+    expect(mcpCallToolMock.mock.calls.some(([call]) => call.name === 'click')).toBe(false);
+  });
+
+  it('cancels a queued same-session call without closing the active driver', async () => {
+    const pending = createDeferred<unknown>();
+    const controller = new AbortController();
+    mcpCallToolMock.mockImplementation(({ name }) => name === 'type_text' ? pending.promise : { structuredContent: { ok: true } });
+    const active = callComputerDriverTool('type_text', { pid: 123, text: 'hello' }, { sessionId: 'shared' });
+    await waitForCondition(() => mcpCallToolMock.mock.calls.some(([call]) => call.name === 'type_text'));
+    const queued = callComputerDriverTool('launch_app', { name: 'Calculator' }, { sessionId: 'shared', signal: controller.signal });
+    const rejected = expect(queued).rejects.toMatchObject({ code: 'REQUEST_CANCELLED', outcomeUnknown: false });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    controller.abort();
+    await rejected;
+    expect(mcpCloseMock).not.toHaveBeenCalled();
+    expect(mcpCallToolMock.mock.calls.some(([call]) => call.name === 'launch_app' || call.name === 'end_session')).toBe(false);
+    pending.resolve({ structuredContent: { ok: true } });
+    await active;
+  });
+
+  it('yields to remote input between text chunks and requires a fresh target before resuming', async () => {
+    vi.useFakeTimers();
+    const human = new HumanDesktopInput();
+    let batch: ReturnType<HumanDesktopInput['begin']> | undefined;
+    const context = { sessionId: 'remote-yield' };
+    const target = { pid: 123, window_id: 7 };
+    try {
+      mcpCallToolMock.mockImplementation(({ name }) => {
+        if (name === 'type_text' && !batch) batch = human.begin([{ kind: 'text', text: 'human' }]);
+        return { structuredContent: { ok: true, effect: 'confirmed' } };
+      });
+      await expect(callComputerDriverTool('type_text', { ...target, text: 'a'.repeat(850) }, context))
+        .rejects.toMatchObject({ code: 'DESKTOP_INPUT_YIELDED', outcomeUnknown: true,
+          inputProgress: { completed_chars: 400, attempted_chars: 0, remaining_chars: 450 } });
+      expect(mcpCallToolMock.mock.calls.filter(([call]) => call.name === 'type_text')).toHaveLength(1);
+      await batch!.ready;
+      batch!.complete();
+      vi.advanceTimersByTime(HUMAN_INPUT_QUIET_MS);
+      await expect(callComputerDriverTool('click', { ...target, x: 1, y: 1 }, context))
+        .rejects.toMatchObject({ code: 'STALE_SNAPSHOT' });
+      await callComputerDriverTool('get_window_state', target, context);
+      await expect(callComputerDriverTool('click', { ...target, x: 1, y: 1 }, context)).resolves.toBeDefined();
+    } finally {
+      human.release();
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(['pending', 'quiet', 'settled-before-return', 'input-during-read'] as const)(
+    'does not count an observation overlapping remote input (%s) as a fresh target', async (phase) => {
+    vi.useFakeTimers();
+    const human = new HumanDesktopInput();
+    const context = { sessionId: 'remote-observation' };
+    const target = { pid: 123, window_id: 7 };
+    try {
+      mcpCallToolMock.mockResolvedValue({ structuredContent: { ok: true } });
+      let batch: ReturnType<HumanDesktopInput['begin']> | undefined;
+      if (phase !== 'input-during-read') batch = human.begin([{ kind: 'text', text: 'human' }]);
+      if (phase === 'quiet') batch!.complete();
+      mcpCallToolMock.mockImplementation(({ name }) => {
+        if (name === 'get_window_state') {
+          if (phase === 'input-during-read' && !batch) batch = human.begin([{ kind: 'text', text: 'human' }]);
+          if (phase === 'settled-before-return' || phase === 'input-during-read' || phase === 'quiet') {
+            batch!.complete();
+            vi.advanceTimersByTime(HUMAN_INPUT_QUIET_MS);
+          }
+        }
+        return { structuredContent: { ok: true } };
+      });
+      await callComputerDriverTool('get_window_state', target, context);
+      batch!.complete();
+      vi.advanceTimersByTime(HUMAN_INPUT_QUIET_MS);
+      await expect(callComputerDriverTool('click', { ...target, x: 1, y: 1 }, context))
+        .rejects.toMatchObject({ code: 'STALE_SNAPSHOT' });
+      await callComputerDriverTool('get_window_state', { ...target, window_id: 8 }, context);
+      await expect(callComputerDriverTool('click', { ...target, x: 1, y: 1 }, context))
+        .rejects.toMatchObject({ code: 'STALE_SNAPSHOT' });
+      await callComputerDriverTool('get_window_state', target, context);
+      await expect(callComputerDriverTool('click', { ...target, x: 1, y: 1 }, context)).resolves.toBeDefined();
+    } finally { human.release(); vi.useRealTimers(); }
+  });
+
+  it.each([false, true])('requires successful re-observation after remote input, including session cleanup=%s', async (cleanup) => {
+    vi.useFakeTimers();
+    const human = new HumanDesktopInput();
+    const context = { sessionId: 'fresh-observation' };
+    const target = { pid: 123, window_id: 7 };
+    try {
+      mcpCallToolMock.mockResolvedValue({ structuredContent: { ok: true } });
+      if (cleanup) await callComputerDriverTool('get_window_state', target, context);
+      human.begin([{ kind: 'text', text: 'human' }]).complete();
+      vi.advanceTimersByTime(HUMAN_INPUT_QUIET_MS);
+      if (cleanup) await cleanupComputerDriverSession(context.sessionId);
+      await expect(callComputerDriverTool('click', target, context))
+        .rejects.toMatchObject({ code: 'STALE_SNAPSHOT' });
+      const failedObservations = [
+        { args: {}, result: { ok: false, error: 'unavailable' } },
+        { args: { capture_mode: 'vision' }, result: { screenshot_frame_valid: false, elements: [{}] } },
+        { args: { capture_mode: 'som' }, result: { screenshot_error: 'capture failed', tree_markdown: 'AX' } },
+        { args: { include_screenshot: true }, result: { screenshot_error: 'capture failed' } },
+        { args: { screenshot_out_file: '/tmp/test.png' }, result: { screenshot_frame_valid: false } },
+        { args: { capture_mode: 'ax' }, result: { degraded: true, elements: [], tree_markdown: '' } },
+        { args: { include_screenshot: false }, result: { degraded: true } },
+        { args: {}, result: { screenshot_error: 'capture failed', degraded: true } },
+      ];
+      for (const observation of failedObservations) {
+        mcpCallToolMock.mockResolvedValue({ structuredContent: observation.result });
+        await callComputerDriverTool('get_window_state', { ...target, ...observation.args }, context);
+        await expect(callComputerDriverTool('click', target, context))
+          .rejects.toMatchObject({ code: 'STALE_SNAPSHOT' });
+      }
+      mcpCallToolMock.mockResolvedValue({ structuredContent: { ok: true } });
+      await callComputerDriverTool('get_window_state', target, context);
+      for (const name of ['type_text', 'press_key', 'hotkey', 'click'] as const) {
+        await expect(callComputerDriverTool(name, { pid: 123, text: 'hello', key: 'a', keys: ['CTRL', 'a'] }, context))
+          .resolves.toBeDefined();
+      }
+      await expect(callComputerDriverTool('click', { pid: 124 }, context))
+        .rejects.toMatchObject({ code: 'STALE_SNAPSHOT' });
+      await expect(callComputerDriverTool('click', { ...target, window_id: 8 }, context))
+        .rejects.toMatchObject({ code: 'STALE_SNAPSHOT' });
+      await expect(callComputerDriverTool('click', target, context)).resolves.toBeDefined();
+    } finally { human.release(); vi.useRealTimers(); }
+  });
+
+  it('keeps remote-input gating after real recovery reads until an explicit window observation', async () => {
+    vi.useFakeTimers();
+    const human = new HumanDesktopInput();
+    const context = { sessionId: 'joint-recovery' };
+    const target = { pid: 123, window_id: 7, include_screenshot: false };
+    try {
+      mcpCallToolMock.mockResolvedValue({ structuredContent: { elements: [], tree_markdown: 'window' } });
+      human.begin([{ kind: 'text', text: 'human' }]).complete();
+      vi.advanceTimersByTime(HUMAN_INPUT_QUIET_MS);
+      const recovery = await readForRecovery({ getStatus: vi.fn(), callTool: callComputerDriverTool }, 'get_window_state', target, context);
+      expect(recovery.ok).toBe(true);
+      await expect(callComputerDriverTool('click', { pid: 123, window_id: 7, x: 1, y: 1 }, context)).rejects.toMatchObject({ code: 'STALE_SNAPSHOT' });
+      await expect(callComputerDriverTool('type_text', { pid: 123, text: 'agent' }, context)).rejects.toMatchObject({ code: 'STALE_SNAPSHOT' });
+      expect(mcpCallToolMock.mock.calls.filter(([call]) => ['click', 'type_text'].includes(call.name))).toHaveLength(0);
+      expect(mcpCallToolMock.mock.calls.every(([call]) => !('observationPurpose' in call.arguments))).toBe(true);
+      await callComputerDriverTool('get_window_state', target, context);
+      await expect(callComputerDriverTool('click', { pid: 123, window_id: 7, x: 1, y: 1 }, context)).resolves.toBeDefined();
+      await expect(callComputerDriverTool('type_text', { pid: 123, text: 'agent' }, context)).resolves.toBeDefined();
+    } finally { human.release(); vi.useRealTimers(); }
+  });
+
+  it.each([
+    { include_screenshot: false, result: { degraded: true, degraded_reason: 'ax_window_unresolved', elements: [] } },
+    { include_screenshot: true, result: { screenshot_frame_valid: false, screenshot_error: 'capture unavailable', elements: [] } },
+    { include_screenshot: false, result: { ok: false, code: 'window_id_not_found' } },
+  ])('revokes previous input authorization when explicit observation fails: $result', async ({ include_screenshot, result }) => {
+    vi.useFakeTimers();
+    const human = new HumanDesktopInput();
+    const context = { sessionId: 'joint-failed-observation' };
+    const target = { pid: 123, window_id: 7, include_screenshot };
+    try {
+      human.begin([{ kind: 'text', text: 'human' }]).complete();
+      vi.advanceTimersByTime(HUMAN_INPUT_QUIET_MS);
+      mcpCallToolMock.mockResolvedValue({ structuredContent: { elements: [], screenshot_frame_valid: true } });
+      await callComputerDriverTool('get_window_state', target, context);
+      mcpCallToolMock.mockResolvedValue({ structuredContent: result });
+      await callComputerDriverTool('get_window_state', target, context);
+      await expect(callComputerDriverTool('click', { pid: 123, window_id: 7, x: 1, y: 1 }, context)).rejects.toMatchObject({ code: 'STALE_SNAPSHOT' });
+      await expect(callComputerDriverTool('type_text', { pid: 123, text: 'agent' }, context)).rejects.toMatchObject({ code: 'STALE_SNAPSHOT' });
+    } finally { human.release(); vi.useRealTimers(); }
+  });
+
+  it('does not authorize input from an observation interrupted by remote input', async () => {
+    vi.useFakeTimers();
+    const human = new HumanDesktopInput();
+    const context = { sessionId: 'joint-interrupted-observation' };
+    const target = { pid: 123, window_id: 7, include_screenshot: false };
+    const pending = createDeferred<unknown>();
+    try {
+      mcpCallToolMock.mockImplementation(({ name }) => name === 'get_window_state' ? pending.promise : { structuredContent: { ok: true } });
+      const read = callComputerDriverTool('get_window_state', target, context);
+      await vi.waitFor(() => expect(mcpCallToolMock.mock.calls.some(([call]) => call.name === 'get_window_state')).toBe(true));
+      human.begin([{ kind: 'text', text: 'human' }]).complete();
+      vi.advanceTimersByTime(HUMAN_INPUT_QUIET_MS);
+      pending.resolve({ structuredContent: { elements: [], tree_markdown: 'window' } });
+      await read;
+      await expect(callComputerDriverTool('click', { pid: 123, window_id: 7, x: 1, y: 1 }, context)).rejects.toMatchObject({ code: 'STALE_SNAPSHOT' });
+      await callComputerDriverTool('get_window_state', target, context);
+      await expect(callComputerDriverTool('click', { pid: 123, window_id: 7, x: 1, y: 1 }, context)).resolves.toBeDefined();
+    } finally { human.release(); vi.useRealTimers(); }
+  });
+
+  it.each([
+    { newerWindow: 7, cancel: false },
+    { newerWindow: 7, cancel: true },
+    { newerWindow: 8, cancel: false },
+    { newerWindow: 8, cancel: true },
+  ])('does not let a late observation undo newer failure: $newerWindow, cancelled=$cancel', async ({ newerWindow, cancel }) => {
+    vi.useFakeTimers();
+    const human = new HumanDesktopInput();
+    const context = { sessionId: 'joint-concurrent-observation' };
+    const target = { pid: 123, window_id: 7, include_screenshot: false };
+    const pending = createDeferred<unknown>();
+    try {
+      human.begin([{ kind: 'text', text: 'human' }]).complete();
+      vi.advanceTimersByTime(HUMAN_INPUT_QUIET_MS);
+      mcpCallToolMock.mockImplementation(({ name }) => name === 'get_window_state' ? pending.promise : { structuredContent: { ok: true } });
+      const older = callComputerDriverTool('get_window_state', target, context);
+      await vi.waitFor(() => expect(mcpCallToolMock.mock.calls.some(([call]) => call.name === 'get_window_state')).toBe(true));
+      mcpCallToolMock.mockResolvedValue({ structuredContent: { ok: false, code: 'window_id_not_found' } });
+      const controller = new AbortController();
+      if (cancel) controller.abort();
+      const newer = callComputerDriverTool('get_window_state', { ...target, window_id: newerWindow }, { ...context, signal: controller.signal });
+      if (cancel) await expect(newer).rejects.toBeDefined();
+      else await newer;
+      pending.resolve({ structuredContent: { elements: [], tree_markdown: 'window' } });
+      await older;
+      await expect(callComputerDriverTool('type_text', { pid: 123, text: 'agent' }, context)).rejects.toMatchObject({ code: 'STALE_SNAPSHOT' });
+      await expect(callComputerDriverTool('click', { pid: 123, window_id: newerWindow, x: 1, y: 1 }, context)).rejects.toMatchObject({ code: 'STALE_SNAPSHOT' });
+      mcpCallToolMock.mockResolvedValue({ structuredContent: { elements: [], tree_markdown: 'window' } });
+      if (newerWindow !== 7) {
+        await expect(callComputerDriverTool('click', { pid: 123, window_id: 7, x: 1, y: 1 }, context)).resolves.toBeDefined();
+      }
+      await callComputerDriverTool('get_window_state', { ...target, window_id: newerWindow }, context);
+      await expect(callComputerDriverTool('type_text', { pid: 123, text: 'agent' }, context)).resolves.toBeDefined();
+    } finally { human.release(); vi.useRealTimers(); }
+  });
+
+  it('bounds delayed typing chunks while a remote input connection is open', async () => {
+    const human = new HumanDesktopInput();
+    try {
+      mcpCallToolMock.mockResolvedValue({ structuredContent: { ok: true, effect: 'confirmed' } });
+      await callComputerDriverTool('type_text', { pid: 123, window_id: 7, text: 'abc', delay_ms: 200 }, { sessionId: 'remote-slow-text' });
+      expect(mcpCallToolMock.mock.calls.filter(([call]) => call.name === 'type_text')
+        .map(([call]) => call.arguments.text)).toEqual(['a', 'b', 'c']);
+    } finally { human.release(); }
+  });
+
+  it('lets remote input proceed during driver startup and refuses the now-stale Agent action', async () => {
+    const human = new HumanDesktopInput();
+    let finish!: () => void;
+    mcpConnectMock.mockImplementationOnce(() => new Promise<void>((resolve) => { finish = resolve; }));
+    const action = callComputerDriverTool('click', { pid: 123, window_id: 7, x: 1, y: 1 }, { sessionId: 'remote-startup' });
+    const rejected = expect(action).rejects.toThrow('Agent yielded');
+    try {
+      await vi.waitFor(() => expect(mcpConnectMock).toHaveBeenCalled());
+      const batch = human.begin([{ kind: 'text', text: 'human' }]);
+      await batch.ready;
+      batch.complete();
+      finish();
+      await rejected;
+      expect(mcpCallToolMock.mock.calls.filter(([call]) => call.name === 'click')).toHaveLength(0);
+    } finally { finish?.(); human.release(); }
+  });
+
+  it('keeps remote input waiting through driver teardown after an interrupted primitive', async () => {
+    const human = new HumanDesktopInput();
+    let batch: ReturnType<HumanDesktopInput['begin']> | undefined;
+    let finish!: () => void;
+    let delivered = false;
+    mcpCallToolMock.mockImplementation(({ name }) => {
+      if (name === 'type_text') {
+        batch = human.begin([{ kind: 'text', text: 'human' }]);
+        void batch.ready.then(() => { delivered = true; });
+        throw new Error('session ended; tool call ignored');
+      }
+      if (name === 'end_session') return new Promise((resolve) => {
+        finish = () => resolve({ structuredContent: { ok: true } });
+      });
+      return { structuredContent: { ok: true } };
+    });
+    const action = callComputerDriverTool('type_text', { pid: 123, window_id: 7, text: 'hello' }, { sessionId: 'remote-teardown' });
+    const rejected = expect(action).rejects.toMatchObject({ code: 'ACTION_OUTCOME_UNKNOWN' });
+    try {
+      await vi.waitFor(() => expect(finish).toBeTypeOf('function'));
+      expect(delivered).toBe(false);
+      finish(); await rejected; await batch!.ready;
+      expect(delivered).toBe(true);
+      batch!.complete();
+    } finally { finish?.(); human.release(); }
+  });
+
+  it.each(['connect', 'tools/list'] as const)('cancels the caller during %s without interrupting shared startup', async (phase) => {
+    mcpCallToolMock.mockResolvedValue({ structuredContent: { width: 1920, height: 1080 } });
+    let finish!: () => void;
+    const pending = new Promise<void>((resolve) => { finish = resolve; });
+    if (phase === 'connect') mcpConnectMock.mockImplementationOnce(() => pending);
+    else mcpListToolsMock.mockImplementationOnce(async () => {
+      await pending;
+      return { tools: [{ name: 'get_screen_size', inputSchema: { type: 'object' } }] };
+    });
+    const controller = new AbortController();
+    const cancelled = callComputerDriverTool('click', { pid: 123, window_id: 7, x: 1, y: 1 }, {
+      sessionId: 'startup-cancel', signal: controller.signal,
+    });
+    const rejected = expect(cancelled).rejects.toMatchObject({ code: 'REQUEST_CANCELLED' });
+    await vi.waitFor(() => expect(phase === 'connect' ? mcpConnectMock : mcpListToolsMock).toHaveBeenCalledTimes(1));
+    const otherCaller = callComputerDriverTool('get_screen_size', {}, { sessionId: 'startup-cancel' });
+    controller.abort();
+    await rejected; // Must settle before startup finishes, rather than after its timeout.
+    expect(mcpCallToolMock).not.toHaveBeenCalled();
+    expect(mcpCloseMock).not.toHaveBeenCalled();
+    finish();
+    await otherCaller;
+    expect(mcpConnectMock).toHaveBeenCalledTimes(1);
+    expect(mcpCallToolMock.mock.calls.map(([call]) => call.name)).toEqual(['get_screen_size']);
+  });
+
+  it('cancels a fresh-session retry while its connection is still pending', async () => {
+    let finish!: () => void;
+    mcpConnectMock.mockResolvedValueOnce(undefined).mockImplementationOnce(() => new Promise<void>((resolve) => { finish = resolve; }));
+    mcpCallToolMock.mockImplementation(({ name }) => {
+      if (name === 'get_window_state') throw new Error('Not connected');
+      return { structuredContent: { ok: true } };
+    });
+    const controller = new AbortController();
+    const call = callComputerDriverTool('get_window_state', { pid: 123, window_id: 7 }, {
+      sessionId: 'retry-startup-cancel', signal: controller.signal,
+    });
+    const rejected = expect(call).rejects.toMatchObject({ code: 'REQUEST_CANCELLED' });
+    await vi.waitFor(() => expect(mcpConnectMock).toHaveBeenCalledTimes(2));
+    controller.abort();
+    await rejected;
+    finish();
+    await Promise.resolve();
+    expect(mcpCallToolMock.mock.calls.filter(([tool]) => tool.name === 'get_window_state')).toHaveLength(1);
+  });
+
+  it('stops optional cursor setup as soon as cancellation arrives', async () => {
+    const controller = new AbortController();
+    mcpCallToolMock.mockImplementation(({ name }) => {
+      if (name === 'set_agent_cursor_motion') controller.abort();
+      return { structuredContent: { ok: true } };
+    });
+    await expect(callComputerDriverTool('click', { pid: 123, window_id: 7, x: 10, y: 20 }, {
+      sessionId: 'setup-cancel', signal: controller.signal,
+    })).rejects.toMatchObject({ code: 'REQUEST_CANCELLED' });
+    expect(mcpCallToolMock.mock.calls.map(([call]) => call.name)).toEqual(['set_agent_cursor_motion']);
+    expect(mcpCloseMock).not.toHaveBeenCalled();
+  });
+
+  it('negotiates paginated tools once per connection and fails unsupported actions locally', async () => {
+    mcpListToolsMock.mockReset();
+    mcpListToolsMock.mockResolvedValueOnce({ tools: [], nextCursor: 'next' }).mockResolvedValueOnce({ tools: [
+      { name: 'list_windows', inputSchema: { type: 'object', additionalProperties: true } },
+    ] });
+    mcpCallToolMock.mockResolvedValue({ structuredContent: { windows: [] } });
+    await callComputerDriverTool('list_windows', {}, { sessionId: 'pagination' });
+    await callComputerDriverTool('list_windows', {}, { sessionId: 'pagination' });
+    await expect(callComputerDriverTool('click', { pid: 123, window_id: 7, x: 1, y: 1 }, { sessionId: 'pagination' }))
+      .rejects.toMatchObject({ code: 'COMPUTER_DRIVER_INCOMPATIBLE' });
+    expect(mcpListToolsMock).toHaveBeenCalledTimes(2);
+    expect(mcpListToolsMock).toHaveBeenLastCalledWith({ cursor: 'next' });
+    expect(mcpCallToolMock.mock.calls.map(([call]) => call.name)).toEqual(['list_windows', 'list_windows']);
+  });
+
+  it('rotates the driver session and retries once when cua-driver reports session ended', async () => {
+    mcpCallToolMock
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true}' }] })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true}' }] })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '"session ended; tool call ignored"' }] })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true}' }] })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true}' }] })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true}' }] })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true,"screenshot_file_path":"/tmp/recovered.png"}' }] });
+
+    await expect(callComputerDriverTool('get_window_state', {
+      pid: 123,
+      window_id: 7,
+      capture_mode: 'vision',
+      session: 'caller-supplied',
+    }, { sessionId: 'session-stale' })).resolves.toEqual({
+      ok: true,
+      screenshot_file_path: '/tmp/recovered.png',
+    });
+
+    expect(mcpConnectMock).toHaveBeenCalledTimes(2);
+    expect(mcpCloseMock).toHaveBeenCalledTimes(1);
+    const stateCalls = mcpCallToolMock.mock.calls
+      .map((call) => call[0])
+      .filter((call) => call?.name === 'get_window_state');
+    expectDriverSessionGenerations(
+      stateCalls.map((call) => (call?.arguments as { session: string }).session),
+      'session-stale',
+      [0, 1],
+    );
+  });
+
+  it('rotates and retries when cua-driver rejects a call because the named session has ended', async () => {
+    mcpCallToolMock.mockImplementation((call: { name: string; arguments: Record<string, unknown> }) => {
+      if (call.name === 'end_session') {
+        return { content: [{ type: 'text', text: '{"ok":true}' }] };
+      }
+      if (call.name === 'list_windows') {
+        const generation = driverSessionGeneration(
+          String(call.arguments.session),
+          'session-ended-rejected',
+        );
+        if (generation === 0) {
+          return {
+            isError: true,
+            content: [{
+              type: 'text',
+              text: `session '${String(call.arguments.session)}' has ended; tool call '${call.name}' was rejected`,
+            }],
+          };
+        }
+        return {
+          content: [{ type: 'text', text: '{"ok":true,"windows":[{"window_id":9}]}' }],
+        };
+      }
+      throw new Error(`unexpected call ${call.name}`);
+    });
+
+    await expect(callComputerDriverTool('list_windows', {
+      session: 'caller-supplied',
+    }, { sessionId: 'session-ended-rejected' })).resolves.toEqual({
+      ok: true,
+      windows: [{ window_id: 9 }],
+    });
+
+    expect(mcpConnectMock).toHaveBeenCalledTimes(2);
+    expect(mcpCloseMock).toHaveBeenCalledTimes(1);
+    const listCalls = mcpCallToolMock.mock.calls
+      .map((call) => call[0])
+      .filter((call) => call?.name === 'list_windows');
+    expectDriverSessionGenerations(
+      listCalls.map((call) => (call?.arguments as { session: string }).session),
+      'session-ended-rejected',
+      [0, 1],
+    );
+  });
+
+  it('rotates the driver session and retries once when cua-driver reports not connected', async () => {
+    mcpCallToolMock
+      .mockRejectedValueOnce(new Error('Not connected'))
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true}' }] })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true,"windows":[{"window_id":9}]}' }] });
+
+    await expect(callComputerDriverTool('list_windows', {
+      session: 'caller-supplied',
+    }, { sessionId: 'session-not-connected' })).resolves.toEqual({
+      ok: true,
+      windows: [{ window_id: 9 }],
+    });
+
+    expect(mcpConnectMock).toHaveBeenCalledTimes(2);
+    expect(mcpCloseMock).toHaveBeenCalledTimes(1);
+    const listCalls = mcpCallToolMock.mock.calls
+      .map((call) => call[0])
+      .filter((call) => call?.name === 'list_windows');
+    expectDriverSessionGenerations(
+      listCalls.map((call) => (call?.arguments as { session: string }).session),
+      'session-not-connected',
+      [0, 1],
+    );
+  });
+
+  it('rotates the driver session and retries once when cua-driver returns Not connected as an error result', async () => {
+    mcpCallToolMock
+      .mockResolvedValueOnce({
+        isError: true,
+        content: [{ type: 'text', text: 'Not connected' }],
+      })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true}' }] })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true,"windows":[{"window_id":9}]}' }] });
+
+    await expect(callComputerDriverTool('list_windows', {
+      session: 'caller-supplied',
+    }, { sessionId: 'session-not-connected-error' })).resolves.toEqual({
+      ok: true,
+      windows: [{ window_id: 9 }],
+    });
+
+    expect(mcpConnectMock).toHaveBeenCalledTimes(2);
+    expect(mcpCloseMock).toHaveBeenCalledTimes(1);
+    const listCalls = mcpCallToolMock.mock.calls
+      .map((call) => call[0])
+      .filter((call) => call?.name === 'list_windows');
+    expectDriverSessionGenerations(
+      listCalls.map((call) => (call?.arguments as { session: string }).session),
+      'session-not-connected-error',
+      [0, 1],
+    );
+  });
+
+  it('falls back to one-shot CLI when cua-driver returns Not connected as plain text on a basic state tool', async () => {
+    mcpCallToolMock
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: 'Not connected' }] });
+    mockDriverSpawn({ stdout: '{"ok":true,"width":1920,"height":1080}\n' });
+
+    await expect(callComputerDriverTool('get_screen_size', {}, { sessionId: 'session-not-connected-plain' })).resolves.toEqual({
+      ok: true,
+      width: 1920,
+      height: 1080,
+    });
+
+    expect(mcpConnectMock).toHaveBeenCalledTimes(1);
+    expect(spawnMock).toHaveBeenCalledWith(expect.stringContaining('cua-driver'), ['call', 'get_screen_size'], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+    expect(driverStdinWrites).toEqual(['{}\n']);
+    const screenCalls = mcpCallToolMock.mock.calls
+      .map((call) => call[0])
+      .filter((call) => call?.name === 'get_screen_size');
+    expect(screenCalls).toHaveLength(1);
+    expect(screenCalls.every((call) => (call?.arguments as Record<string, unknown>).session === undefined)).toBe(true);
+  });
+
+  it('falls back to one-shot CLI for basic state tools after a cua-driver MCP timeout', async () => {
+    vi.useFakeTimers();
+    try {
+      const timedOutCall = createDeferred<unknown>();
+      mcpCallToolMock.mockReturnValueOnce(timedOutCall.promise);
+      mockDriverSpawn({ stdout: '{"ok":true,"width":1920,"height":1080}\n' });
+
+      const call = callComputerDriverTool('get_screen_size', {}, { sessionId: 'session-light-timeout' });
+      const assertion = expect(call).resolves.toEqual({
+        ok: true,
+        width: 1920,
+        height: 1080,
+      });
+      await vi.advanceTimersByTimeAsync(10_000);
+      await assertion;
+
+      expect(mcpConnectMock).toHaveBeenCalledTimes(1);
+      expect(spawnMock).toHaveBeenCalledWith(expect.stringContaining('cua-driver'), ['call', 'get_screen_size'], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: true,
+      });
+      expect(driverStdinWrites).toEqual(['{}\n']);
+      const screenCalls = mcpCallToolMock.mock.calls
+        .map((mockCall) => mockCall[0])
+        .filter((mockCall) => mockCall?.name === 'get_screen_size');
+      expect(screenCalls).toHaveLength(1);
+      expect(screenCalls.every((mockCall) => (mockCall?.arguments as Record<string, unknown>).session === undefined)).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('ignores stdin stream errors while the one-shot CLI fallback process resolves normally', async () => {
+    mcpCallToolMock
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: 'Not connected' }] });
+    mockDriverSpawn({
+      stdout: '{"ok":true,"width":1280,"height":720}\n',
+      stdinError: new Error('stdin closed'),
+    });
+
+    await expect(callComputerDriverTool('get_screen_size', {}, { sessionId: 'session-cli-stdin-error' })).resolves.toEqual({
+      ok: true,
+      width: 1280,
+      height: 720,
+    });
+
+    expect(spawnMock).toHaveBeenCalledWith(expect.stringContaining('cua-driver'), ['call', 'get_screen_size'], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+    expect(driverStdinWrites).toEqual(['{}\n']);
+  });
+
+  it('falls back to one-shot CLI for get_cursor_position after a cua-driver MCP timeout', async () => {
+    vi.useFakeTimers();
+    try {
+      const timedOutCall = createDeferred<unknown>();
+      mcpCallToolMock.mockReturnValueOnce(timedOutCall.promise);
+      mockDriverSpawn({ stdout: '{"ok":true,"x":120,"y":240}\n' });
+
+      const call = callComputerDriverTool('get_cursor_position', {}, { sessionId: 'session-cursor-position-timeout' });
+      const assertion = expect(call).resolves.toEqual({
+        ok: true,
+        x: 120,
+        y: 240,
+      });
+      await vi.advanceTimersByTimeAsync(10_000);
+      await assertion;
+
+      expect(mcpConnectMock).toHaveBeenCalledTimes(1);
+      expect(spawnMock).toHaveBeenCalledWith(expect.stringContaining('cua-driver'), ['call', 'get_cursor_position'], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: true,
+      });
+      expect(driverStdinWrites).toEqual(['{}\n']);
+      const cursorCalls = mcpCallToolMock.mock.calls
+        .map((mockCall) => mockCall[0])
+        .filter((mockCall) => mockCall?.name === 'get_cursor_position');
+      expect(cursorCalls).toHaveLength(1);
+      expect(cursorCalls.every((mockCall) => (mockCall?.arguments as Record<string, unknown>).session === undefined)).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('falls back to one-shot CLI when get_screen_size returns Not connected as an error result', async () => {
+    mcpCallToolMock
+      .mockResolvedValueOnce({
+        isError: true,
+        content: [{ type: 'text', text: 'Not connected' }],
+      });
+    mockDriverSpawn({ stdout: '{"ok":true,"width":2560,"height":1440}\n' });
+
+    await expect(callComputerDriverTool('get_screen_size', {}, { sessionId: 'session-screen-error-result' })).resolves.toEqual({
+      ok: true,
+      width: 2560,
+      height: 1440,
+    });
+
+    expect(mcpConnectMock).toHaveBeenCalledTimes(1);
+    expect(spawnMock).toHaveBeenCalledWith(expect.stringContaining('cua-driver'), ['call', 'get_screen_size'], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+    expect(driverStdinWrites).toEqual(['{}\n']);
+    const screenCalls = mcpCallToolMock.mock.calls
+      .map((mockCall) => mockCall[0])
+      .filter((mockCall) => mockCall?.name === 'get_screen_size');
+    expect(screenCalls).toHaveLength(1);
+  });
+
+  it('returns degraded Win32 list_windows data when Windows Cua list_windows times out', async () => {
+    setPlatform('win32');
+    vi.useFakeTimers();
+    try {
+      const timedOutCall = createDeferred<unknown>();
+      mcpCallToolMock.mockReturnValueOnce(timedOutCall.promise);
+      mockWin32FallbackSpawn({
+        windows: [
+          {
+            windowId: 7,
+            pid: 123,
+            title: 'XDMaker',
+            left: 10,
+            top: 20,
+            width: 800,
+            height: 600,
+          },
+        ],
+        processes: [
+          {
+            pid: 123,
+            name: 'electron',
+            executable: 'C:\\Tools\\electron.exe',
+          },
+        ],
+      });
+
+      const call = callComputerDriverTool('list_windows', {}, { sessionId: 'session-win32-list-timeout' });
+      const assertion = expect(call).resolves.toMatchObject({
+        ok: true,
+        source: 'xdmaker_win32_fallback',
+        degraded: true,
+        accessibility_unavailable: true,
+        windows: [
+          {
+            window_id: 7,
+            hwnd: 7,
+            pid: 123,
+            app_name: 'electron',
+            title: 'XDMaker',
+            bounds: {
+              x: 10,
+              y: 20,
+              width: 800,
+              height: 600,
+            },
+            is_on_screen: true,
+            source: 'xdmaker_win32_fallback',
+            accessibility_unavailable: true,
+            process: {
+              pid: 123,
+              name: 'electron',
+              executable: 'C:\\Tools\\electron.exe',
+            },
+          },
+        ],
+      });
+      await vi.advanceTimersByTimeAsync(45_000);
+      await assertion;
+
+      expect(mcpConnectMock).toHaveBeenCalledTimes(1);
+      expect(mcpCloseMock).toHaveBeenCalledTimes(1);
+      expect(spawnMock.mock.calls.filter(isWin32FallbackSpawnCall)).toHaveLength(1);
+      const fallbackResult = await call as { windows: Array<Record<string, unknown>> };
+      const fallbackWindow = fallbackResult.windows[0];
+      expect(fallbackWindow).not.toHaveProperty('element_index');
+      const listCalls = mcpCallToolMock.mock.calls
+        .map((mockCall) => mockCall[0])
+        .filter((mockCall) => mockCall?.name === 'list_windows');
+      expect(listCalls).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not invoke Win32 fallback for stale, transport, permission, or non-timeout list_windows failures on Windows', async () => {
+    setPlatform('win32');
+    const scenarios = [
+      {
+        sessionId: 'session-win32-no-fallback-stale',
+        first: { content: [{ type: 'text', text: 'Not connected' }] },
+        followups: [
+          { content: [{ type: 'text', text: '{"ok":true}' }] },
+          { content: [{ type: 'text', text: '{"ok":true,"windows":[]}' }] },
+        ],
+        expected: 'resolve',
+      },
+      {
+        sessionId: 'session-win32-no-fallback-transport',
+        firstError: new Error('transport closed'),
+        followups: [
+          { content: [{ type: 'text', text: '{"ok":true}' }] },
+          { content: [{ type: 'text', text: '{"ok":true,"windows":[]}' }] },
+        ],
+        expected: 'reject',
+        message: 'transport closed',
+      },
+      {
+        sessionId: 'session-win32-no-fallback-permission',
+        first: {
+          isError: true,
+          content: [{ type: 'text', text: 'permission denied' }],
+        },
+        expected: 'reject',
+        message: 'permission denied',
+      },
+      {
+        sessionId: 'session-win32-no-fallback-invalid-args',
+        first: {
+          isError: true,
+          content: [{ type: 'text', text: 'invalid argument: pid is required' }],
+        },
+        expected: 'reject',
+        message: 'invalid argument: pid is required',
+      },
+    ];
+
+    for (const scenario of scenarios) {
+      spawnMock.mockClear();
+      mcpCallToolMock.mockReset();
+      mcpCloseMock.mockClear();
+      mcpConnectMock.mockClear();
+      await cleanupComputerDriverSession(scenario.sessionId);
+
+      if (scenario.firstError) {
+        mcpCallToolMock.mockRejectedValueOnce(scenario.firstError);
+      } else {
+        mcpCallToolMock.mockResolvedValueOnce(scenario.first);
+      }
+      for (const followup of scenario.followups ?? []) {
+        mcpCallToolMock.mockResolvedValueOnce(followup);
+      }
+
+      const call = callComputerDriverTool('list_windows', {}, { sessionId: scenario.sessionId });
+      if (scenario.expected === 'resolve') {
+        await expect(call).resolves.toMatchObject({ ok: true });
+      } else {
+        await expect(call).rejects.toThrow(scenario.message);
+      }
+      expect(spawnMock.mock.calls.some(isWin32FallbackSpawnCall)).toBe(false);
+    }
+  });
+
+  it('does not invoke Win32 fallback when non-Windows Cua list_windows times out', async () => {
+    setPlatform('linux');
+    vi.useFakeTimers();
+    try {
+      const timedOutCall = createDeferred<unknown>();
+      mcpCallToolMock.mockReturnValueOnce(timedOutCall.promise);
+
+      const call = callComputerDriverTool('list_windows', {}, { sessionId: 'session-linux-list-timeout' });
+      const assertion = expect(call).rejects.toThrow('cua-driver mcp tool list_windows timed out after 45000ms');
+      await vi.advanceTimersByTimeAsync(45_000);
+      await assertion;
+
+      expect(mcpConnectMock).toHaveBeenCalledTimes(1);
+      expect(mcpCloseMock).toHaveBeenCalledTimes(1);
+      expect(spawnMock.mock.calls.some(isWin32FallbackSpawnCall)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('applies process name, query, on-screen, and workspace filters to Win32 list_windows fallback', async () => {
+    setPlatform('win32');
+    const workspaceRoot = path.resolve(process.cwd(), '../..');
+    const electronExecutable = path.join(workspaceRoot, 'node_modules', 'electron', 'dist', 'electron.exe');
+    mockWorkspaceRootExists(workspaceRoot);
+    mcpCallToolMock.mockRejectedValueOnce(new Error('cua-driver mcp tool list_windows timed out after 45000ms'));
+    mockWin32FallbackSpawn({
+      windows: [
+        {
+          windowId: 7,
+          pid: 123,
+          title: 'XDMaker Console',
+          left: 10,
+          top: 20,
+          width: 800,
+          height: 600,
+          isOnScreen: true,
+        },
+        {
+          windowId: 8,
+          pid: 456,
+          title: 'Hidden XDMaker',
+          left: 0,
+          top: 0,
+          width: 800,
+          height: 600,
+          isOnScreen: false,
+        },
+        {
+          windowId: 9,
+          pid: 789,
+          title: 'Browser Docs',
+          left: 30,
+          top: 40,
+          width: 800,
+          height: 600,
+          isOnScreen: true,
+        },
+      ],
+      processes: [
+        {
+          pid: 123,
+          name: 'electron',
+          executable: electronExecutable,
+        },
+        {
+          pid: 456,
+          name: 'electron',
+          executable: electronExecutable,
+        },
+        {
+          pid: 789,
+          name: 'chrome',
+          executable: 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+        },
+      ],
+    });
+    mockProcessSnapshotSpawn([
+      {
+        pid: 123,
+        name: 'electron',
+        command: `"${electronExecutable}" ${workspaceRoot}`,
+        executable: electronExecutable,
+      },
+      {
+        pid: 456,
+        name: 'electron',
+        command: `"${electronExecutable}" ${workspaceRoot}`,
+        executable: electronExecutable,
+      },
+      {
+        pid: 789,
+        name: 'chrome',
+        command: 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+        executable: 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+      },
+    ]);
+
+    await expect(callComputerDriverTool('list_windows', {
+      process_name: 'electron',
+      query: 'console',
+      on_screen_only: true,
+      workspace_root: workspaceRoot,
+    }, { sessionId: 'session-win32-fallback-filter' })).resolves.toMatchObject({
+      ok: true,
+      windows: [
+        {
+          window_id: 7,
+          pid: 123,
+          title: 'XDMaker Console',
+          source: 'xdmaker_win32_fallback',
+          accessibility_unavailable: true,
+          identity: {
+            workspace_root: path.win32.normalize(workspaceRoot),
+          },
+        },
+      ],
+    });
+    expect(spawnMock.mock.calls.filter(isWin32FallbackSpawnCall)).toHaveLength(1);
+    expect(spawnMock.mock.calls.filter((call) => call[0] === 'powershell.exe')).toHaveLength(2);
+  });
+
+  it('keeps Win32 list_windows fallback process metadata when the workspace process snapshot fails', async () => {
+    setPlatform('win32');
+    const workspaceRoot = path.resolve(process.cwd(), '../..');
+    const electronExecutable = path.join(workspaceRoot, 'node_modules', 'electron', 'dist', 'electron.exe');
+    mockWorkspaceRootExists(workspaceRoot);
+    mcpCallToolMock.mockRejectedValueOnce(new Error('cua-driver mcp tool list_windows timed out after 45000ms'));
+    mockWin32FallbackSpawn({
+      windows: [
+        {
+          windowId: 7,
+          pid: 123,
+          title: 'XDMaker Console',
+          left: 10,
+          top: 20,
+          width: 800,
+          height: 600,
+          isOnScreen: true,
+        },
+      ],
+      processes: [
+        {
+          pid: 123,
+          name: 'electron',
+          executable: electronExecutable,
+        },
+      ],
+    });
+    mockDriverSpawn({ stderr: 'Get-CimInstance failed', exitCode: 1 });
+
+    await expect(callComputerDriverTool('list_windows', {
+      process_name: 'electron',
+      workspace_root: workspaceRoot,
+    }, { sessionId: 'session-win32-fallback-cim-fails' })).resolves.toMatchObject({
+      ok: true,
+      windows: [
+        {
+          window_id: 7,
+          pid: 123,
+          title: 'XDMaker Console',
+          process: {
+            pid: 123,
+            name: 'electron',
+            executable: electronExecutable,
+          },
+          identity: {
+            workspace_root: path.win32.normalize(workspaceRoot),
+          },
+        },
+      ],
+    });
+    expect(spawnMock.mock.calls.filter(isWin32FallbackSpawnCall)).toHaveLength(1);
+    expect(spawnMock.mock.calls.filter((call) => call[0] === 'powershell.exe')).toHaveLength(2);
+  });
+
+  it('keeps Win32 list_windows fallback process fields when the workspace process snapshot is partial', async () => {
+    setPlatform('win32');
+    const workspaceRoot = path.resolve(process.cwd(), '../..');
+    const electronExecutable = path.join(workspaceRoot, 'node_modules', 'electron', 'dist', 'electron.exe');
+    mockWorkspaceRootExists(workspaceRoot);
+    mcpCallToolMock.mockRejectedValueOnce(new Error('cua-driver mcp tool list_windows timed out after 45000ms'));
+    mockWin32FallbackSpawn({
+      windows: [
+        {
+          windowId: 7,
+          pid: 123,
+          title: 'XDMaker Console',
+          left: 10,
+          top: 20,
+          width: 800,
+          height: 600,
+          isOnScreen: true,
+        },
+      ],
+      processes: [
+        {
+          pid: 123,
+          name: 'electron',
+          executable: electronExecutable,
+        },
+      ],
+    });
+    mockProcessSnapshotSpawn([
+      {
+        pid: 123,
+        name: 'electron',
+        command: 'electron.exe --inspect',
+      },
+    ]);
+
+    await expect(callComputerDriverTool('list_windows', {
+      process_name: 'electron',
+      workspace_root: workspaceRoot,
+    }, { sessionId: 'session-win32-fallback-cim-partial' })).resolves.toMatchObject({
+      ok: true,
+      windows: [
+        {
+          window_id: 7,
+          pid: 123,
+          title: 'XDMaker Console',
+          process: {
+            pid: 123,
+            name: 'electron',
+            command: 'electron.exe --inspect',
+            executable: electronExecutable,
+          },
+          identity: {
+            workspace_root: path.win32.normalize(workspaceRoot),
+          },
+        },
+      ],
+    });
+    expect(spawnMock.mock.calls.filter(isWin32FallbackSpawnCall)).toHaveLength(1);
+    expect(spawnMock.mock.calls.filter((call) => call[0] === 'powershell.exe')).toHaveLength(2);
+  });
+
+  it('returns the original list_windows failure when Win32 fallback fails', async () => {
+    setPlatform('win32');
+    mcpCallToolMock.mockRejectedValueOnce(new Error('cua-driver mcp tool list_windows timed out after 45000ms'));
+    mockDriverSpawn({ stderr: 'Add-Type failed', exitCode: 1 });
+
+    await expect(callComputerDriverTool('list_windows', {}, { sessionId: 'session-win32-fallback-fails' })).rejects.toThrow(
+      'cua-driver mcp tool list_windows timed out after 45000ms',
+    );
+    expect(spawnMock.mock.calls.filter(isWin32FallbackSpawnCall)).toHaveLength(1);
+  });
+
+  it('does not hang when Win32 list_windows fallback times out', async () => {
+    setPlatform('win32');
+    vi.useFakeTimers();
+    try {
+      mcpCallToolMock.mockRejectedValueOnce(new Error('cua-driver mcp tool list_windows timed out after 45000ms'));
+      mockNeverSettlingSpawn();
+
+      const call = callComputerDriverTool('list_windows', {}, { sessionId: 'session-win32-fallback-timeout' });
+      const assertion = expect(call).rejects.toThrow('cua-driver mcp tool list_windows timed out after 45000ms');
+      await vi.advanceTimersByTimeAsync(4_000);
+      await assertion;
+      expect(spawnMock.mock.calls.filter(isWin32FallbackSpawnCall)).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not invoke Win32 fallback when Cua list_apps succeeds on Windows', async () => {
+    setPlatform('win32');
+    mcpCallToolMock.mockResolvedValueOnce({
+      content: [{ type: 'text', text: '{"ok":true,"apps":[{"name":"XDMaker","pid":123}]}' }],
+    });
+
+    await expect(callComputerDriverTool('list_apps', {}, { sessionId: 'session-windows-apps-success' })).resolves.toEqual({
+      ok: true,
+      apps: [
+        {
+          name: 'XDMaker',
+          pid: 123,
+        },
+      ],
+    });
+    expect(spawnMock.mock.calls.some(isWin32FallbackSpawnCall)).toBe(false);
+  });
+
+  it('returns degraded running-app data when Windows Cua list_apps times out', async () => {
+    setPlatform('win32');
+    vi.useFakeTimers();
+    try {
+      const timedOutCall = createDeferred<unknown>();
+      mcpCallToolMock.mockReturnValueOnce(timedOutCall.promise);
+      mockWin32FallbackSpawn({
+        windows: [
+          {
+            windowId: 7,
+            pid: 123,
+            title: 'XDMaker',
+            left: 10,
+            top: 20,
+            width: 800,
+            height: 600,
+          },
+          {
+            windowId: 8,
+            pid: 123,
+            title: 'XDMaker Settings',
+            left: 40,
+            top: 50,
+            width: 500,
+            height: 400,
+          },
+        ],
+        processes: [
+          {
+            pid: 123,
+            name: 'xdt-maker',
+            executable: 'E:\\xdt-maker\\xdt-maker.exe',
+          },
+        ],
+      });
+
+      const call = callComputerDriverTool('list_apps', {}, { sessionId: 'session-win32-apps-timeout' });
+      const assertion = expect(call).resolves.toMatchObject({
+        ok: true,
+        source: 'xdmaker_win32_fallback',
+        degraded: true,
+        running_apps_only: true,
+        installed_app_metadata_unavailable: true,
+        accessibility_unavailable: true,
+        apps: [
+          {
+            pid: 123,
+            name: 'xdt-maker',
+            app_name: 'xdt-maker',
+            executable: 'E:\\xdt-maker\\xdt-maker.exe',
+            is_running: true,
+            running_windows_only: true,
+            installed_app_metadata_unavailable: true,
+            source: 'xdmaker_win32_fallback',
+            accessibility_unavailable: true,
+            window_count: 2,
+            windows: [
+              {
+                window_id: 7,
+                title: 'XDMaker',
+                source: 'xdmaker_win32_fallback',
+                accessibility_unavailable: true,
+              },
+              {
+                window_id: 8,
+                title: 'XDMaker Settings',
+                source: 'xdmaker_win32_fallback',
+                accessibility_unavailable: true,
+              },
+            ],
+          },
+        ],
+      });
+      await vi.advanceTimersByTimeAsync(45_000);
+      await assertion;
+      expect(spawnMock.mock.calls.filter(isWin32FallbackSpawnCall)).toHaveLength(1);
+      const appCalls = mcpCallToolMock.mock.calls
+        .map((mockCall) => mockCall[0])
+        .filter((mockCall) => mockCall?.name === 'list_apps');
+      expect(appCalls).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('retries lightweight non-CLI tools once after a cua-driver MCP timeout', async () => {
+    vi.useFakeTimers();
+    try {
+      const timedOutCall = createDeferred<unknown>();
+      mcpCallToolMock
+        .mockReturnValueOnce(timedOutCall.promise)
+        .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true}' }] })
+        .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true,"enabled":true}' }] });
+
+      const call = callComputerDriverTool('get_agent_cursor_state', {}, { sessionId: 'session-light-mcp-timeout' });
+      const assertion = expect(call).resolves.toEqual({
+        ok: true,
+        enabled: true,
+      });
+      await vi.advanceTimersByTimeAsync(10_000);
+      await assertion;
+
+      expect(mcpConnectMock).toHaveBeenCalledTimes(2);
+      expect(mcpCloseMock).toHaveBeenCalledTimes(1);
+      const cursorCalls = mcpCallToolMock.mock.calls
+        .map((mockCall) => mockCall[0])
+        .filter((mockCall) => mockCall?.name === 'get_agent_cursor_state');
+      expect(cursorCalls).toHaveLength(2);
+      expectDriverSessionGenerations(
+        cursorCalls.map((mockCall) => (mockCall?.arguments as { cursor_id: string }).cursor_id),
+        'session-light-mcp-timeout',
+        [0, 1],
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not replay an overlay mutation after timeout', async () => {
+    vi.useFakeTimers();
+    try {
+      mcpCallToolMock.mockImplementation(({ name }) => name === 'move_cursor'
+        ? new Promise(() => {}) : { content: [{ type: 'text', text: '{"ok":true}' }] });
+      const call = callComputerDriverTool('move_cursor', { x: 10, y: 20 }, { sessionId: 'move-timeout' });
+      const assertion = expect(call).rejects.toMatchObject({ code: 'ACTION_OUTCOME_UNKNOWN' });
+      await vi.advanceTimersByTimeAsync(10_000);
+      await assertion;
+      expect(mcpCallToolMock.mock.calls.filter(([call]) => call.name === 'move_cursor')).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not retry long window enumeration tools after a cua-driver MCP timeout', async () => {
+    setPlatform('linux');
+    vi.useFakeTimers();
+    try {
+      const timedOutCall = createDeferred<unknown>();
+      mcpCallToolMock.mockReturnValueOnce(timedOutCall.promise);
+
+      const call = callComputerDriverTool('list_windows', {
+        session: 'caller-supplied',
+      }, { sessionId: 'session-long-timeout' });
+      const assertion = expect(call).rejects.toThrow('cua-driver mcp tool list_windows timed out after 45000ms');
+      await vi.advanceTimersByTimeAsync(45_000);
+      await assertion;
+      expect(mcpConnectMock).toHaveBeenCalledTimes(1);
+      expect(mcpCloseMock).toHaveBeenCalledTimes(1);
+      const listCalls = mcpCallToolMock.mock.calls
+        .map((mockCall) => mockCall[0])
+        .filter((mockCall) => mockCall?.name === 'list_windows');
+      expect(listCalls).toHaveLength(1);
+      expectDriverSessionGenerations(
+        listCalls.map((mockCall) => (mockCall?.arguments as { session: string }).session),
+        'session-long-timeout',
+        [0],
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('cleans up the fresh CUA MCP client when stale-session retry fails', async () => {
+    mcpCallToolMock
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true}' }] })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true}' }] })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '"session ended; tool call ignored"' }] })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true}' }] })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true}' }] })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true}' }] })
+      .mockRejectedValueOnce(new Error('transport closed'))
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true}' }] })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true}' }] })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true}' }] })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true,"screenshot_file_path":"/tmp/recovered-again.png"}' }] });
+
+    await expect(callComputerDriverTool('get_window_state', {
+      pid: 123,
+      window_id: 7,
+      capture_mode: 'vision',
+      session: 'caller-supplied',
+    }, { sessionId: 'session-stale-retry-fails' })).rejects.toThrow('transport closed');
+
+    await expect(callComputerDriverTool('get_window_state', {
+      pid: 123,
+      window_id: 7,
+      capture_mode: 'vision',
+      session: 'caller-supplied',
+    }, { sessionId: 'session-stale-retry-fails' })).resolves.toEqual({
+      ok: true,
+      screenshot_file_path: '/tmp/recovered-again.png',
+    });
+
+    expect(mcpConnectMock).toHaveBeenCalledTimes(3);
+    expect(mcpCloseMock).toHaveBeenCalledTimes(2);
+    const stateCalls = mcpCallToolMock.mock.calls
+      .map((call) => call[0])
+      .filter((call) => call?.name === 'get_window_state');
+    expectDriverSessionGenerations(
+      stateCalls.map((call) => (call?.arguments as { session: string }).session),
+      'session-stale-retry-fails',
+      [0, 1, 2],
+    );
+  });
+
+  it('does not delete a fresh CUA MCP client from a concurrent stale failure', async () => {
+    mcpCallToolMock.mockResolvedValueOnce({
+      content: [{ type: 'text', text: '{"ok":true,"windows":[]}' }],
+    });
+    await callComputerDriverTool('list_windows', { session: 'session-concurrent-stale' }, { sessionId: 'session-concurrent-stale' });
+
+    mcpCallToolMock.mockClear();
+    const firstOldCall = createDeferred<unknown>();
+    const secondOldCall = createDeferred<unknown>();
+    const oldEndSession = createDeferred<unknown>();
+    const firstFreshCall = createDeferred<unknown>();
+    const secondFreshCall = createDeferred<unknown>();
+    let oldCalls = 0;
+    let freshCalls = 0;
+
+    mcpCallToolMock.mockImplementation((call: { name: string; arguments: Record<string, unknown> }) => {
+      if (
+        call.name === 'list_windows' &&
+        driverSessionGeneration(String(call.arguments.session), 'session-concurrent-stale') === 0
+      ) {
+        oldCalls += 1;
+        return oldCalls === 1 ? firstOldCall.promise : secondOldCall.promise;
+      }
+      if (call.name === 'end_session') {
+        return oldEndSession.promise;
+      }
+      if (
+        call.name === 'list_windows' &&
+        driverSessionGeneration(String(call.arguments.session), 'session-concurrent-stale') === 1
+      ) {
+        freshCalls += 1;
+        return freshCalls === 1 ? firstFreshCall.promise : secondFreshCall.promise;
+      }
+      throw new Error(`unexpected call ${call.name} ${String(call.arguments.session)}`);
+    });
+
+    const first = callComputerDriverTool(
+      'list_windows',
+      { session: 'caller-supplied' },
+      { sessionId: 'session-concurrent-stale' },
+    );
+    const second = callComputerDriverTool(
+      'list_windows',
+      { session: 'caller-supplied' },
+      { sessionId: 'session-concurrent-stale' },
+    );
+
+    await waitForCondition(() => oldCalls === 2);
+    firstOldCall.resolve({ content: [{ type: 'text', text: '"session ended; tool call ignored"' }] });
+    await waitForCondition(() => mcpCallToolMock.mock.calls.some((call) => call[0]?.name === 'end_session'));
+    oldEndSession.resolve({ content: [{ type: 'text', text: '{"ok":true}' }] });
+    await waitForCondition(() => freshCalls === 1);
+
+    secondOldCall.resolve({ content: [{ type: 'text', text: '"session ended; tool call ignored"' }] });
+    await waitForCondition(() => freshCalls === 2);
+    firstFreshCall.resolve({ content: [{ type: 'text', text: '{"ok":true,"windows":[{"window_id":7}]}' }] });
+    secondFreshCall.resolve({ content: [{ type: 'text', text: '{"ok":true,"windows":[{"window_id":8}]}' }] });
+
+    await expect(first).resolves.toEqual({ ok: true, windows: [{ window_id: 7 }] });
+    await expect(second).resolves.toEqual({ ok: true, windows: [{ window_id: 8 }] });
+    expect(mcpCloseMock).toHaveBeenCalledTimes(1);
+
+    const sessionArgs = mcpCallToolMock.mock.calls
+      .map((call) => call[0])
+      .filter((call) => call?.name === 'list_windows')
+      .map((call) => (call?.arguments as { session: string }).session);
+    expectDriverSessionGenerations(sessionArgs, 'session-concurrent-stale', [0, 0, 1, 1]);
+  });
+
+  it('does not retry stale tool calls after the session closes during cleanup', async () => {
+    mcpCallToolMock.mockResolvedValueOnce({
+      content: [{ type: 'text', text: '{"ok":true,"windows":[]}' }],
+    });
+    await callComputerDriverTool('list_windows', { session: 'session-close-during-stale' }, { sessionId: 'session-close-during-stale' });
+
+    mcpCallToolMock.mockClear();
+    const oldCall = createDeferred<unknown>();
+    const oldEndSession = createDeferred<unknown>();
+
+    mcpCallToolMock.mockImplementation((call: { name: string; arguments: Record<string, unknown> }) => {
+      if (
+        call.name === 'click' &&
+        driverSessionGeneration(String(call.arguments.session), 'session-close-during-stale') === 0
+      ) {
+        return oldCall.promise;
+      }
+      if (call.name === 'end_session') {
+        return oldEndSession.promise;
+      }
+      throw new Error(`unexpected call ${call.name} ${String(call.arguments.session)}`);
+    });
+
+    const click = callComputerDriverTool(
+      'click',
+      { pid: 123, window_id: 7, x: 10, y: 20, session: 'caller-supplied' },
+      { sessionId: 'session-close-during-stale' },
+    );
+
+    await waitForCondition(() => mcpCallToolMock.mock.calls.some((call) => call[0]?.name === 'click'));
+    oldCall.resolve({ content: [{ type: 'text', text: '"session ended; tool call ignored"' }] });
+    await waitForCondition(() => mcpCallToolMock.mock.calls.some((call) => call[0]?.name === 'end_session'));
+
+    const close = cleanupComputerDriverSession('session-close-during-stale');
+    oldEndSession.resolve({ content: [{ type: 'text', text: '{"ok":true}' }] });
+
+    await close;
+    await expect(click).rejects.toMatchObject({ code: 'ACTION_OUTCOME_UNKNOWN' });
+    expect(mcpConnectMock).toHaveBeenCalledTimes(1);
+    expect(mcpCloseMock).toHaveBeenCalledTimes(1);
+    const clickSessions = mcpCallToolMock.mock.calls
+      .map((call) => call[0])
+      .filter((call) => call?.name === 'click')
+      .map((call) => (call?.arguments as { session: string }).session);
+    expectDriverSessionGenerations(clickSessions, 'session-close-during-stale', [0]);
+  });
+
+  it('cleans up the fresh client when the session closes before stale retry dispatch', async () => {
+    mcpCallToolMock.mockResolvedValueOnce({
+      content: [{ type: 'text', text: '{"ok":true,"windows":[]}' }],
+    });
+    await callComputerDriverTool('list_windows', { session: 'session-close-before-retry' }, { sessionId: 'session-close-before-retry' });
+
+    mcpCallToolMock.mockClear();
+    const staleClick = createDeferred<unknown>();
+    const oldEndSession = createDeferred<unknown>();
+    const freshStyle = createDeferred<unknown>();
+    let freshStyleCalls = 0;
+
+    mcpCallToolMock.mockImplementation((call: { name: string; arguments: Record<string, unknown> }) => {
+      const session = String(call.arguments.session ?? call.arguments.cursor_id);
+      const generation = driverSessionGeneration(session, 'session-close-before-retry');
+      if (call.name === 'get_window_state' && generation === 0) {
+        return staleClick.promise;
+      }
+      if (call.name === 'end_session') {
+        return oldEndSession.promise;
+      }
+      if (call.name === 'set_agent_cursor_motion' && generation === 1) {
+        freshStyleCalls += 1;
+        return freshStyle.promise;
+      }
+      if (call.name === 'set_agent_cursor_style' && generation === 1) {
+        return { content: [{ type: 'text', text: '{"ok":true}' }] };
+      }
+      throw new Error(`unexpected call ${call.name} ${session}`);
+    });
+
+    const click = callComputerDriverTool(
+      'get_window_state',
+      { pid: 123, window_id: 7, x: 10, y: 20, session: 'caller-supplied' },
+      { sessionId: 'session-close-before-retry' },
+    );
+
+    await waitForCondition(() => mcpCallToolMock.mock.calls.some((call) => call[0]?.name === 'get_window_state'));
+    staleClick.resolve({ content: [{ type: 'text', text: '"session ended; tool call ignored"' }] });
+    await waitForCondition(() => mcpCallToolMock.mock.calls.some((call) => call[0]?.name === 'end_session'));
+    oldEndSession.resolve({ content: [{ type: 'text', text: '{"ok":true}' }] });
+    await waitForCondition(() => freshStyleCalls === 1);
+
+    const close = cleanupComputerDriverSession('session-close-before-retry');
+    freshStyle.resolve({ content: [{ type: 'text', text: '{"ok":true}' }] });
+
+    await close;
+    await expect(click).rejects.toMatchObject({ code: 'REQUEST_CANCELLED' });
+    expect(mcpConnectMock).toHaveBeenCalledTimes(2);
+    expect(mcpCloseMock).toHaveBeenCalledTimes(2);
+    const clickSessions = mcpCallToolMock.mock.calls
+      .map((call) => call[0])
+      .filter((call) => call?.name === 'get_window_state')
+      .map((call) => (call?.arguments as { session: string }).session);
+    expectDriverSessionGenerations(clickSessions, 'session-close-before-retry', [0]);
+  });
+
+  it('cleans up the session-owned CUA MCP proxy on session close', async () => {
+    mcpCallToolMock.mockResolvedValueOnce({
+      content: [{ type: 'text', text: '{"ok":true,"windows":[]}' }],
+    });
+    await callComputerDriverTool('list_windows', { session: 'session-cleanup' }, { sessionId: 'session-cleanup' });
+
+    mcpCallToolMock.mockResolvedValueOnce({
+      content: [{ type: 'text', text: '{"ok":true}' }],
+    });
+    await cleanupComputerDriverSession('session-cleanup');
+
+    const endSessionPayload = mcpCallToolMock.mock.lastCall?.[0]?.arguments as { session: string };
+    expectDriverSessionGenerations([endSessionPayload.session], 'session-cleanup', [0]);
+    expect(mcpCloseMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not reuse a driver session id after explicit session cleanup', async () => {
+    mcpCallToolMock
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true,"windows":[]}' }] })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true}' }] })
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true,"windows":[{"window_id":8}]}' }] });
+
+    await callComputerDriverTool('list_windows', { session: 'session-cleanup-reuse' }, { sessionId: 'session-cleanup-reuse' });
+    await cleanupComputerDriverSession('session-cleanup-reuse');
+    await expect(callComputerDriverTool('list_windows', {
+      session: 'caller-supplied',
+    }, { sessionId: 'session-cleanup-reuse' })).resolves.toEqual({
+      ok: true,
+      windows: [{ window_id: 8 }],
+    });
+
+    const listCalls = mcpCallToolMock.mock.calls
+      .map((call) => call[0])
+      .filter((call) => call?.name === 'list_windows');
+    expectDriverSessionGenerations(
+      listCalls.map((call) => (call?.arguments as { session: string }).session),
+      'session-cleanup-reuse',
+      [0, 1],
+    );
+  });
+
+  it('waits for stale cleanup before recreating a CUA MCP session with the same id', async () => {
+    let resolveEndSession: (() => void) | undefined;
+    mcpCallToolMock
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true,"windows":[]}' }] })
+      .mockImplementationOnce(() => new Promise((resolve) => {
+        resolveEndSession = () => resolve({ content: [{ type: 'text', text: '{"ok":true}' }] });
+      }))
+      .mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true,"windows":[{"window_id":7}]}' }] });
+
+    await callComputerDriverTool('list_windows', { session: 'session-race' }, { sessionId: 'session-race' });
+
+    const cleanup = cleanupComputerDriverSession('session-race');
+    const retry = callComputerDriverTool('list_windows', { session: 'session-race' }, { sessionId: 'session-race' });
+
+    await Promise.resolve();
+    expect(mcpConnectMock).toHaveBeenCalledTimes(1);
+
+    resolveEndSession?.();
+    await cleanup;
+    await expect(retry).resolves.toEqual({ ok: true, windows: [{ window_id: 7 }] });
+    expect(mcpConnectMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('checks current Computer Use opt-in before dispatching MCP tool calls', async () => {
+    const isComputerUseEnabled = vi.fn(() => false);
+    const prepareRuntimeBeforeUse = vi.fn(async () => undefined);
+    const deps = getComputerMcpDeps({ isComputerUseEnabled, prepareRuntimeBeforeUse });
+
+    await expect(deps.callTool('list_windows', {}, { agentKind: 'codex' }))
+      .rejects.toThrow('Computer Use is disabled');
+    expect(isComputerUseEnabled).toHaveBeenCalledWith({ agentKind: 'codex' });
+    expect(prepareRuntimeBeforeUse).not.toHaveBeenCalled();
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  it('closes active MCP sessions and blocks tool dispatch while permission onboarding is paused', async () => {
+    setPlatform('darwin');
+    mcpCallToolMock
+      .mockResolvedValueOnce({
+        content: [{ type: 'text', text: '{"ok":true,"windows":[]}' }],
+      })
+      .mockResolvedValueOnce({
+        content: [{ type: 'text', text: '{"ok":true}' }],
+      });
+
+    await callComputerDriverTool(
+      'list_windows',
+      {},
+      { sessionId: 'session-permission-guide-pause' },
+    );
+    await pauseComputerDriverPermissionProbe();
+
+    expect(mcpCloseMock).toHaveBeenCalledOnce();
+    await expect(callComputerDriverTool(
+      'list_windows',
+      {},
+      { sessionId: 'session-permission-guide-pause' },
+    )).rejects.toThrow('permission onboarding is active');
+    expect(mcpConnectMock).toHaveBeenCalledOnce();
+  });
+
+  it('prepares the runtime before dispatching the first enabled tool call', async () => {
+    const prepareRuntimeBeforeUse = vi.fn(async () => undefined);
+    mcpCallToolMock.mockResolvedValueOnce({
+      content: [{ type: 'text', text: '{"ok":true,"windows":[]}' }],
+    });
+    const deps = getComputerMcpDeps({
+      isComputerUseEnabled: () => true,
+      prepareRuntimeBeforeUse,
+    });
+
+    await expect(deps.callTool(
+      'list_windows',
+      {},
+      { sessionId: 'session-runtime-gate' },
+    )).resolves.toEqual({ ok: true, windows: [] });
+    expect(prepareRuntimeBeforeUse).toHaveBeenCalledTimes(1);
+    expect(prepareRuntimeBeforeUse.mock.invocationCallOrder[0]).toBeLessThan(
+      mcpCallToolMock.mock.invocationCallOrder[0]!,
+    );
+  });
+
+  it('prepares the runtime only once for subsequent tool calls', async () => {
+    const prepareRuntimeBeforeUse = vi.fn(async () => undefined);
+    mcpCallToolMock
+      .mockResolvedValueOnce({
+        content: [{ type: 'text', text: '{"ok":true,"windows":[]}' }],
+      })
+      .mockResolvedValueOnce({
+        content: [{ type: 'text', text: '{"ok":true,"windows":[]}' }],
+      });
+    const deps = getComputerMcpDeps({
+      isComputerUseEnabled: () => true,
+      prepareRuntimeBeforeUse,
+    });
+
+    await deps.callTool('list_windows', {}, { sessionId: 'session-runtime-gate-once' });
+    await deps.callTool('list_windows', {}, { sessionId: 'session-runtime-gate-once' });
+
+    expect(prepareRuntimeBeforeUse).toHaveBeenCalledTimes(1);
+  });
+
+  it('runs the official installer and returns refreshed status', async () => {
+    mockDriverSpawn({ stdout: 'installed\n' });
+    mockDriverSpawn({ stdout: 'cua-driver 0.5.8\n' });
+    mockDriverSpawn({ stdout: 'Cua Driver daemon is running\n' });
+    if (process.platform === 'darwin') {
+      mockDriverSpawn({
+        stdout:
+          '{"accessibility":true,"screen_recording":true,"screen_recording_capturable":true,"source":{"attribution":"driver-daemon"}}\n',
+      });
+    }
+
+    await expect(installComputerDriver()).resolves.toMatchObject({
+      ok: true,
+      stdout: 'installed\n',
+      status: {
+        installed: true,
+        version: 'cua-driver 0.5.8',
+      },
+    });
+    expect(spawnMock.mock.calls[0]?.[0]).toMatch(process.platform === 'win32' ? /powershell/i : '/bin/bash');
+  });
+
+  it('passes the resolved system HTTP proxy to the POSIX installer', async () => {
+    setPlatform('linux');
+    resolveDesktopOutboundProxyMock.mockResolvedValue('http://127.0.0.1:7897');
+    mockDriverSpawn({ stdout: 'installed\n' });
+    mockDriverSpawn({ stdout: 'cua-driver 0.5.8\n' });
+    mockDriverSpawn({ stdout: 'Cua Driver daemon is running\n' });
+
+    await installComputerDriver();
+
+    expect(resolveDesktopOutboundProxyMock).toHaveBeenCalledWith(
+      'https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/install.sh',
+    );
+    expect(spawnMock.mock.calls[0]?.[2]?.env).toMatchObject({
+      HTTPS_PROXY: 'http://127.0.0.1:7897',
+      HTTP_PROXY: 'http://127.0.0.1:7897',
+      https_proxy: 'http://127.0.0.1:7897',
+      http_proxy: 'http://127.0.0.1:7897',
+    });
+  });
+
+  it('continues the POSIX install when system proxy resolution fails', async () => {
+    setPlatform('linux');
+    resolveDesktopOutboundProxyMock.mockRejectedValue(new Error('resolver unavailable'));
+    mockDriverSpawn({ stdout: 'installed\n' });
+    mockDriverSpawn({ stdout: 'cua-driver 0.5.8\n' });
+    mockDriverSpawn({ stdout: 'Cua Driver daemon is running\n' });
+
+    await expect(installComputerDriver()).resolves.toMatchObject({ ok: true });
+
+    expect(spawnMock.mock.calls[0]?.[2]?.env).not.toHaveProperty('HTTPS_PROXY');
+    expect(spawnMock.mock.calls[0]?.[2]?.env).not.toHaveProperty('ALL_PROXY');
+  });
+
+  it('preserves explicit proxy env instead of replacing it with the system proxy', async () => {
+    setPlatform('linux');
+    process.env.HTTPS_PROXY = 'http://user:secret@127.0.0.1:6152';
+    resolveDesktopOutboundProxyMock.mockResolvedValue('http://127.0.0.1:7897');
+    mockDriverSpawn({ stdout: 'installed\n' });
+    mockDriverSpawn({ stdout: 'cua-driver 0.5.8\n' });
+    mockDriverSpawn({ stdout: 'Cua Driver daemon is running\n' });
+
+    await installComputerDriver();
+
+    expect(resolveDesktopOutboundProxyMock).not.toHaveBeenCalled();
+    expect(spawnMock.mock.calls[0]?.[2]?.env?.HTTPS_PROXY).toBe(
+      'http://user:secret@127.0.0.1:6152',
+    );
+  });
+
+  it('uses remote DNS for a resolved SOCKS5 installer proxy', () => {
+    expect(buildCuaInstallerProxyEnv('socks5://127.0.0.1:7898')).toEqual({
+      ALL_PROXY: 'socks5h://127.0.0.1:7898',
+      all_proxy: 'socks5h://127.0.0.1:7898',
+    });
+    expect(buildCuaInstallerProxyEnv('https://unsupported.example')).toBeUndefined();
+  });
+
+  it('keeps macOS status checks side-effect-free when the daemon is stopped', async () => {
+    if (process.platform !== 'darwin') return;
+
+    mockDriverSpawn({ stdout: 'cua-driver 0.5.8\n' });
+    mockDriverSpawn({ stderr: 'Cua Driver daemon is not running\n', exitCode: 1 });
+
+    await expect(getComputerDriverStatus()).resolves.toMatchObject({
+      installed: true,
+      daemonRunning: false,
+      permissionState: {
+        platform: 'macos',
+        required: true,
+        status: 'unknown',
+      },
+    });
+    expect(spawnMock.mock.calls.some((call) => call[1]?.[0] === 'serve')).toBe(false);
+    expect(spawnMock.mock.calls.some((call) => call[1]?.[0] === 'permissions')).toBe(false);
+  });
+
+  it('can inspect a running macOS daemon without triggering the permission probe', async () => {
+    if (process.platform !== 'darwin') return;
+
+    mockDriverSpawn({ stdout: 'cua-driver 0.5.8\n' });
+    mockDriverSpawn({ stdout: 'Cua Driver daemon is running\n' });
+
+    await expect(getComputerDriverStatus({ skipPermissionProbe: true })).resolves.toMatchObject({
+      installed: true,
+      daemonRunning: true,
+      permissionState: {
+        platform: 'macos',
+        status: 'unknown',
+      },
+    });
+    expect(spawnMock.mock.calls.some((call) => call[1]?.[0] === 'permissions')).toBe(false);
+  });
+
+  it('keeps page-entry status checks passive on CuaDriver versions before 0.12.2', async () => {
+    if (process.platform !== 'darwin') return;
+
+    mockDriverSpawn({ stdout: 'cua-driver 0.12.1\n' });
+    mockDriverSpawn({ stdout: 'Cua Driver daemon is running\n  pid: 4242\n' });
+
+    await expect(getComputerDriverStatus({
+      forcePermissionProbe: true,
+      bypassPermissionProbeCache: true,
+      passivePermissionProbeOnly: true,
+    })).resolves.toMatchObject({
+      installed: true,
+      daemonRunning: true,
+      permissionState: {
+        platform: 'macos',
+        status: 'unknown',
+      },
+    });
+    expect(spawnMock.mock.calls.some((call) => call[1]?.[0] === 'permissions')).toBe(false);
+  });
+
+  it('refreshes page-entry permissions through the read-only 0.12.2 status command', async () => {
+    if (process.platform !== 'darwin') return;
+
+    mockDriverSpawn({ stdout: 'cua-driver 0.12.2\n' });
+    mockDriverSpawn({ stdout: 'Cua Driver daemon is running\n  pid: 4242\n' });
+    mockDriverSpawn({
+      stdout:
+        '{"accessibility":true,"screen_recording":true,"screen_recording_capturable":true,"source":{"attribution":"driver-daemon"}}\n',
+    });
+
+    await expect(getComputerDriverStatus({
+      forcePermissionProbe: true,
+      bypassPermissionProbeCache: true,
+      passivePermissionProbeOnly: true,
+    })).resolves.toMatchObject({
+      installed: true,
+      permissionState: {
+        accessibility: 'granted',
+        screenRecording: 'granted',
+        status: 'granted',
+      },
+    });
+    expect(spawnMock).toHaveBeenCalledWith(
+      'cua-driver',
+      ['permissions', 'status', '--json'],
+      expect.objectContaining({ windowsHide: true }),
+    );
+  });
+
+  it('bootstraps macOS @ windows from the passive permission status after restart', async () => {
+    setPlatform('darwin');
+    mockDriverSpawn({ stdout: 'cua-driver 0.12.2\n' });
+    mockDriverSpawn({ stdout: 'Cua Driver daemon is running\n  pid: 4242\n' });
+    mockDriverSpawn({
+      stdout:
+        '{"accessibility":true,"screen_recording":true,"screen_recording_capturable":true,"source":{"attribution":"driver-daemon"}}\n',
+    });
+    mockDriverSpawn({ stdout: '{"ok":true,"windows":[{"window_id":7,"pid":70}]}\n' });
+
+    await expect(listComputerWindowsForAtMention()).resolves.toEqual({
+      ok: true,
+      windows: [{ window_id: 7, pid: 70 }],
+    });
+    expect(spawnMock.mock.calls.map((call) => call[1])).toEqual([
+      ['--version'],
+      ['status'],
+      ['permissions', 'status', '--json'],
+      ['call', 'list_windows'],
+    ]);
+  });
+
+  it('keeps macOS @ windows hidden without probing on older drivers', async () => {
+    setPlatform('darwin');
+    mockDriverSpawn({ stdout: 'cua-driver 0.12.1\n' });
+    mockDriverSpawn({ stdout: 'Cua Driver daemon is running\n  pid: 4242\n' });
+
+    await expect(listComputerWindowsForAtMention()).resolves.toEqual({
+      ok: true,
+      windows: [],
+    });
+    expect(spawnMock.mock.calls.map((call) => call[1])).toEqual([
+      ['--version'],
+      ['status'],
+    ]);
+  });
+
+  it('does not autostart the macOS permission daemon from the @ palette', async () => {
+    setPlatform('darwin');
+    mockDriverSpawn({ stdout: 'cua-driver 0.12.2\n' });
+    mockDriverSpawn({ stderr: 'Cua Driver daemon is not running\n', exitCode: 1 });
+
+    await expect(listComputerWindowsForAtMention()).resolves.toEqual({
+      ok: true,
+      windows: [],
+    });
+    expect(spawnMock.mock.calls.map((call) => call[1])).toEqual([
+      ['--version'],
+      ['status'],
+    ]);
+  });
+
+  it('can force a macOS permission probe even when the daemon status is stopped', async () => {
+    if (process.platform !== 'darwin') return;
+
+    mockDriverSpawn({ stdout: 'cua-driver 0.6.8\n' });
+    mockDriverSpawn({ stderr: 'Cua Driver daemon is not running\n', exitCode: 1 });
+    // daemon 掉线的强制探测会先尝试自愈启动(open);这里模拟 app bundle 缺失
+    // (open 非零退出)→ 放弃自愈,仍应继续走 CLI 探测。
+    mockDriverSpawn({ stderr: 'Unable to find application named CuaDriver\n', exitCode: 1 });
+    mockDriverSpawn({
+      stdout:
+        '{"accessibility":true,"screen_recording":true,"screen_recording_capturable":true,"source":{"attribution":"driver-daemon"}}\n',
+    });
+
+    await expect(getComputerDriverStatus({ forcePermissionProbe: true })).resolves.toMatchObject({
+      installed: true,
+      daemonRunning: false,
+      permissionState: {
+        platform: 'macos',
+        status: 'granted',
+        accessibility: 'granted',
+        screenRecording: 'granted',
+      },
+    });
+    expect(spawnMock).toHaveBeenCalledWith('cua-driver', ['permissions', 'status', '--json'], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+    expect(spawnMock.mock.calls.some((call) => call[1]?.[0] === 'doctor')).toBe(false);
+  });
+
+  it('treats failed macOS permission probes as unknown instead of missing', async () => {
+    if (process.platform !== 'darwin') return;
+
+    mockDriverSpawn({ stdout: 'cua-driver 0.6.8\n' });
+    mockDriverSpawn({ stdout: 'Cua Driver daemon is running\n' });
+    mockDriverSpawn({
+      stderr: 'permission status unavailable\n',
+      exitCode: 1,
+    });
+
+    await expect(getComputerDriverStatus({ forcePermissionProbe: true })).resolves.toMatchObject({
+      installed: true,
+      permissionState: {
+        platform: 'macos',
+        status: 'unknown',
+        reason: 'permission status unavailable',
+      },
+    });
+  });
+
+  it('treats a capturable macOS screen as screen recording ready', async () => {
+    if (process.platform !== 'darwin') return;
+
+    mockDriverSpawn({ stdout: 'cua-driver 0.6.8\n' });
+    mockDriverSpawn({ stdout: 'Cua Driver daemon is running\n' });
+    mockDriverSpawn({
+      stdout:
+        '{"accessibility":true,"screen_recording":false,"screen_recording_capturable":true,"source":{"attribution":"driver-daemon"}}\n',
+    });
+
+    await expect(getComputerDriverStatus({ forcePermissionProbe: true })).resolves.toMatchObject({
+      installed: true,
+      permissionState: {
+        platform: 'macos',
+        status: 'granted',
+        screenRecording: 'missing',
+        screenRecordingCapturable: 'granted',
+      },
+    });
+  });
+
+  it('treats a stale macOS screen recording grant (recorded but not capturable) as missing', async () => {
+    if (process.platform !== 'darwin') return;
+
+    // driver 二进制更新后的典型 stale grant:TCC 数据库记录还在(screen_recording=true),
+    // 但 ScreenCaptureKit 实测已被拒(capturable=false),实际截屏必失败。必须报 missing
+    // 并附 stale 原因,把用户指回系统设置重新授权 —— 报 granted 会把坏状态藏起来。
+    mockDriverSpawn({ stdout: 'cua-driver 0.6.8\n' });
+    mockDriverSpawn({ stdout: 'Cua Driver daemon is running\n' });
+    mockDriverSpawn({
+      stdout:
+        '{"accessibility":true,"screen_recording":true,"screen_recording_capturable":false,"source":{"attribution":"driver-daemon"}}\n',
+    });
+
+    await expect(getComputerDriverStatus({ forcePermissionProbe: true })).resolves.toMatchObject({
+      installed: true,
+      permissionState: {
+        platform: 'macos',
+        status: 'missing',
+        screenRecording: 'granted',
+        screenRecordingCapturable: 'missing',
+        reason: expect.stringContaining('stale grant'),
+      },
+    });
+  });
+
+  it('reuses the broken permission probe result while the daemon pid is unchanged', async () => {
+    if (process.platform !== 'darwin') return;
+
+    // daemon 端的 capturable 实测在授权坏掉时每次都会触发 macOS 授权弹窗,因此同一个
+    // daemon(pid 未变)只允许实测一次,后续 status 复用缓存 —— 不再反复弹窗。
+    const daemonStdout = 'Cua Driver daemon is running\n  socket: /tmp/cua-driver.sock\n  pid: 4242\n';
+    const brokenPayload =
+      '{"accessibility":true,"screen_recording":true,"screen_recording_capturable":false,"source":{"attribution":"driver-daemon"}}\n';
+    mockDriverSpawn({ stdout: 'cua-driver 0.7.0\n' });
+    mockDriverSpawn({ stdout: daemonStdout });
+    mockDriverSpawn({ stdout: brokenPayload });
+    await expect(getComputerDriverStatus({ forcePermissionProbe: true })).resolves.toMatchObject({
+      permissionState: { status: 'missing', screenRecordingCapturable: 'missing' },
+    });
+
+    // 第二次 status:只 mock version + daemon status 两个 spawn —— 若错误地再次探测
+    // 权限,spawn 队列耗尽会让状态落到 unknown,下面的断言会失败。
+    mockDriverSpawn({ stdout: 'cua-driver 0.7.0\n' });
+    mockDriverSpawn({ stdout: daemonStdout });
+    await expect(getComputerDriverStatus({ forcePermissionProbe: true })).resolves.toMatchObject({
+      permissionState: { status: 'missing', screenRecordingCapturable: 'missing' },
+    });
+    const permissionProbeCalls = spawnMock.mock.calls.filter((call) => call[1]?.[0] === 'permissions');
+    expect(permissionProbeCalls).toHaveLength(1);
+  });
+
+  it('re-probes permissions after the daemon restarts with a new pid', async () => {
+    if (process.platform !== 'darwin') return;
+
+    const brokenPayload =
+      '{"accessibility":true,"screen_recording":true,"screen_recording_capturable":false,"source":{"attribution":"driver-daemon"}}\n';
+    mockDriverSpawn({ stdout: 'cua-driver 0.7.0\n' });
+    mockDriverSpawn({ stdout: 'Cua Driver daemon is running\n  pid: 4242\n' });
+    mockDriverSpawn({ stdout: brokenPayload });
+    await expect(getComputerDriverStatus({ forcePermissionProbe: true })).resolves.toMatchObject({
+      permissionState: { status: 'missing' },
+    });
+
+    // macOS 重新授权屏幕录制会杀掉 daemon;pid 变化 ⇒ 状态可能已修复,必须重新实测。
+    mockDriverSpawn({ stdout: 'cua-driver 0.7.0\n' });
+    mockDriverSpawn({ stdout: 'Cua Driver daemon is running\n  pid: 9999\n' });
+    mockDriverSpawn({
+      stdout:
+        '{"accessibility":true,"screen_recording":true,"screen_recording_capturable":true,"source":{"attribution":"driver-daemon"}}\n',
+    });
+    await expect(getComputerDriverStatus({ forcePermissionProbe: true })).resolves.toMatchObject({
+      permissionState: { status: 'granted', screenRecordingCapturable: 'granted' },
+    });
+  });
+
+  it('autostarts the daemon for a forced permission probe when it is down, then probes it', async () => {
+    if (process.platform !== 'darwin') return;
+
+    // macOS 修改屏幕录制授权会杀掉 daemon 且 macOS 侧没有 autostart;设置面板的
+    // 显式探测应把它拉起来(必须带 --no-permissions-gate,避免 serve 首启 gate
+    // 自己弹授权框 + 打开系统设置)再对新 daemon 做探测。
+    mockDriverSpawn({ stdout: 'cua-driver 0.7.0\n' });
+    mockDriverSpawn({ stderr: 'daemon not running\n', exitCode: 1 });
+    mockDriverSpawn({ stdout: '' }); // open -n -g -a CuaDriver … → exit 0
+    mockDriverSpawn({ stdout: 'Cua Driver daemon is running\n  pid: 7777\n' }); // 自愈后的轮询
+    mockDriverSpawn({
+      stdout:
+        '{"accessibility":true,"screen_recording":true,"screen_recording_capturable":true,"source":{"attribution":"driver-daemon"}}\n',
+    });
+
+    await expect(getComputerDriverStatus({ forcePermissionProbe: true })).resolves.toMatchObject({
+      installed: true,
+      daemonRunning: true,
+      permissionState: { status: 'granted' },
+    });
+    const openCall = spawnMock.mock.calls.find((call) => call[0] === 'open');
+    expect(openCall?.[1]).toEqual(['-n', '-g', '-a', 'CuaDriver', '--args', 'serve', '--no-permissions-gate']);
+  }, 10_000);
+
+  it('allows an immediate re-autostart after a successful one (throttle only cools down failures)', async () => {
+    if (process.platform !== 'darwin') return;
+
+    const healthyPayload =
+      '{"accessibility":true,"screen_recording":true,"screen_recording_capturable":true,"source":{"attribution":"driver-daemon"}}\n';
+    // 第一次:daemon 掉线 → 自愈成功。
+    mockDriverSpawn({ stdout: 'cua-driver 0.7.0\n' });
+    mockDriverSpawn({ stderr: 'daemon not running\n', exitCode: 1 });
+    mockDriverSpawn({ stdout: '' }); // open
+    mockDriverSpawn({ stdout: 'Cua Driver daemon is running\n  pid: 4242\n' });
+    mockDriverSpawn({ stdout: healthyPayload });
+    await expect(getComputerDriverStatus({ forcePermissionProbe: true })).resolves.toMatchObject({
+      daemonRunning: true,
+    });
+
+    // 授权引导中 macOS 又杀掉 daemon(如用户授了屏幕录制):必须能立刻再拉起,
+    // 不被 30s 节流卡住 —— 节流只惩罚「起不来」的失败重试。
+    mockDriverSpawn({ stdout: 'cua-driver 0.7.0\n' });
+    mockDriverSpawn({ stderr: 'daemon not running\n', exitCode: 1 });
+    mockDriverSpawn({ stdout: '' }); // open(第二次)
+    mockDriverSpawn({ stdout: 'Cua Driver daemon is running\n  pid: 5555\n' });
+    mockDriverSpawn({ stdout: healthyPayload });
+    await expect(getComputerDriverStatus({ forcePermissionProbe: true })).resolves.toMatchObject({
+      daemonRunning: true,
+      permissionState: { status: 'granted' },
+    });
+    expect(spawnMock.mock.calls.filter((call) => call[0] === 'open')).toHaveLength(2);
+  }, 10_000);
+
+  it('throttles daemon autostart attempts when the daemon stays down', async () => {
+    if (process.platform !== 'darwin') return;
+
+    // 第一次:open 成功但 daemon 在等待窗口内一直没起来(后续 spawn 全部失败)。
+    mockDriverSpawn({ stdout: 'cua-driver 0.7.0\n' });
+    mockDriverSpawn({ stderr: 'daemon not running\n', exitCode: 1 });
+    mockDriverSpawn({ stdout: '' }); // open → exit 0
+    spawnMock.mockImplementation(() => {
+      const child = new EventEmitter() as EventEmitter & {
+        stdout: EventEmitter;
+        stderr: EventEmitter;
+        kill: ReturnType<typeof vi.fn>;
+      };
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.kill = vi.fn();
+      queueMicrotask(() => {
+        child.stderr.emit('data', Buffer.from('daemon not running\n'));
+        child.emit('close', 1, null);
+      });
+      return child;
+    });
+
+    await expect(getComputerDriverStatus({ forcePermissionProbe: true })).resolves.toMatchObject({
+      daemonRunning: false,
+      permissionState: { status: 'unknown' },
+    });
+    expect(spawnMock.mock.calls.filter((call) => call[0] === 'open')).toHaveLength(1);
+
+    // 第二次(30s 节流窗口内):不再尝试 open,直接维持 unknown,避免 spawn 风暴。
+    mockDriverSpawn({ stdout: 'cua-driver 0.7.0\n' });
+    mockDriverSpawn({ stderr: 'daemon not running\n', exitCode: 1 });
+    await expect(getComputerDriverStatus({ forcePermissionProbe: true })).resolves.toMatchObject({
+      daemonRunning: false,
+      permissionState: { status: 'unknown' },
+    });
+    expect(spawnMock.mock.calls.filter((call) => call[0] === 'open')).toHaveLength(1);
+  }, 15_000);
+
+  it('restarts the daemon for a fresh permission probe so accessibility revocation is detected', async () => {
+    if (process.platform !== 'darwin') return;
+
+    existsSyncMock.mockImplementation((candidate) => String(candidate).includes('CuaDriver.app'));
+    // AX 撤销对运行中的 daemon 不可见:fresh 探测必须 stop → 自愈拉起 → 对新进程实测。
+    mockDriverSpawn({ stdout: 'cua-driver 0.7.0\n' });
+    mockDriverSpawn({ stdout: 'Cua Driver daemon is running\n  pid: 4242\n' });
+    mockDriverSpawn({ stdout: 'daemon stopped\n' }); // cua-driver stop
+    mockDriverSpawn({ stderr: 'daemon not running\n', exitCode: 1 }); // stop 后复查
+    mockDriverSpawn({ stdout: '' }); // open(autostart) → exit 0
+    mockDriverSpawn({ stdout: 'Cua Driver daemon is running\n  pid: 9999\n' }); // 自愈轮询
+    mockDriverSpawn({
+      stdout:
+        '{"accessibility":false,"screen_recording":true,"screen_recording_capturable":true,"source":{"attribution":"driver-daemon"}}\n',
+    });
+
+    await expect(
+      getComputerDriverStatus({ forcePermissionProbe: true, freshPermissionProbe: true }),
+    ).resolves.toMatchObject({
+      daemonRunning: true,
+      permissionState: { status: 'missing', accessibility: 'missing', screenRecordingCapturable: 'granted' },
+    });
+    expect(spawnMock.mock.calls.filter((call) => call[1]?.[0] === 'stop')).toHaveLength(1);
+    expect(spawnMock.mock.calls.filter((call) => call[0] === 'open')).toHaveLength(1);
+  }, 10_000);
+
+  it('fresh probe restarts and live-probes even while screen recording is broken', async () => {
+    if (process.platform !== 'darwin') return;
+
+    existsSyncMock.mockImplementation((candidate) => String(candidate).includes('CuaDriver.app'));
+    // 先种下「屏幕录制坏状态」缓存(capturable=missing @ pid 4242)——被动路径会复用它。
+    const daemonStdout = 'Cua Driver daemon is running\n  pid: 4242\n';
+    mockDriverSpawn({ stdout: 'cua-driver 0.7.0\n' });
+    mockDriverSpawn({ stdout: daemonStdout });
+    mockDriverSpawn({
+      stdout:
+        '{"accessibility":true,"screen_recording":true,"screen_recording_capturable":false,"source":{"attribution":"driver-daemon"}}\n',
+    });
+    await expect(getComputerDriverStatus({ forcePermissionProbe: true })).resolves.toMatchObject({
+      permissionState: { screenRecordingCapturable: 'missing' },
+    });
+
+    // fresh(用户显式点重新检查)不许被弹窗抑制缓存挡成「点了没反应」:必须重启 + 实测。
+    mockDriverSpawn({ stdout: 'cua-driver 0.7.0\n' });
+    mockDriverSpawn({ stdout: daemonStdout });
+    mockDriverSpawn({ stdout: 'daemon stopped\n' }); // cua-driver stop
+    mockDriverSpawn({ stderr: 'daemon not running\n', exitCode: 1 }); // stop 后复查
+    mockDriverSpawn({ stdout: '' }); // open(autostart)
+    mockDriverSpawn({ stdout: 'Cua Driver daemon is running\n  pid: 9999\n' }); // 自愈轮询
+    mockDriverSpawn({
+      stdout:
+        '{"accessibility":false,"screen_recording":true,"screen_recording_capturable":false,"source":{"attribution":"driver-daemon"}}\n',
+    });
+    await expect(
+      getComputerDriverStatus({ forcePermissionProbe: true, freshPermissionProbe: true }),
+    ).resolves.toMatchObject({
+      permissionState: { status: 'missing', accessibility: 'missing' },
+    });
+    expect(spawnMock.mock.calls.filter((call) => call[1]?.[0] === 'stop')).toHaveLength(1);
+    expect(spawnMock.mock.calls.filter((call) => call[1]?.[0] === 'permissions')).toHaveLength(2);
+  }, 10_000);
+
+  it('fresh probe never stops the daemon when the app bundle is missing (CLI-only install)', async () => {
+    if (process.platform !== 'darwin') return;
+
+    // 无 /Applications/CuaDriver.app(existsSync 默认 false)时自愈 `open` 必失败:
+    // 绝不能把健康 daemon 停掉变成拉不回来的破坏性动作,退化为不重启的现场实测。
+    mockDriverSpawn({ stdout: 'cua-driver 0.7.0\n' });
+    mockDriverSpawn({ stdout: 'Cua Driver daemon is running\n  pid: 4242\n' });
+    mockDriverSpawn({
+      stdout:
+        '{"accessibility":true,"screen_recording":true,"screen_recording_capturable":true,"source":{"attribution":"driver-daemon"}}\n',
+    });
+    await expect(
+      getComputerDriverStatus({ forcePermissionProbe: true, freshPermissionProbe: true }),
+    ).resolves.toMatchObject({
+      daemonRunning: true,
+      permissionState: { status: 'granted' },
+    });
+    expect(spawnMock.mock.calls.filter((call) => call[1]?.[0] === 'stop')).toHaveLength(0);
+    expect(spawnMock.mock.calls.filter((call) => call[1]?.[0] === 'permissions')).toHaveLength(1);
+  });
+
+  it('fresh probe skips the daemon restart while cua MCP sessions are active but still live-probes', async () => {
+    if (process.platform !== 'darwin') return;
+
+    existsSyncMock.mockImplementation((candidate) => String(candidate).includes('CuaDriver.app'));
+    // 起一个 cua MCP 会话(agent 正在操作电脑)。
+    mcpCallToolMock.mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true,"windows":[]}' }] });
+    await callComputerDriverTool('list_windows', {}, { sessionId: 'fresh-guard-session' });
+
+    mockDriverSpawn({ stdout: 'cua-driver 0.7.0\n' });
+    mockDriverSpawn({ stdout: 'Cua Driver daemon is running\n  pid: 4242\n' });
+    mockDriverSpawn({
+      stdout:
+        '{"accessibility":true,"screen_recording":true,"screen_recording_capturable":true,"source":{"attribution":"driver-daemon"}}\n',
+    });
+    await expect(
+      getComputerDriverStatus({ forcePermissionProbe: true, freshPermissionProbe: true }),
+    ).resolves.toMatchObject({
+      permissionState: { status: 'granted' },
+    });
+    // 不重启(别打断 agent),但仍现场实测。
+    expect(spawnMock.mock.calls.filter((call) => call[1]?.[0] === 'stop')).toHaveLength(0);
+    expect(spawnMock.mock.calls.filter((call) => call[1]?.[0] === 'permissions')).toHaveLength(1);
+  });
+
+  it('fresh/bypass probes start a new probe instead of joining a stale in-flight one', async () => {
+    if (process.platform !== 'darwin') return;
+
+    // p1(被动路径)卡在一个悬挂的 permissions 探测上(模拟对旧 daemon 的慢探测)。
+    mockDriverSpawn({ stdout: 'cua-driver 0.7.0\n' });
+    mockDriverSpawn({ stdout: 'Cua Driver daemon is running\n  pid: 4242\n' });
+    let hangingProbe:
+      | (EventEmitter & { stdout: EventEmitter; stderr: EventEmitter; kill: ReturnType<typeof vi.fn> })
+      | undefined;
+    spawnMock.mockImplementationOnce(() => {
+      const child = new EventEmitter() as EventEmitter & {
+        stdout: EventEmitter;
+        stderr: EventEmitter;
+        kill: ReturnType<typeof vi.fn>;
+      };
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.kill = vi.fn();
+      hangingProbe = child;
+      return child;
+    });
+    const p1 = getComputerDriverStatus({ forcePermissionProbe: true });
+    await new Promise((resolve) => setTimeout(resolve, 20)); // 让 p1 走到探测
+
+    // p2(bypass,「必须第一手」语义)不许 join p1 的在途探测,必须新起一个。
+    mockDriverSpawn({ stdout: 'cua-driver 0.7.0\n' });
+    mockDriverSpawn({ stdout: 'Cua Driver daemon is running\n  pid: 4242\n' });
+    mockDriverSpawn({
+      stdout:
+        '{"accessibility":true,"screen_recording":true,"screen_recording_capturable":true,"source":{"attribution":"driver-daemon"}}\n',
+    });
+    await expect(
+      getComputerDriverStatus({ forcePermissionProbe: true, bypassPermissionProbeCache: true }),
+    ).resolves.toMatchObject({ permissionState: { status: 'granted' } });
+    expect(spawnMock.mock.calls.filter((call) => call[1]?.[0] === 'permissions')).toHaveLength(2);
+
+    // 收尾:放行 p1,避免悬挂 promise 泄漏到后续用例。
+    hangingProbe?.stderr.emit('data', Buffer.from('slow probe\n'));
+    hangingProbe?.emit('close', 1, null);
+    await p1;
+  });
+
+  it('bypasses the broken-probe cache when the grant flow asks for a fresh status', async () => {
+    if (process.platform !== 'darwin') return;
+
+    const daemonStdout = 'Cua Driver daemon is running\n  pid: 4242\n';
+    const brokenPayload =
+      '{"accessibility":false,"screen_recording":true,"screen_recording_capturable":false,"source":{"attribution":"driver-daemon"}}\n';
+    mockDriverSpawn({ stdout: 'cua-driver 0.7.0\n' });
+    mockDriverSpawn({ stdout: daemonStdout });
+    mockDriverSpawn({ stdout: brokenPayload });
+    await expect(getComputerDriverStatus({ forcePermissionProbe: true })).resolves.toMatchObject({
+      permissionState: { status: 'missing', accessibility: 'missing' },
+    });
+
+    // 授权流程刷新状态必须绕过缓存现场实测(例如辅助功能刚被授予、daemon pid 未变)。
+    mockDriverSpawn({ stdout: 'cua-driver 0.7.0\n' });
+    mockDriverSpawn({ stdout: daemonStdout });
+    mockDriverSpawn({
+      stdout:
+        '{"accessibility":true,"screen_recording":true,"screen_recording_capturable":false,"source":{"attribution":"driver-daemon"}}\n',
+    });
+    await expect(getComputerDriverStatus({ forcePermissionProbe: true, bypassPermissionProbeCache: true })).resolves.toMatchObject({
+      permissionState: { status: 'missing', accessibility: 'granted' },
+    });
+    const permissionProbeCalls = spawnMock.mock.calls.filter((call) => call[1]?.[0] === 'permissions');
+    expect(permissionProbeCalls).toHaveLength(2);
+  });
+
+  it('runs the cua-driver macOS permission grant flow and returns refreshed status', async () => {
+    if (process.platform !== 'darwin') return;
+
+    mockDriverSpawn({ stdout: 'permission granted\n' });
+    mockDriverSpawn({ stdout: 'cua-driver 0.5.8\n' });
+    mockDriverSpawn({ stdout: 'Cua Driver daemon is running\n' });
+    mockDriverSpawn({
+      stdout:
+        '{"accessibility":true,"screen_recording":true,"screen_recording_capturable":true,"source":{"attribution":"driver-daemon"}}\n',
+    });
+
+    await expect(grantComputerDriverPermissions()).resolves.toMatchObject({
+      ok: true,
+      stdout: 'permission granted\n',
+      status: {
+        permissionState: {
+          status: 'granted',
+        },
+      },
+    });
+    expect(spawnMock).toHaveBeenCalledWith('cua-driver', ['permissions', 'grant'], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+  });
+
+  it('leaves row creation to the phase-one guide while its drag step is active', async () => {
+    setPlatform('darwin');
+    await pauseComputerDriverPermissionProbe();
+    mockDriverSpawn({ stdout: 'cua-driver 0.12.2\n' });
+    mockDriverSpawn({ stdout: 'Cua Driver daemon is not running\n' });
+
+    await expect(grantComputerDriverPermissions()).resolves.toMatchObject({
+      ok: false,
+      status: {
+        permissionState: {
+          status: 'missing',
+          accessibility: 'missing',
+          reason: 'Waiting for CuaDriver to be added in System Settings.',
+        },
+      },
+    });
+    expect(
+      spawnMock.mock.calls.some(
+        (call) => call[1]?.[0] === 'permissions' && call[1]?.[1] === 'grant',
+      ),
+    ).toBe(false);
+  });
+
+  it('preserves the preflight permission snapshot while the phase-one guide is active', async () => {
+    setPlatform('darwin');
+    await pauseComputerDriverPermissionProbe();
+    const preflightStatus: ComputerDriverStatus = {
+      installed: true,
+      executablePath: '/Applications/CuaDriver.app/Contents/MacOS/cua-driver',
+      version: '0.12.2',
+      daemonRunning: true,
+      installCommand: 'test',
+      docsUrl: 'https://cua.ai/docs/cua-driver',
+      permissionState: {
+        platform: 'macos',
+        required: true,
+        status: 'missing',
+        accessibility: 'granted',
+        screenRecording: 'missing',
+        screenRecordingCapturable: 'missing',
+        canGrant: true,
+      },
+    };
+
+    await expect(grantComputerDriverPermissions(preflightStatus)).resolves.toMatchObject({
+      ok: false,
+      status: {
+        permissionState: {
+          accessibility: 'granted',
+          screenRecording: 'missing',
+        },
+      },
+    });
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  it('kills the in-flight grant child when the user cancels the permission guide', async () => {
+    if (process.platform !== 'darwin') return;
+
+    // 挂死的 grant 子进程(上游会一直等用户完成授权,长达 210s)。
+    let grantChild:
+      | (EventEmitter & { stdout: EventEmitter; stderr: EventEmitter; kill: ReturnType<typeof vi.fn> })
+      | undefined;
+    spawnMock.mockImplementationOnce(() => {
+      const child = new EventEmitter() as EventEmitter & {
+        stdout: EventEmitter;
+        stderr: EventEmitter;
+        kill: ReturnType<typeof vi.fn>;
+      };
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.kill = vi.fn();
+      grantChild = child;
+      return child;
+    });
+    mockDriverSpawn({ stdout: 'cua-driver 0.7.0\n' });
+    mockDriverSpawn({ stdout: 'Cua Driver daemon is running\n' });
+    mockDriverSpawn({
+      stdout:
+        '{"accessibility":false,"screen_recording":false,"screen_recording_capturable":false,"source":{"attribution":"driver-daemon"}}\n',
+    });
+    await expect(grantComputerDriverPermissions()).resolves.toMatchObject({ ok: false });
+
+    // 用户点「取消」:在途 grant 子进程必须被收割,原生授权流程随之停止。
+    cancelComputerDriverPermissionGrant();
+    expect(grantChild?.kill).toHaveBeenCalledTimes(1);
+
+    // 下一次授权是全新流程(重新 spawn),不是复用已被放弃的旧流程。
+    mockDriverSpawn({ stdout: 'permission granted\n' });
+    mockDriverSpawn({ stdout: 'cua-driver 0.7.0\n' });
+    mockDriverSpawn({ stdout: 'Cua Driver daemon is running\n' });
+    mockDriverSpawn({
+      stdout:
+        '{"accessibility":true,"screen_recording":true,"screen_recording_capturable":true,"source":{"attribution":"driver-daemon"}}\n',
+    });
+    await expect(grantComputerDriverPermissions()).resolves.toMatchObject({ ok: true });
+    const grantSpawns = spawnMock.mock.calls.filter((call) => call[1]?.[0] === 'permissions' && call[1]?.[1] === 'grant');
+    expect(grantSpawns).toHaveLength(2);
+  });
+
+  it('restarts a stale macOS permission grant flow so users do not need to restart the app', async () => {
+    if (process.platform !== 'darwin') return;
+
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-03T02:00:00.000Z'));
+    try {
+      // 挂死的 grant 子进程:上游 `permissions grant` 会一直等用户完成授权。
+      let staleChild:
+        | (EventEmitter & { stdout: EventEmitter; stderr: EventEmitter; kill: ReturnType<typeof vi.fn> })
+        | undefined;
+      spawnMock.mockImplementationOnce(() => {
+        const child = new EventEmitter() as EventEmitter & {
+          stdout: EventEmitter;
+          stderr: EventEmitter;
+          kill: ReturnType<typeof vi.fn>;
+        };
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        child.kill = vi.fn();
+        staleChild = child;
+        return child;
+      });
+      mockDriverSpawn({ stdout: 'cua-driver 0.6.8\n' });
+      mockDriverSpawn({ stdout: 'Cua Driver daemon is running\n' });
+      mockDriverSpawn({
+        stdout:
+          '{"accessibility":true,"screen_recording":false,"screen_recording_capturable":false,"source":{"attribution":"driver-daemon"}}\n',
+      });
+
+      const firstGrant = grantComputerDriverPermissions();
+      await vi.advanceTimersByTimeAsync(750);
+      await expect(firstGrant).resolves.toMatchObject({
+        ok: false,
+        status: { permissionState: { status: 'missing' } },
+      });
+      // 授权仍在等用户操作,复用窗口内不许收割在途流程。
+      expect(staleChild?.kill).not.toHaveBeenCalled();
+
+      // 用户走开又回来:超过复用窗口的旧流程必须被杀掉重启,否则按钮点了没反应。
+      await vi.advanceTimersByTimeAsync(16_000);
+      mockDriverSpawn({ stdout: 'permission granted\n' });
+      mockDriverSpawn({ stdout: 'cua-driver 0.6.8\n' });
+      mockDriverSpawn({ stdout: 'Cua Driver daemon is running\n' });
+      mockDriverSpawn({
+        stdout:
+          '{"accessibility":true,"screen_recording":true,"screen_recording_capturable":true,"source":{"attribution":"driver-daemon"}}\n',
+      });
+
+      await expect(grantComputerDriverPermissions()).resolves.toMatchObject({
+        ok: true,
+        status: { permissionState: { status: 'granted' } },
+      });
+      expect(staleChild?.kill).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('stale status probes do not kill a grant flow started after the probe began', async () => {
+    if (process.platform !== 'darwin') return;
+
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-04T02:00:00.000Z'));
+    try {
+      const grantedPayload =
+        '{"accessibility":true,"screen_recording":true,"screen_recording_capturable":true,"source":{"attribution":"driver-daemon"}}\n';
+      const makeHangingChild = () => {
+        const child = new EventEmitter() as EventEmitter & {
+          stdout: EventEmitter;
+          stderr: EventEmitter;
+          kill: ReturnType<typeof vi.fn>;
+        };
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        child.kill = vi.fn();
+        return child;
+      };
+
+      // A:一次 status 探测在 permissions 子进程处挂起(证据采集始于 grant 之前)。
+      mockDriverSpawn({ stdout: 'cua-driver 0.7.0\n' });
+      mockDriverSpawn({ stdout: 'Cua Driver daemon is running\n  pid: 4242\n' });
+      let staleProbeChild: ReturnType<typeof makeHangingChild> | undefined;
+      spawnMock.mockImplementationOnce(() => {
+        staleProbeChild = makeHangingChild();
+        return staleProbeChild;
+      });
+      const staleStatus = getComputerDriverStatus({ forcePermissionProbe: true });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(staleProbeChild).toBeDefined();
+
+      // B:此后用户发起 grant(子进程挂起等待系统授权)。
+      let grantChild: ReturnType<typeof makeHangingChild> | undefined;
+      spawnMock.mockImplementationOnce(() => {
+        grantChild = makeHangingChild();
+        return grantChild;
+      });
+      mockDriverSpawn({ stdout: 'cua-driver 0.7.0\n' });
+      mockDriverSpawn({ stdout: 'Cua Driver daemon is running\n  pid: 4242\n' });
+      mockDriverSpawn({
+        stdout:
+          '{"accessibility":false,"screen_recording":false,"screen_recording_capturable":false,"source":{"attribution":"driver-daemon"}}\n',
+      });
+      const grantPromise = grantComputerDriverPermissions();
+      await vi.advanceTimersByTimeAsync(750);
+      await expect(grantPromise).resolves.toMatchObject({ ok: false });
+      expect(grantChild?.kill).not.toHaveBeenCalled();
+
+      // A 的探测此刻才回并报 granted(stale 证据):不得误杀 B 的在途 grant。
+      staleProbeChild!.stdout.emit('data', Buffer.from(grantedPayload));
+      staleProbeChild!.emit('close', 0, null);
+      await expect(staleStatus).resolves.toMatchObject({
+        permissionState: { status: 'granted' },
+      });
+      expect(grantChild?.kill).not.toHaveBeenCalled();
+
+      // 对照:grant 在途期间发起的 status 确认 granted,仍应收割该 grant 子进程。
+      mockDriverSpawn({ stdout: 'cua-driver 0.7.0\n' });
+      mockDriverSpawn({ stdout: 'Cua Driver daemon is running\n  pid: 4242\n' });
+      mockDriverSpawn({ stdout: grantedPayload });
+      await expect(
+        getComputerDriverStatus({ forcePermissionProbe: true, bypassPermissionProbeCache: true }),
+      ).resolves.toMatchObject({ permissionState: { status: 'granted' } });
+      expect(grantChild?.kill).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('returns partial macOS permission status while the grant flow is still incomplete', async () => {
+    if (process.platform !== 'darwin') return;
+
+    mockDriverSpawn({ stdout: 'permission prompt opened\n' });
+    mockDriverSpawn({ stdout: 'cua-driver 0.5.8\n' });
+    mockDriverSpawn({ stdout: 'Cua Driver daemon is running\n' });
+    mockDriverSpawn({
+      stdout:
+        '{"accessibility":true,"screen_recording":false,"screen_recording_capturable":false,"source":{"attribution":"driver-daemon"}}\n',
+    });
+
+    await expect(grantComputerDriverPermissions()).resolves.toMatchObject({
+      ok: false,
+      stdout: 'permission prompt opened\n',
+      status: {
+        permissionState: {
+          status: 'missing',
+          accessibility: 'granted',
+          screenRecording: 'missing',
+        },
+      },
+    });
+  });
+});
+
+function currentPlatformReleaseAsset(version: string, size = 21147689) {
+  const name = getCuaDriverReleaseAssetName(version);
+  if (!name) throw new Error(`unsupported test platform: ${process.platform}/${process.arch}`);
+  return { name, size, state: 'uploaded' as const };
+}
+
+/** 标准更新检查 mock:matching-refs 返回 0.7.0,后续请求返回可安装 release。 */
+function mockRefsThenReleaseFetch() {
+  return vi
+    .fn()
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => [{ ref: 'refs/tags/cua-driver-rs-v0.7.0' }],
+    })
+    .mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        tag_name: 'cua-driver-rs-v0.7.0',
+        assets: [currentPlatformReleaseAsset('0.7.0')],
+      }),
+    });
+}
+
+/**
+ * CU-014 (2026-10 audit): foreground input competed with the person at the
+ * keyboard in eight sessions. Gap: only remote-desktop input yielded. Tier: unit.
+ */
+describe('foreground input while the person is using this computer', () => {
+  const context = { sessionId: 'user-active' };
+  const target = { pid: 123, window_id: 7 };
+  beforeEach(async () => {
+    await cleanupAllComputerDriverSessions();
+    resetDesktopInputGuardStateForTests();
+    mcpConnectMock.mockReset().mockResolvedValue(undefined);
+    mcpListToolsMock.mockReset().mockResolvedValue({ tools: COMPUTER_TOOLS.map(({ name }) => ({
+      name, inputSchema: { type: 'object', additionalProperties: true },
+    })) });
+    mcpCallToolMock.mockReset().mockResolvedValue({ structuredContent: { ok: true, effect: 'confirmed' } });
+    powerMonitorState.idleSeconds = 3600;
+    powerMonitorState.idleState = 'active';
+  });
+
+  it('refuses foreground delivery after recent system input and keeps background delivery', async () => {
+    await callComputerDriverTool('get_window_state', target, context);
+    powerMonitorState.idleSeconds = 0;
+    await expect(callComputerDriverTool('click', { ...target, x: 1, y: 1, delivery_mode: 'foreground' }, context))
+      .rejects.toMatchObject({ code: 'USER_INPUT_ACTIVE' });
+    expect(mcpCallToolMock.mock.calls.filter(([call]) => call.name === 'click')).toHaveLength(0);
+    await expect(callComputerDriverTool('click', {
+      target: { kind: 'desktop', display_id: 'primary' }, capture_id: 'capture-1', x: 1, y: 1, delivery_mode: 'foreground',
+    }, context)).rejects.toMatchObject({ code: 'USER_INPUT_ACTIVE' });
+    await expect(callComputerDriverTool('click', { ...target, x: 1, y: 1, delivery_mode: 'background' }, context))
+      .resolves.toBeDefined();
+    await expect(callComputerDriverTool('get_window_state', target, context)).resolves.toBeDefined();
+  });
+
+  // Mouse drift regression: the idle clock cannot distinguish physical input
+  // from CUA events. The former test explicitly permitted the unsafe delivery
+  // tail. Exercise real dispatch refusal (unit), including the in-flight path.
+  it('does not let an Agent dispatch mask recent input before the next foreground click', async () => {
+    await callComputerDriverTool('get_window_state', target, context);
+    await callComputerDriverTool('click', { ...target, x: 1, y: 1, delivery_mode: 'background' }, context);
+    mcpCallToolMock.mockClear();
+    powerMonitorState.idleSeconds = 0;
+    await expect(callComputerDriverTool('click', { ...target, x: 1, y: 1, delivery_mode: 'foreground' }, context))
+      .rejects.toMatchObject({ code: 'USER_INPUT_ACTIVE' });
+    expect(mcpCallToolMock.mock.calls.filter(([call]) => call.name === 'click')).toHaveLength(0);
+    powerMonitorState.idleSeconds = 3;
+    await expect(callComputerDriverTool('click', { ...target, x: 1, y: 1, delivery_mode: 'foreground' }, context))
+      .resolves.toBeDefined();
+  });
+
+  it('stops foreground text at the next chunk when input arrives during dispatch without replaying the prefix', async () => {
+    await callComputerDriverTool('get_window_state', target, context);
+    mcpCallToolMock.mockImplementation(async (call) => {
+      if (call.name === 'type_text') powerMonitorState.idleSeconds = 0;
+      return { structuredContent: { ok: true, effect: 'confirmed' } };
+    });
+    await expect(callComputerDriverTool('type_text', {
+      ...target, text: 'a'.repeat(401), delivery_mode: 'foreground',
+    }, context)).rejects.toMatchObject({
+      code: 'USER_INPUT_ACTIVE',
+      inputProgress: { completed_chars: 400, attempted_chars: 0, remaining_chars: 1 },
+    });
+    expect(mcpCallToolMock.mock.calls.filter(([call]) => call.name === 'type_text')).toHaveLength(1);
+  });
+
+  it.each([Number.NaN, Number.POSITIVE_INFINITY, -1, 'throws'])(
+    'refuses foreground input when the idle probe is unavailable (%s), retaining background input', async (idle) => {
+      await callComputerDriverTool('get_window_state', target, context);
+      const probe = vi.spyOn(powerMonitor, 'getSystemIdleTime').mockImplementation(() => {
+        if (idle === 'throws') throw new Error('probe unavailable');
+        return idle as number;
+      });
+      try {
+        await expect(callComputerDriverTool('click', { ...target, x: 1, y: 1, delivery_mode: 'foreground' }, context))
+          .rejects.toMatchObject({ code: 'USER_INPUT_ACTIVE' });
+        expect(mcpCallToolMock.mock.calls.filter(([call]) => call.name === 'click')).toHaveLength(0);
+        await expect(callComputerDriverTool('click', { ...target, x: 1, y: 1, delivery_mode: 'background' }, context))
+          .resolves.toBeDefined();
+      } finally {
+        probe.mockRestore();
+      }
+    },
+  );
+
+  it('retains foreground operation under the existing physical input shield', async () => {
+    await callComputerDriverTool('get_window_state', target, context);
+    powerMonitorState.idleSeconds = 0;
+    setPhysicalInputShielded(() => true);
+    try {
+      await expect(callComputerDriverTool('click', { ...target, x: 1, y: 1, delivery_mode: 'foreground' }, context))
+        .resolves.toBeDefined();
+    } finally {
+      setPhysicalInputShielded(() => false);
+    }
+    await expect(callComputerDriverTool('click', { ...target, x: 1, y: 1, delivery_mode: 'foreground' }, context))
+      .rejects.toMatchObject({ code: 'USER_INPUT_ACTIVE' });
+    expect(mcpCallToolMock.mock.calls.filter(([call]) => call.name === 'click')).toHaveLength(1);
+  });
+
+  // Review (#8227): an AX write or app launch sends no HID event, so it must not take
+  // the credit for the person's typing that follows it.
+  it.each([
+    ['set_value', { element_token: 'x:1', value: 'hi' }],
+    ['launch_app', { name: 'Notes' }],
+  ] as const)('does not attribute later input to a %s that synthesized none', async (tool, extra) => {
+    vi.useFakeTimers();
+    try {
+      await callComputerDriverTool('get_window_state', target, context);
+      await callComputerDriverTool(tool, tool === 'launch_app' ? { ...extra } : { ...target, ...extra }, context).catch(() => undefined);
+      powerMonitorState.idleSeconds = 1;
+      await expect(callComputerDriverTool('click', { ...target, x: 1, y: 1, delivery_mode: 'foreground' }, context))
+        .rejects.toMatchObject({ code: expect.stringMatching(/USER_INPUT_ACTIVE|STALE_SNAPSHOT/) });
+      // A fresh read lets the check run on its own merits.
+      await callComputerDriverTool('get_window_state', target, context);
+      await expect(callComputerDriverTool('click', { ...target, x: 1, y: 1, delivery_mode: 'foreground' }, context))
+        .rejects.toMatchObject({ code: 'USER_INPUT_ACTIVE' });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // Review (#8227 round 8): input that follows an Agent action by more than the delivery
+  // tail is a person's, however recent the action was.
+  it('treats input after the delivery tail of an Agent action as the person\'s', async () => {
+    vi.useFakeTimers();
+    try {
+      await callComputerDriverTool('get_window_state', target, context);
+      await callComputerDriverTool('click', { ...target, x: 1, y: 1, delivery_mode: 'background' }, context);
+      vi.advanceTimersByTime(2_600);
+      powerMonitorState.idleSeconds = 0;
+      await expect(callComputerDriverTool('click', { ...target, x: 1, y: 1, delivery_mode: 'foreground' }, context))
+        .rejects.toMatchObject({ code: 'USER_INPUT_ACTIVE' });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // Review (#8227 round 14): a driver refusal returns as a normal result and sent nothing.
+  it('does not attribute later input to a click the driver refused', async () => {
+    await callComputerDriverTool('get_window_state', target, context);
+    mcpCallToolMock.mockResolvedValue({ structuredContent: { ok: true, effect: 'refused', errorCode: 'background_unavailable' } });
+    await callComputerDriverTool('click', { ...target, x: 1, y: 1, delivery_mode: 'background' }, context);
+    mcpCallToolMock.mockResolvedValue({ structuredContent: { ok: true, effect: 'confirmed' } });
+    await callComputerDriverTool('get_window_state', target, context);
+    powerMonitorState.idleSeconds = 0;
+    await expect(callComputerDriverTool('click', { ...target, x: 1, y: 1, delivery_mode: 'foreground' }, context))
+      .rejects.toMatchObject({ code: 'USER_INPUT_ACTIVE' });
+  });
+
+  it('does not attribute input to a foreground action the guard refused', async () => {
+    await callComputerDriverTool('get_window_state', target, context);
+    powerMonitorState.idleSeconds = 0;
+    await expect(callComputerDriverTool('click', { ...target, x: 1, y: 1, delivery_mode: 'foreground' }, context))
+      .rejects.toMatchObject({ code: 'USER_INPUT_ACTIVE' });
+    await expect(callComputerDriverTool('click', { ...target, x: 1, y: 1, delivery_mode: 'foreground' }, context))
+      .rejects.toMatchObject({ code: 'USER_INPUT_ACTIVE' });
+  });
+
+  it('reports the lock state from power events, else from the idle-state probe', async () => {
+    const deps = getComputerMcpDeps();
+    // Started on a locked screen: macOS never reports 'locked' through the probe.
+    powerMonitorState.idleState = 'idle';
+    seedDesktopScreenLocked(true);
+    await expect(deps.describeDesktop?.()).resolves.toEqual({ screen_locked: true });
+    resetDesktopInputGuardStateForTests();
+    powerMonitorState.idleState = 'locked';
+    await expect(deps.describeDesktop?.()).resolves.toEqual({ screen_locked: true });
+    powerMonitorState.listeners.get('unlock-screen')?.();
+    await expect(deps.describeDesktop?.()).resolves.toEqual({ screen_locked: false });
+    // A startup seed never overrides an event already seen.
+    seedDesktopScreenLocked(true);
+    await expect(deps.describeDesktop?.()).resolves.toEqual({ screen_locked: false });
+    powerMonitorState.listeners.get('lock-screen')?.();
+    await expect(deps.describeDesktop?.()).resolves.toEqual({ screen_locked: true });
+    powerMonitorState.listeners.get('unlock-screen')?.();
+  });
+});
+
+describe('computer driver update check', () => {
+  beforeEach(() => {
+    spawnMock.mockReset();
+    resetComputerDriverUpdateStateForTests();
+  });
+
+  it('extractDriverSemver pulls x.y.z out of raw --version output shapes', () => {
+    expect(extractDriverSemver('0.5.8')).toBe('0.5.8');
+    expect(extractDriverSemver('cua-driver 0.5.8\n')).toBe('0.5.8');
+    expect(extractDriverSemver('CuaDriver v0.10.2 (release)')).toBe('0.10.2');
+    expect(extractDriverSemver('')).toBeNull();
+    expect(extractDriverSemver(null)).toBeNull();
+    expect(extractDriverSemver('no version here')).toBeNull();
+  });
+
+  it('compareSemver compares numerically per segment, not lexically', () => {
+    expect(compareSemver('0.5.8', '0.5.8')).toBe(0);
+    expect(compareSemver('0.5.8', '0.6.0')).toBeLessThan(0);
+    expect(compareSemver('0.10.0', '0.9.9')).toBeGreaterThan(0);
+    expect(compareSemver('1.0.0', '0.99.99')).toBeGreaterThan(0);
+  });
+
+  it('pickLatestCuaDriverVersion ignores other monorepo components and picks semver max', () => {
+    expect(
+      pickLatestCuaDriverVersion([
+        'agent-v0.8.4',
+        'cua-driver-rs-v0.6.8',
+        'cli-v0.1.12',
+        'cua-driver-rs-v0.7.0',
+        'cua-driver-rs-v0.5.8',
+        'computer-server-v0.3.42',
+      ]),
+    ).toBe('0.7.0');
+    expect(pickLatestCuaDriverVersion(['agent-v0.8.4', 'cli-v0.1.12'])).toBeNull();
+    expect(pickLatestCuaDriverVersion([])).toBeNull();
+  });
+
+  it('reports updateAvailable when upstream has a newer cua-driver tag', async () => {
+    mockDriverSpawn({ stdout: 'cua-driver 0.5.8\n' });
+    const fetchImpl = vi
+      .fn()
+      // matching-refs:全量 driver tag(乱序也无妨,semver max)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => [
+          { ref: 'refs/tags/cua-driver-rs-v0.6.8' },
+          { ref: 'refs/tags/cua-driver-rs-v0.7.0' },
+          { ref: 'refs/tags/cua-driver-rs-v0.5.8' },
+        ],
+      })
+      // release-by-tag:asset 列表
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          tag_name: 'cua-driver-rs-v0.7.0',
+          assets: [currentPlatformReleaseAsset('0.7.0')],
+        }),
+      });
+
+    await expect(checkComputerDriverUpdate(fetchImpl as unknown as typeof fetch)).resolves.toEqual({
+      currentVersion: '0.5.8',
+      latestVersion: '0.7.0',
+      updateAvailable: true,
+      updating: false,
+      checkStatus: 'success',
+      checkedAt: expect.any(Number),
+    });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(String(fetchImpl.mock.calls[0][0])).toContain('git/matching-refs/tags/cua-driver-rs-v');
+    expect(String(fetchImpl.mock.calls[1][0])).toContain('releases/tags/cua-driver-rs-v0.7.0');
+  });
+
+  it('reports no update when local version already matches the latest tag (single request)', async () => {
+    mockDriverSpawn({ stdout: '0.7.0\n' });
+    const fetchImpl = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => [{ ref: 'refs/tags/cua-driver-rs-v0.7.0' }],
+    });
+
+    await expect(checkComputerDriverUpdate(fetchImpl as unknown as typeof fetch)).resolves.toEqual({
+      currentVersion: '0.7.0',
+      latestVersion: '0.7.0',
+      updateAvailable: false,
+      updating: false,
+      checkStatus: 'success',
+      checkedAt: expect.any(Number),
+    });
+    // 无更新时不拉 assets,恒定 1 个请求
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('silently reports no update when the driver is not installed locally', async () => {
+    mockDriverSpawn({ error: Object.assign(new Error('spawn cua-driver ENOENT'), { code: 'ENOENT' }) });
+    const fetchImpl = vi.fn();
+
+    await expect(checkComputerDriverUpdate(fetchImpl as unknown as typeof fetch)).resolves.toEqual({
+      currentVersion: null,
+      latestVersion: null,
+      updateAvailable: false,
+      updating: false,
+      checkStatus: 'error',
+      checkedAt: expect.any(Number),
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('silently reports no update when the releases API fails', async () => {
+    mockDriverSpawn({ stdout: '0.5.8\n' });
+    // 不带配额信息的 403:可能是仓库/权限问题,不能报成「稍后重试就好」。
+    const fetchImpl = vi.fn().mockResolvedValue({ ok: false, status: 403 });
+
+    await expect(checkComputerDriverUpdate(fetchImpl as unknown as typeof fetch)).resolves.toEqual({
+      currentVersion: '0.5.8',
+      latestVersion: null,
+      updateAvailable: false,
+      updating: false,
+      checkStatus: 'error',
+      checkError: { kind: 'network' },
+      checkedAt: expect.any(Number),
+    });
+  });
+
+  it('silently reports no update on malformed API payloads', async () => {
+    mockDriverSpawn({ stdout: '0.5.8\n' });
+    const fetchImpl = vi.fn().mockResolvedValue({
+      ok: true,
+      // matching-refs 返回非数组(异常形态)
+      json: async () => ({ message: 'unexpected object payload' }),
+    });
+
+    await expect(checkComputerDriverUpdate(fetchImpl as unknown as typeof fetch)).resolves.toEqual({
+      currentVersion: '0.5.8',
+      latestVersion: null,
+      updateAvailable: false,
+      updating: false,
+      checkStatus: 'error',
+      checkedAt: expect.any(Number),
+    });
+  });
+
+  it('serves the cached result instantly on subsequent checks (no network wait)', async () => {
+    mockDriverSpawn({ stdout: 'cua-driver 0.5.8\n' });
+    const firstFetch = mockRefsThenReleaseFetch();
+    const first = await checkComputerDriverUpdate(firstFetch as unknown as typeof fetch);
+
+    // 第二次立即返回缓存;且距上次检查未满节流窗口,不应触发后台刷新
+    // (未鉴权 GitHub API 限额有限,面板频繁开合不能放大请求量)。
+    const hangingFetch = vi.fn().mockReturnValue(new Promise(() => {}));
+    await expect(
+      checkComputerDriverUpdate(hangingFetch as unknown as typeof fetch),
+    ).resolves.toEqual({
+      currentVersion: '0.5.8',
+      latestVersion: '0.7.0',
+      updateAvailable: true,
+      updating: false,
+      checkStatus: 'success',
+      checkedAt: first.checkedAt,
+    });
+    expect(hangingFetch).not.toHaveBeenCalled();
+  });
+
+  it('bypasses fresh cached results on manual checks and shares an in-flight request', async () => {
+    mockDriverSpawn({ stdout: 'cua-driver 0.5.8\n' });
+    await checkComputerDriverUpdate(mockRefsThenReleaseFetch() as unknown as typeof fetch);
+    mockDriverSpawn({ stdout: 'cua-driver 0.7.0\n' });
+    let finish!: (response: unknown) => void;
+    const fetchImpl = vi.fn().mockReturnValue(new Promise((resolve) => { finish = resolve; }));
+    const first = checkComputerDriverUpdate(fetchImpl as unknown as typeof fetch, { force: true });
+    const second = checkComputerDriverUpdate(fetchImpl as unknown as typeof fetch, { force: true });
+    await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledOnce());
+    finish({ ok: true, json: async () => [{ ref: 'refs/tags/cua-driver-rs-v0.7.0' }] });
+    const result = await first;
+    expect(result).toMatchObject({ currentVersion: '0.7.0', updateAvailable: false, checkStatus: 'success' });
+    expect(await second).toEqual(result);
+    expect(fetchImpl).toHaveBeenCalledOnce();
+  });
+
+  it('awaits an expired cache refresh and returns the new result to the same caller', async () => {
+    mockDriverSpawn({ stdout: 'cua-driver 0.5.8\n' });
+    const previous = await checkComputerDriverUpdate(mockRefsThenReleaseFetch() as unknown as typeof fetch);
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      vi.setSystemTime(Date.now() + 11 * 60_000);
+      mockDriverSpawn({ stdout: 'cua-driver 0.7.0\n' });
+      const result = await checkComputerDriverUpdate(mockRefsThenReleaseFetch() as unknown as typeof fetch);
+      expect(result).toMatchObject({ currentVersion: '0.7.0', updateAvailable: false, checkStatus: 'success' });
+      expect(result.checkedAt).toBeGreaterThan(previous.checkedAt!);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reports a failed refresh while keeping the previously verified update offer', async () => {
+    mockDriverSpawn({ stdout: 'cua-driver 0.5.8\n' });
+    const okFetch = mockRefsThenReleaseFetch();
+    await checkComputerDriverUpdate(okFetch as unknown as typeof fetch);
+
+    // 越过节流窗口后,后台刷新网络失败(latestVersion 拿不到)不应把已知的
+    // 更新入口抹掉。只 fake Date 以推进节流窗口,真实 timer 保持可用。
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      vi.setSystemTime(Date.now() + 11 * 60_000);
+      mockDriverSpawn({ stdout: 'cua-driver 0.5.8\n' });
+      const failingFetch = vi.fn().mockResolvedValue({ ok: false, status: 500 });
+      await expect(checkComputerDriverUpdate(failingFetch as unknown as typeof fetch)).resolves.toMatchObject({
+        latestVersion: '0.7.0', updateAvailable: true, checkStatus: 'error', checkedAt: Date.now(),
+      });
+      // 节流窗口外确实触发了后台刷新
+      expect(failingFetch).toHaveBeenCalledTimes(1);
+
+      mockDriverSpawn({ stdout: 'cua-driver 0.5.8\n' });
+      const hangingFetch = vi.fn().mockReturnValue(new Promise(() => {}));
+      await expect(
+        checkComputerDriverUpdate(hangingFetch as unknown as typeof fetch),
+      ).resolves.toMatchObject({ latestVersion: '0.7.0', updateAvailable: true, checkStatus: 'error' });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('marks a GitHub rate-limited refresh as retryable instead of a broken check', async () => {
+    mockDriverSpawn({ stdout: 'cua-driver 0.5.8\n' });
+    await checkComputerDriverUpdate(mockRefsThenReleaseFetch() as unknown as typeof fetch);
+
+    // 已知有可安装新版后,后台刷新撞上 403 + 配额见底:要保留安装入口,
+    // 同时把原因报成「限流可重试」,而不是笼统的检查失败。
+    mockDriverSpawn({ stdout: 'cua-driver 0.5.8\n' });
+    const rateLimitedFetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 403,
+      headers: { get: (name: string) => (name === 'x-ratelimit-remaining' ? '0' : null) },
+    });
+    await expect(
+      checkComputerDriverUpdate(rateLimitedFetch as unknown as typeof fetch, { force: true }),
+    ).resolves.toMatchObject({
+      latestVersion: '0.7.0',
+      updateAvailable: true,
+      checkStatus: 'error',
+      checkError: { kind: 'rate_limited' },
+    });
+  });
+
+  it('does not turn an unverified cached tag into an update after a local downgrade and network failure', async () => {
+    mockDriverSpawn({ stdout: 'cua-driver 0.7.0\n' });
+    await expect(checkComputerDriverUpdate(mockRefsThenReleaseFetch() as unknown as typeof fetch))
+      .resolves.toMatchObject({ latestVersion: '0.7.0', updateAvailable: false });
+    mockDriverSpawn({ stdout: 'cua-driver 0.5.8\n' });
+    const failedFetch = vi.fn().mockResolvedValue({ ok: false, status: 500 });
+    await expect(checkComputerDriverUpdate(failedFetch as unknown as typeof fetch, { force: true }))
+      .resolves.toMatchObject({ currentVersion: '0.5.8', updateAvailable: false, checkStatus: 'error' });
+  });
+
+  it('keeps a newer verified target when its background probe transiently falls back', async () => {
+    mockDriverSpawn({ stdout: 'cua-driver 0.10.0\n' });
+    const initialFetch = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => [{ ref: 'refs/tags/cua-driver-rs-v0.12.0' }],
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          tag_name: 'cua-driver-rs-v0.12.0',
+          assets: [currentPlatformReleaseAsset('0.12.0')],
+        }),
+      });
+    await checkComputerDriverUpdate(initialFetch as unknown as typeof fetch);
+
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      vi.setSystemTime(Date.now() + 11 * 60_000);
+      mockDriverSpawn({ stdout: 'cua-driver 0.10.0\n' });
+      const refreshedFetch = vi
+        .fn()
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => [
+            { ref: 'refs/tags/cua-driver-rs-v0.12.0' },
+            { ref: 'refs/tags/cua-driver-rs-v0.11.0' },
+          ],
+        })
+        .mockResolvedValueOnce({ ok: false, status: 503 })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            tag_name: 'cua-driver-rs-v0.11.0',
+            assets: [currentPlatformReleaseAsset('0.11.0')],
+          }),
+        });
+
+      await expect(
+        checkComputerDriverUpdate(refreshedFetch as unknown as typeof fetch),
+      ).resolves.toMatchObject({ latestVersion: '0.12.0', updateAvailable: true });
+      await new Promise((resolve) => { setTimeout(resolve, 0); });
+      expect(refreshedFetch).toHaveBeenCalledTimes(3);
+
+      const hangingFetch = vi.fn().mockReturnValue(new Promise(() => {}));
+      await expect(
+        checkComputerDriverUpdate(hangingFetch as unknown as typeof fetch),
+      ).resolves.toMatchObject({ latestVersion: '0.12.0', updateAvailable: true });
+      expect(hangingFetch).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('updateComputerDriver joins one in-flight install and clears the cached check on success', async () => {
+    // 先塞一个"有更新"缓存
+    mockDriverSpawn({ stdout: 'cua-driver 0.5.8\n' });
+    const fetchImpl = mockRefsThenReleaseFetch();
+    await checkComputerDriverUpdate(fetchImpl as unknown as typeof fetch);
+
+    // installComputerDriver 的 spawn 序列:installer + status(version/daemon[/permissions])
+    mockDriverSpawn({ stdout: 'installed\n' });
+    mockDriverSpawn({ stdout: 'cua-driver 0.7.0\n' });
+    mockDriverSpawn({ stdout: 'Cua Driver daemon is running\n' });
+    if (process.platform === 'darwin') {
+      mockDriverSpawn({
+        stdout:
+          '{"accessibility":true,"screen_recording":true,"screen_recording_capturable":true,"source":{"attribution":"driver-daemon"}}\n',
+      });
+    }
+
+    const installerCallsBefore = spawnMock.mock.calls.length;
+    // 并发两次调用(模拟面板关闭前发起 + 重开后 join),应共享同一次安装
+    const [first, second] = await Promise.all([
+      updateComputerDriver(undefined, { fetchImpl: fetchImpl as unknown as typeof fetch }),
+      updateComputerDriver(undefined, { fetchImpl: fetchImpl as unknown as typeof fetch }),
+    ]);
+    expect(first).toBe(second);
+    expect(first.ok).toBe(true);
+    const installerRuns = spawnMock.mock.calls
+      .slice(installerCallsBefore)
+      .filter((call) => String(call[0]).match(/bash|powershell/i)).length;
+    expect(installerRuns).toBe(1);
+    const installerCall = spawnMock.mock.calls
+      .slice(installerCallsBefore)
+      .find((call) => String(call[0]).match(/bash|powershell/i));
+    expect(installerCall?.[2]?.env?.CUA_DRIVER_RS_VERSION).toBe('0.7.0');
+
+    // 成功后缓存被清:下一次 check 重新走网络(注入 no-update 响应验证)
+    mockDriverSpawn({ stdout: 'cua-driver 0.7.0\n' });
+    const refreshedFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => [{ ref: 'refs/tags/cua-driver-rs-v0.7.0' }],
+    });
+    await expect(
+      checkComputerDriverUpdate(refreshedFetch as unknown as typeof fetch),
+    ).resolves.toEqual({
+      currentVersion: '0.7.0',
+      latestVersion: '0.7.0',
+      updateAvailable: false,
+      updating: false,
+      checkStatus: 'success',
+      checkedAt: expect.any(Number),
+    });
+    expect(refreshedFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['0.5.8', '0.7.0'])('rechecks the installed version %s after a nonzero installer exit', async (version) => {
+    mockDriverSpawn({ stdout: 'cua-driver 0.5.8\n' });
+    const fetchImpl = mockRefsThenReleaseFetch();
+    await checkComputerDriverUpdate(fetchImpl as unknown as typeof fetch);
+
+    mockDriverSpawn({ exitCode: 1, stderr: 'installer cleanup failed' });
+    mockDriverSpawn({ stdout: `cua-driver ${version}\n` });
+    mockDriverSpawn({ stdout: 'Cua Driver daemon is stopped\n' });
+    await expect(updateComputerDriver(undefined, {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    })).rejects.toThrow('installer cleanup failed');
+
+    // Completion must invalidate the ten-minute cache even if the binary changed.
+    mockDriverSpawn({ stdout: `cua-driver ${version}\n` });
+    const refreshedFetch = mockRefsThenReleaseFetch();
+    await expect(checkComputerDriverUpdate(refreshedFetch as unknown as typeof fetch))
+      .resolves.toMatchObject({
+        currentVersion: version,
+        updateAvailable: version === '0.5.8',
+        updating: false,
+      });
+    expect(refreshedFetch).toHaveBeenCalled();
+  });
+
+  it('invalidates the cached offer when the installer cannot start', async () => {
+    mockDriverSpawn({ stdout: 'cua-driver 0.5.8\n' });
+    const fetchImpl = mockRefsThenReleaseFetch();
+    await checkComputerDriverUpdate(fetchImpl as unknown as typeof fetch);
+    mockDriverSpawn({ error: new Error('spawn failed') });
+    await expect(updateComputerDriver(undefined, {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    })).rejects.toThrow('spawn failed');
+
+    mockDriverSpawn({ stdout: 'cua-driver 0.5.8\n' });
+    const refreshedFetch = mockRefsThenReleaseFetch();
+    await expect(checkComputerDriverUpdate(refreshedFetch as unknown as typeof fetch))
+      .resolves.toMatchObject({ currentVersion: '0.5.8', updateAvailable: true, updating: false });
+    expect(refreshedFetch).toHaveBeenCalled();
+  });
+
+  it.each(['cached', 'pending', 'absent'])('returns post-install state to late check callers (new check: %s)', async (freshState) => {
+    mockDriverSpawn({ stdout: 'cua-driver 0.5.8\n' });
+    const fetchImpl = mockRefsThenReleaseFetch();
+    await checkComputerDriverUpdate(fetchImpl as unknown as typeof fetch);
+
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      vi.setSystemTime(Date.now() + 11 * 60_000);
+      mockDriverSpawn({ stdout: 'cua-driver 0.5.8\n' });
+      let finishOldCheck!: (response: unknown) => void;
+      const lateFetch = vi.fn()
+        .mockImplementationOnce(() => new Promise((resolve) => { finishOldCheck = resolve; }))
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ tag_name: 'cua-driver-rs-v0.7.0', assets: [currentPlatformReleaseAsset('0.7.0')] }),
+        })
+        .mockImplementation(mockRefsThenReleaseFetch());
+      const oldCheck = checkComputerDriverUpdate(lateFetch as unknown as typeof fetch);
+      await vi.waitFor(() => expect(lateFetch).toHaveBeenCalledOnce());
+
+      mockDriverSpawn({ stdout: 'installed\n' });
+      mockDriverSpawn({ stdout: 'cua-driver 0.7.0\n' });
+      mockDriverSpawn({ stdout: 'Cua Driver daemon is stopped\n' });
+      await updateComputerDriver(undefined, { fetchImpl: fetchImpl as unknown as typeof fetch });
+
+      mockDriverSpawn({ stdout: 'cua-driver 0.7.0\n' });
+      let finishFreshCheck!: (response: unknown) => void;
+      const freshFetch = vi.fn().mockImplementation(() => new Promise((resolve) => { finishFreshCheck = resolve; }));
+      const freshCheck = freshState === 'absent' ? null : checkComputerDriverUpdate(
+        (freshState === 'cached' ? mockRefsThenReleaseFetch() : freshFetch) as unknown as typeof fetch,
+      );
+      if (freshState === 'cached') await freshCheck;
+      if (freshState === 'pending') await vi.waitFor(() => expect(freshFetch).toHaveBeenCalledOnce());
+      finishOldCheck({ ok: true, json: async () => [{ ref: 'refs/tags/cua-driver-rs-v0.7.0' }] });
+      if (freshState === 'pending') {
+        await vi.waitFor(() => expect(lateFetch).toHaveBeenCalledTimes(2));
+        finishFreshCheck({ ok: true, json: async () => [{ ref: 'refs/tags/cua-driver-rs-v0.7.0' }] });
+      }
+      await expect(oldCheck).resolves.toMatchObject({ currentVersion: '0.7.0', updateAvailable: false });
+      if (freshCheck) await expect(freshCheck).resolves.toMatchObject({ currentVersion: '0.7.0', updateAvailable: false });
+      expect(lateFetch).toHaveBeenCalledTimes(freshState === 'absent' ? 3 : 2);
+      const unusedFetch = vi.fn();
+      await expect(checkComputerDriverUpdate(unusedFetch as unknown as typeof fetch))
+        .resolves.toMatchObject({ currentVersion: '0.7.0', updateAvailable: false });
+      expect(unusedFetch).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reports updating=true while a driver update install is in flight', async () => {
+    mockDriverSpawn({ stdout: 'cua-driver 0.5.8\n' });
+    const fetchImpl = mockRefsThenReleaseFetch();
+    await checkComputerDriverUpdate(fetchImpl as unknown as typeof fetch);
+
+    // 安装脚本挂起 → updateComputerDriver 处于 in-flight
+    mockNeverSettlingSpawn();
+    const updatePromise = updateComputerDriver(undefined, {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    await new Promise((resolve) => { setTimeout(resolve, 0); });
+
+    const hangingFetch = vi.fn().mockReturnValue(new Promise(() => {}));
+    await expect(
+      checkComputerDriverUpdate(hangingFetch as unknown as typeof fetch),
+    ).resolves.toMatchObject({ updateAvailable: true, updating: true });
+    // 更新进行中不应触发后台刷新
+    expect(hangingFetch).not.toHaveBeenCalled();
+
+    // 收尾:让挂起的安装超时路径不影响其它测试 —— 直接重置状态
+    resetComputerDriverUpdateStateForTests();
+    void updatePromise.catch(() => {});
+  });
+});
+
+describe('install activity timeout and stale lock preflight', () => {
+  beforeEach(() => {
+    spawnMock.mockReset();
+  });
+
+  function mockLongRunningInstallSpawn() {
+    const child = new EventEmitter() as EventEmitter & {
+      stdout: EventEmitter;
+      stderr: EventEmitter;
+      kill: ReturnType<typeof vi.fn>;
+      unref: ReturnType<typeof vi.fn>;
+    };
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.kill = vi.fn();
+    child.unref = vi.fn();
+    spawnMock.mockImplementationOnce(() => child);
+    return child;
+  }
+
+  it('fails after idleTimeoutMs of total silence and kills the child', async () => {
+    vi.useFakeTimers();
+    try {
+      const child = mockLongRunningInstallSpawn();
+      const run = runProcessWithActivityTimeout('/bin/bash', ['-c', 'install'], {
+        idleTimeoutMs: 180_000,
+        hardTimeoutMs: 1_800_000,
+        pollIntervalMs: 15_000,
+        sampleTree: async () => null,
+      });
+      const assertion = expect(run).rejects.toThrow(/no install progress for 18\d+s/);
+      await vi.advanceTimersByTimeAsync(181_000);
+      await assertion;
+      expect(child.kill).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('treats stdout/stderr output as progress and resets the idle window', async () => {
+    vi.useFakeTimers();
+    try {
+      const child = mockLongRunningInstallSpawn();
+      const run = runProcessWithActivityTimeout('/bin/bash', ['-c', 'install'], {
+        idleTimeoutMs: 180_000,
+        hardTimeoutMs: 1_800_000,
+        pollIntervalMs: 15_000,
+        sampleTree: async () => null,
+      });
+      // 每 170s 吐一次输出,总计超过 3 个 idle 窗口也不能失败
+      for (let i = 0; i < 3; i += 1) {
+        await vi.advanceTimersByTimeAsync(170_000);
+        child.stderr.emit('data', Buffer.from('==> downloading...\n'));
+      }
+      child.stdout.emit('data', Buffer.from('done\n'));
+      child.emit('close', 0, null);
+      await expect(run).resolves.toMatchObject({ exitCode: 0 });
+      expect(child.kill).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('treats process-tree snapshot changes (silent download) as progress', async () => {
+    vi.useFakeTimers();
+    try {
+      const child = mockLongRunningInstallSpawn();
+      let tick = 0;
+      let frozen = false;
+      const run = runProcessWithActivityTimeout('/bin/bash', ['-c', 'install'], {
+        idleTimeoutMs: 180_000,
+        hardTimeoutMs: 1_800_000,
+        pollIntervalMs: 15_000,
+        // 模拟静默下载:无 stdout/stderr,但 curl 的累计 CPU time 在涨
+        sampleTree: async () => (frozen ? 'tree-frozen' : `tree-${(tick += 1)}`),
+      });
+      const assertion = expect(run).rejects.toThrow(/no install progress/);
+      // 快照持续变化:远超 idle 窗口也不失败
+      await vi.advanceTimersByTimeAsync(600_000);
+      expect(child.kill).not.toHaveBeenCalled();
+      // 快照冻结(连接挂死):3 分钟后失败
+      frozen = true;
+      await vi.advanceTimersByTimeAsync(200_000);
+      await assertion;
+      expect(child.kill).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('enforces the hard cap even with continuous activity', async () => {
+    vi.useFakeTimers();
+    try {
+      const child = mockLongRunningInstallSpawn();
+      let tick = 0;
+      const run = runProcessWithActivityTimeout('/bin/bash', ['-c', 'install'], {
+        idleTimeoutMs: 180_000,
+        hardTimeoutMs: 1_800_000,
+        pollIntervalMs: 15_000,
+        sampleTree: async () => `tree-${(tick += 1)}`,
+      });
+      const assertion = expect(run).rejects.toThrow(/hard cap/);
+      await vi.advanceTimersByTimeAsync(1_801_000);
+      await assertion;
+      expect(child.kill).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('clears the install lock only when the holder pid is dead', async () => {
+    const os = await import('node:os');
+    const fs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const pathMod = await import('node:path');
+    existsSyncMock.mockImplementation((candidate) => fs.existsSync(String(candidate)));
+    const base = fs.mkdtempSync(pathMod.join(os.tmpdir(), 'cua-lock-test-'));
+    const lockDir = pathMod.join(base, '.install.lock.d');
+    const writeLock = (pid: number) => {
+      fs.mkdirSync(lockDir, { recursive: true });
+      fs.writeFileSync(pathMod.join(lockDir, 'info'), `pid=${pid}\nstarted=now\nargv=test\n`);
+    };
+
+    // 无锁 → no-op
+    expect(clearStaleCuaInstallLock(lockDir, () => false)).toBe(false);
+
+    // 持有者活着 → 绝不清
+    writeLock(4242);
+    expect(clearStaleCuaInstallLock(lockDir, () => true)).toBe(false);
+    expect(fs.existsSync(lockDir)).toBe(true);
+
+    // 持有者死了 → 清锁
+    expect(clearStaleCuaInstallLock(lockDir, () => false)).toBe(true);
+    expect(fs.existsSync(lockDir)).toBe(false);
+
+    // info 无 pid 行 → 保守不清
+    fs.mkdirSync(lockDir, { recursive: true });
+    fs.writeFileSync(pathMod.join(lockDir, 'info'), 'started=now\n');
+    expect(clearStaleCuaInstallLock(lockDir, () => false)).toBe(false);
+    expect(fs.existsSync(lockDir)).toBe(true);
+
+    fs.rmSync(base, { recursive: true, force: true });
+  });
+});
+
+describe('driver update download progress helpers', () => {
+  it('extractCurlOutputPath parses -o targets from curl command lines', () => {
+    expect(
+      extractCurlOutputPath(
+        'curl -fsSL -o /tmp/tmp.x1/cua-driver-rs-0.7.0-darwin-universal.tar.gz https://github.com/trycua/cua/releases/download/x.tar.gz',
+      ),
+    ).toBe('/tmp/tmp.x1/cua-driver-rs-0.7.0-darwin-universal.tar.gz');
+    expect(extractCurlOutputPath('curl -fsSL -o "/tmp/with space/a.tar.gz" https://x')).toBe(
+      '/tmp/with space/a.tar.gz',
+    );
+    expect(extractCurlOutputPath('curl -fsSL https://x')).toBeNull();
+  });
+
+  it('matchAssetSizeByFilename matches by basename', () => {
+    const assets = [
+      { name: 'cua-driver-rs-0.7.0-darwin-universal.tar.gz', size: 21147689 },
+      { name: 'checksums.txt', size: 1437 },
+    ];
+    expect(
+      matchAssetSizeByFilename(assets, '/tmp/tmp.abc/cua-driver-rs-0.7.0-darwin-universal.tar.gz'),
+    ).toBe(21147689);
+    expect(matchAssetSizeByFilename(assets, '/tmp/unknown.tar.gz')).toBeNull();
+  });
+
+  it('pickLatestCuaDriverRelease returns version and assets of the semver-max driver release', () => {
+    const release = pickLatestCuaDriverRelease([
+      { tag_name: 'agent-v0.8.4', assets: [{ name: 'other', size: 1 }] },
+      {
+        tag_name: 'cua-driver-rs-v0.6.8',
+        assets: [{ name: 'cua-driver-rs-0.6.8-darwin-universal.tar.gz', size: 100 }],
+      },
+      {
+        tag_name: 'cua-driver-rs-v0.7.0',
+        assets: [
+          { name: 'cua-driver-rs-0.7.0-darwin-universal.tar.gz', size: 21147689 },
+          { name: 'bad-entry', size: 'not-a-number' },
+        ],
+      },
+    ]);
+    expect(release?.version).toBe('0.7.0');
+    expect(release?.assets).toEqual([
+      { name: 'cua-driver-rs-0.7.0-darwin-universal.tar.gz', size: 21147689 },
+    ]);
+    expect(pickLatestCuaDriverRelease([{ tag_name: 'cli-v0.1.12' }])).toBeNull();
+  });
+
+  it('maps the assets used by the official installer on every supported platform', () => {
+    expect(getCuaDriverReleaseAssetName('0.7.0', 'darwin', 'arm64')).toBe(
+      'cua-driver-rs-0.7.0-darwin-universal.tar.gz',
+    );
+    expect(getCuaDriverReleaseAssetName('0.7.0', 'linux', 'x64')).toBe(
+      'cua-driver-rs-0.7.0-linux-x86_64-binary.tar.gz',
+    );
+    expect(getCuaDriverReleaseAssetName('0.7.0', 'linux', 'arm64')).toBe(
+      'cua-driver-rs-0.7.0-linux-arm64-binary.tar.gz',
+    );
+    expect(getCuaDriverReleaseAssetName('0.7.0', 'linux', 'aarch64')).toBe(
+      'cua-driver-rs-0.7.0-linux-arm64-binary.tar.gz',
+    );
+    expect(getCuaDriverReleaseAssetName('0.7.0', 'win32', 'x64')).toBe(
+      'cua-driver-rs-0.7.0-windows-x86_64.zip',
+    );
+    expect(getCuaDriverReleaseAssetName('0.7.0', 'win32', 'x86_64')).toBe(
+      'cua-driver-rs-0.7.0-windows-x86_64.zip',
+    );
+    expect(getCuaDriverReleaseAssetName('0.7.0', 'win32', 'arm64')).toBe(
+      'cua-driver-rs-0.7.0-windows-arm64.zip',
+    );
+    expect(getCuaDriverReleaseAssetName('0.7.0', 'linux', 'riscv64')).toBeNull();
+  });
+
+  it('falls back when Windows os.machine() reports unknown', () => {
+    expect(
+      resolveCuaDriverHostArch('win32', 'unknown', {
+        processArch: 'x64',
+        env: { PROCESSOR_ARCHITECTURE: 'ARM64' },
+      }),
+    ).toBe('arm64');
+    expect(
+      getCuaDriverReleaseAssetName('0.7.0', 'win32', 'unknown', {
+        processArch: 'x64',
+        env: { PROCESSOR_ARCHITECTURE: 'ARM64' },
+      }),
+    ).toBe('cua-driver-rs-0.7.0-windows-arm64.zip');
+    expect(
+      getCuaDriverReleaseAssetName('0.7.0', 'win32', 'unknown', {
+        processArch: 'arm64',
+        env: {},
+      }),
+    ).toBe('cua-driver-rs-0.7.0-windows-arm64.zip');
+  });
+});
+
+describe('review follow-ups: releases pagination and Windows idle timeout', () => {
+  beforeEach(() => {
+    spawnMock.mockReset();
+    resetComputerDriverUpdateStateForTests();
+  });
+
+  it('pages matching-refs only when a page is full, stopping at a short page', async () => {
+    mockDriverSpawn({ stdout: 'cua-driver 0.5.8\n' });
+    const fullPage = Array.from({ length: 100 }, (_, i) => ({
+      ref: `refs/tags/cua-driver-rs-v0.1.${i}`,
+    }));
+    const shortPage = [{ ref: 'refs/tags/cua-driver-rs-v0.7.0' }];
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => fullPage })
+      .mockResolvedValueOnce({ ok: true, json: async () => shortPage })
+      // assets by tag
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          tag_name: 'cua-driver-rs-v0.7.0',
+          assets: [currentPlatformReleaseAsset('0.7.0')],
+        }),
+      });
+
+    await expect(
+      checkComputerDriverUpdate(fetchImpl as unknown as typeof fetch),
+    ).resolves.toMatchObject({ latestVersion: '0.7.0', updateAvailable: true });
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+  });
+
+  it('takes semver max across all driver tags regardless of ref ordering', async () => {
+    // matching-refs 按字母序返回,0.10.0 会排在 0.9.0 前 —— 必须数值比较
+    mockDriverSpawn({ stdout: 'cua-driver 0.9.0\n' });
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => [
+          { ref: 'refs/tags/cua-driver-rs-v0.10.0' },
+          { ref: 'refs/tags/cua-driver-rs-v0.9.0' },
+        ],
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          tag_name: 'cua-driver-rs-v0.10.0',
+          assets: [currentPlatformReleaseAsset('0.10.0')],
+        }),
+      });
+
+    await expect(
+      checkComputerDriverUpdate(fetchImpl as unknown as typeof fetch),
+    ).resolves.toMatchObject({ latestVersion: '0.10.0', updateAvailable: true });
+  });
+
+  it('falls back when the newest tag has no published release', async () => {
+    mockDriverSpawn({ stdout: 'cua-driver 0.10.0\n' });
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => [
+          { ref: 'refs/tags/cua-driver-rs-v0.11.0' },
+          { ref: 'refs/tags/cua-driver-rs-v0.12.0' },
+        ],
+      })
+      .mockResolvedValueOnce({ ok: false, status: 404 })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          tag_name: 'cua-driver-rs-v0.11.0',
+          assets: [currentPlatformReleaseAsset('0.11.0')],
+        }),
+      });
+
+    await expect(
+      checkComputerDriverUpdate(fetchImpl as unknown as typeof fetch),
+    ).resolves.toMatchObject({ latestVersion: '0.11.0', updateAvailable: true });
+    expect(String(fetchImpl.mock.calls[1][0])).toContain('cua-driver-rs-v0.12.0');
+    expect(String(fetchImpl.mock.calls[2][0])).toContain('cua-driver-rs-v0.11.0');
+  });
+
+  it('keeps probing past five incomplete tags to find an older installable update', async () => {
+    mockDriverSpawn({ stdout: 'cua-driver 0.6.0\n' });
+    const fetchImpl = vi.fn().mockResolvedValueOnce({
+      ok: true,
+      json: async () => [
+        { ref: 'refs/tags/cua-driver-rs-v0.12.0' },
+        { ref: 'refs/tags/cua-driver-rs-v0.11.0' },
+        { ref: 'refs/tags/cua-driver-rs-v0.10.0' },
+        { ref: 'refs/tags/cua-driver-rs-v0.9.0' },
+        { ref: 'refs/tags/cua-driver-rs-v0.8.0' },
+        { ref: 'refs/tags/cua-driver-rs-v0.7.0' },
+      ],
+    });
+    for (let index = 0; index < 5; index += 1) {
+      fetchImpl.mockResolvedValueOnce({ ok: false, status: 404 });
+    }
+    fetchImpl.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        tag_name: 'cua-driver-rs-v0.7.0',
+        assets: [currentPlatformReleaseAsset('0.7.0')],
+      }),
+    });
+
+    await expect(
+      checkComputerDriverUpdate(fetchImpl as unknown as typeof fetch),
+    ).resolves.toMatchObject({ latestVersion: '0.7.0', updateAvailable: true });
+    expect(fetchImpl).toHaveBeenCalledTimes(7);
+  });
+
+  it('accepts installable releases that upstream marks as GitHub prereleases', async () => {
+    mockDriverSpawn({ stdout: 'cua-driver 0.10.0\n' });
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => [{ ref: 'refs/tags/cua-driver-rs-v0.11.0' }],
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          tag_name: 'cua-driver-rs-v0.11.0',
+          prerelease: true,
+          assets: [currentPlatformReleaseAsset('0.11.0')],
+        }),
+      });
+
+    await expect(
+      checkComputerDriverUpdate(fetchImpl as unknown as typeof fetch),
+    ).resolves.toMatchObject({ latestVersion: '0.11.0', updateAvailable: true });
+  });
+
+  it('skips releases without the current-platform installer asset', async () => {
+    mockDriverSpawn({ stdout: 'cua-driver 0.10.0\n' });
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => [
+          { ref: 'refs/tags/cua-driver-rs-v0.12.0' },
+          { ref: 'refs/tags/cua-driver-rs-v0.11.0' },
+        ],
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          tag_name: 'cua-driver-rs-v0.12.0',
+          assets: [{ name: 'checksums.txt', size: 100 }],
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          tag_name: 'cua-driver-rs-v0.11.0',
+          assets: [currentPlatformReleaseAsset('0.11.0')],
+        }),
+      });
+
+    await expect(
+      checkComputerDriverUpdate(fetchImpl as unknown as typeof fetch),
+    ).resolves.toMatchObject({ latestVersion: '0.11.0', updateAvailable: true });
+  });
+
+  it('skips starter and zero-byte platform assets until an uploaded archive is available', async () => {
+    mockDriverSpawn({ stdout: 'cua-driver 0.10.0\n' });
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => [
+          { ref: 'refs/tags/cua-driver-rs-v0.13.0' },
+          { ref: 'refs/tags/cua-driver-rs-v0.12.0' },
+          { ref: 'refs/tags/cua-driver-rs-v0.11.0' },
+        ],
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          tag_name: 'cua-driver-rs-v0.13.0',
+          assets: [{ ...currentPlatformReleaseAsset('0.13.0'), state: 'starter' }],
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          tag_name: 'cua-driver-rs-v0.12.0',
+          assets: [currentPlatformReleaseAsset('0.12.0', 0)],
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          tag_name: 'cua-driver-rs-v0.11.0',
+          assets: [currentPlatformReleaseAsset('0.11.0')],
+        }),
+      });
+
+    await expect(
+      checkComputerDriverUpdate(fetchImpl as unknown as typeof fetch),
+    ).resolves.toMatchObject({ latestVersion: '0.11.0', updateAvailable: true });
+  });
+
+  it('hides the updater when no newer tag is installable', async () => {
+    mockDriverSpawn({ stdout: 'cua-driver 0.10.0\n' });
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => [{ ref: 'refs/tags/cua-driver-rs-v0.12.0' }],
+      })
+      .mockResolvedValueOnce({ ok: false, status: 404 });
+
+    await expect(checkComputerDriverUpdate(fetchImpl as unknown as typeof fetch)).resolves.toEqual({
+      currentVersion: '0.10.0',
+      latestVersion: '0.10.0',
+      updateAvailable: false,
+      updating: false,
+      checkStatus: 'success',
+      checkedAt: expect.any(Number),
+    });
+    const installerCallsBefore = spawnMock.mock.calls.length;
+    await expect(updateComputerDriver()).rejects.toThrow(
+      'no verified installable cua-driver update is available',
+    );
+    expect(spawnMock.mock.calls).toHaveLength(installerCallsBefore);
+  });
+
+  it('revalidates on click and falls back when the cached release disappears', async () => {
+    mockDriverSpawn({ stdout: 'cua-driver 0.10.0\n' });
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => [{ ref: 'refs/tags/cua-driver-rs-v0.12.0' }],
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          tag_name: 'cua-driver-rs-v0.12.0',
+          assets: [currentPlatformReleaseAsset('0.12.0')],
+        }),
+      })
+      .mockResolvedValueOnce({ ok: false, status: 404 })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => [
+          { ref: 'refs/tags/cua-driver-rs-v0.12.0' },
+          { ref: 'refs/tags/cua-driver-rs-v0.11.0' },
+        ],
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          tag_name: 'cua-driver-rs-v0.11.0',
+          assets: [currentPlatformReleaseAsset('0.11.0')],
+        }),
+      });
+
+    await checkComputerDriverUpdate(fetchImpl as unknown as typeof fetch);
+    mockDriverSpawn({ stdout: 'cua-driver 0.10.0\n' });
+    mockDriverSpawn({ stdout: 'installed\n' });
+    mockDriverSpawn({ stdout: 'cua-driver 0.11.0\n' });
+    mockDriverSpawn({ stdout: 'Cua Driver daemon is running\n' });
+    if (process.platform === 'darwin') {
+      mockDriverSpawn({
+        stdout:
+          '{"accessibility":true,"screen_recording":true,"screen_recording_capturable":true,"source":{"attribution":"driver-daemon"}}\n',
+      });
+    }
+
+    const installerCallsBefore = spawnMock.mock.calls.length;
+    await updateComputerDriver(undefined, { fetchImpl: fetchImpl as unknown as typeof fetch });
+    const installerCall = spawnMock.mock.calls
+      .slice(installerCallsBefore)
+      .find((call) => String(call[0]).match(/bash|powershell/i));
+    expect(installerCall?.[2]?.env?.CUA_DRIVER_RS_VERSION).toBe('0.11.0');
+  });
+
+  it('throttles panel refreshes after an update preflight performs a fallback check', async () => {
+    mockDriverSpawn({ stdout: 'cua-driver 0.10.0\n' });
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => [{ ref: 'refs/tags/cua-driver-rs-v0.12.0' }],
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          tag_name: 'cua-driver-rs-v0.12.0',
+          assets: [currentPlatformReleaseAsset('0.12.0')],
+        }),
+      })
+      // update click:cached target disappeared,then fallback sees no other candidate
+      .mockResolvedValueOnce({ ok: false, status: 404 })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => [{ ref: 'refs/tags/cua-driver-rs-v0.12.0' }],
+      });
+
+    await checkComputerDriverUpdate(fetchImpl as unknown as typeof fetch);
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      vi.setSystemTime(Date.now() + 11 * 60_000);
+      mockDriverSpawn({ stdout: 'cua-driver 0.10.0\n' });
+      await expect(
+        updateComputerDriver(undefined, { fetchImpl: fetchImpl as unknown as typeof fetch }),
+      ).rejects.toThrow('no verified installable cua-driver update is available');
+
+      // 预检失败后主缓存已是 no-update;同会话再次读取应直接清掉残留入口。
+      await expect(
+        checkComputerDriverUpdate(fetchImpl as unknown as typeof fetch),
+      ).resolves.toMatchObject({ updateAvailable: false, updating: false });
+
+      const reopenedFetch = vi.fn().mockReturnValue(new Promise(() => {}));
+      await expect(
+        checkComputerDriverUpdate(reopenedFetch as unknown as typeof fetch),
+      ).resolves.toMatchObject({ updateAvailable: false, updating: false });
+      expect(reopenedFetch).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('fails closed when a release probe fails with a server error', async () => {
+    mockDriverSpawn({ stdout: 'cua-driver 0.10.0\n' });
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => [{ ref: 'refs/tags/cua-driver-rs-v0.12.0' }],
+      })
+      .mockResolvedValueOnce({ ok: false, status: 503 });
+
+    await expect(checkComputerDriverUpdate(fetchImpl as unknown as typeof fetch)).resolves.toEqual({
+      currentVersion: '0.10.0',
+      latestVersion: null,
+      updateAvailable: false,
+      updating: false,
+      checkStatus: 'error',
+      checkedAt: expect.any(Number),
+    });
+  });
+
+  it('continues to an older candidate after a transient release probe error', async () => {
+    mockDriverSpawn({ stdout: 'cua-driver 0.10.0\n' });
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => [
+          { ref: 'refs/tags/cua-driver-rs-v0.12.0' },
+          { ref: 'refs/tags/cua-driver-rs-v0.11.0' },
+        ],
+      })
+      .mockResolvedValueOnce({ ok: false, status: 503 })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          tag_name: 'cua-driver-rs-v0.11.0',
+          assets: [currentPlatformReleaseAsset('0.11.0')],
+        }),
+      });
+
+    await expect(
+      checkComputerDriverUpdate(fetchImpl as unknown as typeof fetch),
+    ).resolves.toMatchObject({ latestVersion: '0.11.0', updateAvailable: true });
+  });
+
+  it('sends Authorization only when GITHUB_TOKEN/GH_TOKEN is present', async () => {
+    const savedGithub = process.env.GITHUB_TOKEN;
+    const savedGh = process.env.GH_TOKEN;
+    try {
+      delete process.env.GITHUB_TOKEN;
+      delete process.env.GH_TOKEN;
+      mockDriverSpawn({ stdout: 'cua-driver 0.5.8\n' });
+      const noAuthFetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => [{ ref: 'refs/tags/cua-driver-rs-v0.5.8' }],
+      });
+      await checkComputerDriverUpdate(noAuthFetch as unknown as typeof fetch);
+      expect(noAuthFetch.mock.calls[0][1].headers.Authorization).toBeUndefined();
+
+      resetComputerDriverUpdateStateForTests();
+      process.env.GITHUB_TOKEN = 'test-token';
+      mockDriverSpawn({ stdout: 'cua-driver 0.5.8\n' });
+      const authFetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => [{ ref: 'refs/tags/cua-driver-rs-v0.5.8' }],
+      });
+      await checkComputerDriverUpdate(authFetch as unknown as typeof fetch);
+      expect(authFetch.mock.calls[0][1].headers.Authorization).toBe('Bearer test-token');
+    } finally {
+      if (savedGithub === undefined) delete process.env.GITHUB_TOKEN;
+      else process.env.GITHUB_TOKEN = savedGithub;
+      if (savedGh === undefined) delete process.env.GH_TOKEN;
+      else process.env.GH_TOKEN = savedGh;
+    }
+  });
+
+  it('join-only update never starts a fresh install when none is in flight', async () => {
+    // resume 竞态防护:checkUpdate 报 updating 后原安装恰好完成,joinOnly
+    // 调用只读状态返回,不 spawn 安装脚本。
+    mockDriverSpawn({ stdout: 'cua-driver 0.7.0\n' });
+    mockDriverSpawn({ stdout: 'Cua Driver daemon is running\n' });
+    if (process.platform === 'darwin') {
+      mockDriverSpawn({
+        stdout:
+          '{"accessibility":true,"screen_recording":true,"screen_recording_capturable":true,"source":{"attribution":"driver-daemon"}}\n',
+      });
+    }
+
+    const result = await updateComputerDriver(undefined, { joinOnly: true });
+    expect(result.ok).toBe(true);
+    expect(result.status.installed).toBe(true);
+    // 没有任何 bash/powershell 安装脚本被启动
+    const installerRuns = spawnMock.mock.calls.filter((call) =>
+      String(call[0]).match(/bash|powershell/i),
+    ).length;
+    expect(installerRuns).toBe(0);
+  });
+
+  it('includes download-file byte growth in the POSIX activity snapshot', async () => {
+    if (process.platform === 'win32') return;
+    const os = await import('node:os');
+    const fs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const pathMod = await import('node:path');
+    existsSyncMock.mockImplementation((candidate) => fs.existsSync(String(candidate)));
+    const dir = fs.mkdtempSync(pathMod.join(os.tmpdir(), 'cua-dl-test-'));
+    const file = pathMod.join(dir, 'cua-driver-rs-0.7.0-darwin-universal.tar.gz');
+    fs.writeFileSync(file, Buffer.alloc(1024));
+
+    // ps 输出:同 pgid 的 curl 行,CPU TIME 固定不变(慢速下载阻塞在网络 IO)
+    const psLine = `4242  4300 0:00.01 curl -fsSL -o ${file} https://github.com/x.tar.gz\n`;
+    mockDriverSpawn({ stdout: psLine });
+    const first = await sampleInstallProcessTree(4242);
+
+    fs.writeFileSync(file, Buffer.alloc(4096)); // 文件增长,进程快照不变
+    mockDriverSpawn({ stdout: psLine });
+    const second = await sampleInstallProcessTree(4242);
+
+    expect(first).toContain('bytes:1024');
+    expect(second).toContain('bytes:4096');
+    expect(second).not.toBe(first); // 字节增长即活动
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('relaxes the install idle timeout to the hard cap on Windows only', () => {
+    expect(installIdleTimeoutForPlatform('win32')).toBe(1_800_000);
+    expect(installIdleTimeoutForPlatform('darwin')).toBe(180_000);
+    expect(installIdleTimeoutForPlatform('linux')).toBe(180_000);
+  });
+});

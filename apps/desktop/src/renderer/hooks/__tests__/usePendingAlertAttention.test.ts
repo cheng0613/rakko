@@ -1,0 +1,370 @@
+// @vitest-environment jsdom
+/**
+ * 红点派生语义的行为规格(2026-07 统一):红点是「未处理告警」集合的投影 ——
+ * 横幅不被处置就不消失。这些用例正是用户反馈的割裂点的回归护栏。
+ */
+import { renderHook } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import {
+  _resetPendingAlertAttentionForTests,
+  noteSessionTurnStartedForAlerts,
+  refreshPendingAlerts,
+  usePendingAlertAttention,
+} from '@/hooks/usePendingAlertAttention';
+import {
+  addSessionAttention,
+  clearSessionAttention,
+  getSessionAttentionKind,
+} from '@/lib/sessionAttentionStore';
+
+vi.mock('@/lib/sessionAttentionStore', () => ({
+  addSessionAttention: vi.fn(),
+  clearSessionAttention: vi.fn(() => true),
+  getSessionAttentionKind: vi.fn(() => 'error'),
+}));
+
+const addMock = vi.mocked(addSessionAttention);
+const clearMock = vi.mocked(clearSessionAttention);
+const kindMock = vi.mocked(getSessionAttentionKind);
+const errorTailPendingMock = vi.fn<() => Promise<string[]>>();
+const interruptedPendingMock = vi.fn<() => Promise<string[]>>();
+const createdListeners: Array<
+  (payload: { sessionId: string; message: { role?: string; agentMeta?: unknown } }, ownerStamp?: unknown) => void
+> = [];
+const patchedListeners: Array<(payload: { sessionId: string; patch: Record<string, unknown> }) => void> = [];
+
+/** 驱动一次错误尾行重算并等它收敛完成。 */
+async function reconcile(ids: string[]): Promise<void> {
+  errorTailPendingMock.mockResolvedValue(ids);
+  await refreshPendingAlerts();
+}
+
+describe('usePendingAlertAttention (派生收敛)', () => {
+  beforeEach(() => {
+    _resetPendingAlertAttentionForTests();
+    createdListeners.length = 0;
+    patchedListeners.length = 0;
+    (window as unknown as { electronAPI: unknown }).electronAPI = {
+      localDb: {
+        sessions: {
+          errorTailPending: errorTailPendingMock,
+          interruptedPending: interruptedPendingMock,
+        },
+        sessionsPush: {
+          onPatched: (cb: typeof patchedListeners[number]) => {
+            patchedListeners.push(cb);
+            return () => {};
+          },
+        },
+        messages: {
+          onErrorPersisted: () => () => {},
+          onCreated: (
+            cb: (payload: { sessionId: string; message: { role?: string; agentMeta?: unknown } }, ownerStamp?: unknown) => void,
+          ) => {
+            createdListeners.push(cb);
+            return () => {};
+          },
+        },
+      },
+    };
+    kindMock.mockReturnValue('error');
+    errorTailPendingMock.mockResolvedValue([]);
+    interruptedPendingMock.mockResolvedValue([]);
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('告警仍在时每轮都重新打点,且绝不清点', async () => {
+    await reconcile(['s1', 's2']);
+    expect(addMock).toHaveBeenCalledWith('s1', 'error');
+    expect(addMock).toHaveBeenCalledWith('s2', 'error');
+
+    addMock.mockClear();
+    // 告警仍在(横幅没被处置)→ 继续无条件打点(store 幂等),且绝不清点。
+    await reconcile(['s1', 's2']);
+    expect(addMock).toHaveBeenCalledWith('s1', 'error');
+    expect(addMock).toHaveBeenCalledWith('s2', 'error');
+    expect(clearMock).not.toHaveBeenCalled();
+  });
+
+  // 回归(PR #879 review P1):此前「已 owned 就跳过 add」,于是别的 explicit 路径
+  // (Retry / 关闭 live ErrorBanner / turn 启动的 orphan 清理 / worktree 横幅处置)
+  // 清掉共享的 attention 条目后,未 dismissed 的横幅仍在而红点再也不会回来。
+  it('外部 explicit 清点后,告警仍在则下一轮重算把红点恢复', async () => {
+    await reconcile(['s1']);
+    addMock.mockClear();
+
+    // 模拟外部路径把该会话的 attention 清掉(store 里已无条目)。
+    kindMock.mockReturnValue(undefined);
+
+    // 告警仍未 dismissed,查询继续返回它 → 必须重新打点。
+    await reconcile(['s1']);
+    expect(addMock).toHaveBeenCalledWith('s1', 'error');
+  });
+
+  it('告警消失(横幅被处置)才清点,且用 explicit 意图', async () => {
+    await reconcile(['s1', 's2']);
+    clearMock.mockClear();
+
+    // s1 被处置(dismiss 落库 → 不再命中查询),s2 仍未处理。
+    await reconcile(['s2']);
+    expect(clearMock).toHaveBeenCalledTimes(1);
+    expect(clearMock).toHaveBeenCalledWith('s1', { intent: 'explicit' });
+  });
+
+  it('不清已升级成其它语义的点(不误伤 awaiting / done)', async () => {
+    await reconcile(['s1']);
+    clearMock.mockClear();
+
+    // 本 hook 打点后该会话变成「等待用户回复」——那是别的来源的语义,
+    // 告警收敛不能顺手把它清掉。
+    kindMock.mockReturnValue('awaiting');
+    await reconcile([]);
+    expect(clearMock).not.toHaveBeenCalled();
+  });
+
+  it('只清自己打过的点:从未打点的会话消失时不发清除', async () => {
+    // live error 打的点不在本 hook 账本里(它没出现在任何一次查询结果中)。
+    await reconcile([]);
+    expect(clearMock).not.toHaveBeenCalled();
+  });
+
+  it('重算失败不炸、不误清点(IPC reject 时保留现状)', async () => {
+    await reconcile(['s1']);
+    clearMock.mockClear();
+
+    errorTailPendingMock.mockRejectedValue(new Error('db not ready'));
+    await refreshPendingAlerts();
+    // 查不到结果时绝不能当成「告警都消失了」把红点清光。
+    expect(clearMock).not.toHaveBeenCalled();
+  });
+
+  it('并发重算合流,不打爆 IPC', async () => {
+    await reconcile([]);
+    errorTailPendingMock.mockClear();
+    let resolveFirst: ((v: string[]) => void) | undefined;
+    errorTailPendingMock.mockReturnValueOnce(
+      new Promise<string[]>((res) => {
+        resolveFirst = res;
+      }),
+    );
+    errorTailPendingMock.mockResolvedValue([]);
+
+    const settled = refreshPendingAlerts();
+    void refreshPendingAlerts();
+    void refreshPendingAlerts();
+    // 第一次在飞时,后续请求只置脏 → 此刻只发出过 1 次。
+    expect(errorTailPendingMock).toHaveBeenCalledTimes(1);
+
+    resolveFirst?.([]);
+    await settled;
+    // 合流后补跑一次即可,不是 3 次。
+    expect(errorTailPendingMock).toHaveBeenCalledTimes(2);
+  });
+
+  // 回归(PR #879 review P1):首拉(带退避重试、不经合流)与重算可能并发。
+  // 代数守卫只丢弃**错误尾行**那半 —— 中断腿是 startup-only 的一次性结果,没有更新
+  // 的版本会取代它,跟着一起丢会让这个窗口内的中断会话永远拿不到红点。
+  it('首拉与重算并发:过期的错误尾行结果丢弃,中断腿结果保留', async () => {
+    let resolveInitial: (() => void) | undefined;
+    // 首拉的两条腿:中断腿立刻有值,错误尾行腿挂住(制造「首拉后返回」)。
+    interruptedPendingMock.mockResolvedValue(['s-interrupted']);
+    errorTailPendingMock.mockReturnValueOnce(
+      new Promise<string[]>((res) => {
+        resolveInitial = () => res(['s-stale-tail']);
+      }),
+    );
+
+    renderHook(() => usePendingAlertAttention());
+
+    // 期间一次重算完成 → 代数推进,首拉那一代的错误尾行已过期。
+    errorTailPendingMock.mockResolvedValue([]);
+    await refreshPendingAlerts();
+    addMock.mockClear();
+
+    resolveInitial?.();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // 过期的错误尾行结果被丢弃。
+    expect(addMock).not.toHaveBeenCalledWith('s-stale-tail', 'error');
+    // 中断腿结果照常应用(它没有「更新的版本」)。
+    expect(addMock).toHaveBeenCalledWith('s-interrupted', 'error');
+  });
+
+  // 回归(PR #879 review P1):作废旧结果的条件是「更新的查询**成功应用**了结果」,
+  // 不是「更新的查询已启动」。否则更新的那次失败 + 旧结果被丢弃会两边落空 ——
+  // 首拉自身已 resolve 不会重试,错误尾行会话就一直没有红点。
+  it('更新的查询失败时不作废先前成功的结果', async () => {
+    let resolveInitial: (() => void) | undefined;
+    interruptedPendingMock.mockResolvedValue([]);
+    errorTailPendingMock.mockReturnValueOnce(
+      new Promise<string[]>((res) => {
+        resolveInitial = () => res(['s-boot-tail']);
+      }),
+    );
+
+    renderHook(() => usePendingAlertAttention());
+
+    // 期间一次重算**失败**:代数推进了,但没有任何结果被应用。
+    errorTailPendingMock.mockRejectedValueOnce(new Error('transient'));
+    await refreshPendingAlerts();
+    addMock.mockClear();
+
+    // 首拉后返回:不能因为「有更晚的查询启动过」就丢掉这份唯一成功的结果。
+    resolveInitial?.();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(addMock).toHaveBeenCalledWith('s-boot-tail', 'error');
+  });
+
+  it('认领了错误尾行时,该会话的 user 行触发重算;告警已消失则 explicit 清点', async () => {
+    await reconcile(['s1']);
+    interruptedPendingMock.mockResolvedValue([]);
+    renderHook(() => usePendingAlertAttention());
+    expect(createdListeners.length).toBeGreaterThan(0);
+
+    addMock.mockClear();
+    clearMock.mockClear();
+    errorTailPendingMock.mockClear();
+    errorTailPendingMock.mockResolvedValue([]);
+
+    createdListeners[0]!({ sessionId: 's1', message: { role: 'user' } });
+    await refreshPendingAlerts();
+    expect(clearMock).toHaveBeenCalledWith('s1', { intent: 'explicit' });
+  });
+
+  it('未认领错误尾行时,user 行不打 IPC', async () => {
+    interruptedPendingMock.mockResolvedValue([]);
+    errorTailPendingMock.mockResolvedValue([]);
+    renderHook(() => usePendingAlertAttention());
+    expect(createdListeners.length).toBeGreaterThan(0);
+
+    await refreshPendingAlerts();
+    errorTailPendingMock.mockClear();
+    createdListeners[0]!({ sessionId: 's1', message: { role: 'user' } });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(errorTailPendingMock).not.toHaveBeenCalled();
+  });
+
+  it('assistant 行不触发错误尾行重算', async () => {
+    await reconcile(['s1']);
+    interruptedPendingMock.mockResolvedValue([]);
+    renderHook(() => usePendingAlertAttention());
+    errorTailPendingMock.mockClear();
+
+    createdListeners[0]!({ sessionId: 's1', message: { role: 'assistant' } });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(errorTailPendingMock).not.toHaveBeenCalled();
+  });
+
+  it('Make 失败和重试的元数据更新会重算红点，同时保留未处理的中断', async () => {
+    interruptedPendingMock.mockResolvedValue(['interrupted']);
+    renderHook(() => usePendingAlertAttention());
+    await vi.waitFor(() => expect(addMock).toHaveBeenCalledWith('interrupted', 'error'));
+    errorTailPendingMock.mockClear();
+    errorTailPendingMock.mockResolvedValue(['make']);
+
+    const push = (status: string) => createdListeners[0]!({
+      sessionId: 'make',
+      message: {
+        role: 'assistant',
+        agentMeta: { cindyMakeCompletion: {
+          reportedAt: 100, lastAction: 'build', personal: { status },
+        } },
+      },
+    });
+    push('failed');
+    await vi.waitFor(() => expect(addMock).toHaveBeenCalledWith('make', 'error'));
+    expect(errorTailPendingMock).toHaveBeenCalled();
+
+    clearMock.mockClear();
+    addMock.mockClear();
+    errorTailPendingMock.mockResolvedValue([]);
+    push('waiting');
+    await vi.waitFor(() => expect(clearMock).toHaveBeenCalledWith('make', { intent: 'explicit' }));
+    expect(addMock).toHaveBeenCalledWith('interrupted', 'error');
+    expect(clearMock).not.toHaveBeenCalledWith('interrupted', expect.anything());
+  });
+
+  it('普通 Make 进度更新不反复查询告警', async () => {
+    renderHook(() => usePendingAlertAttention());
+    await refreshPendingAlerts();
+    errorTailPendingMock.mockClear();
+    for (let i = 0; i < 10; i++) {
+      createdListeners[0]!({ sessionId: 'make', message: {
+        role: 'assistant', agentMeta: { cindyMakeCompletion: {
+          reportedAt: 100, lastAction: 'build', personal: { status: 'checking' },
+        } },
+      } });
+    }
+    await Promise.resolve();
+    expect(errorTailPendingMock).not.toHaveBeenCalled();
+  });
+
+  it('新一轮启动时重算仍认领的错误尾行,告警消失则 explicit 清点', async () => {
+    await reconcile(['s1']);
+    clearMock.mockClear();
+    errorTailPendingMock.mockClear();
+    errorTailPendingMock.mockResolvedValue([]);
+
+    noteSessionTurnStartedForAlerts('s1');
+    await refreshPendingAlerts();
+    expect(clearMock).toHaveBeenCalledWith('s1', { intent: 'explicit' });
+  });
+
+  it('新一轮启动时未认领该会话则不打 IPC', async () => {
+    await reconcile(['s1']);
+    errorTailPendingMock.mockClear();
+    noteSessionTurnStartedForAlerts('other');
+    await Promise.resolve();
+    expect(errorTailPendingMock).not.toHaveBeenCalled();
+  });
+
+  // 回归：批量续跑没有打开任务视图，启动时同时认领中断和错误尾行的红点可能残留。
+  // 生产入口 usePendingAlertAttention；现有用例没有覆盖 dispatch ack 后的双账本收敛。
+  // 最小输入为一次 lastTurnEndedAt patch；unit，成功清点，新错误和未恢复任务仍保留。
+  it.each([false, true])('批量续跑确认后复核旧错误尾行，新错误保留=%s', async (newError) => {
+    interruptedPendingMock.mockResolvedValue(['resumed', 'waiting']);
+    errorTailPendingMock.mockResolvedValue(['resumed']);
+    renderHook(() => usePendingAlertAttention());
+    await vi.waitFor(() => expect(addMock).toHaveBeenCalledWith('waiting', 'error'));
+    clearMock.mockClear();
+    errorTailPendingMock.mockClear();
+    errorTailPendingMock.mockResolvedValue(newError ? ['resumed'] : []);
+
+    patchedListeners[0]!({ sessionId: 'resumed', patch: { lastTurnEndedAt: Date.now() } });
+    await vi.waitFor(() => expect(errorTailPendingMock).toHaveBeenCalled());
+    await refreshPendingAlerts();
+
+    if (newError) expect(clearMock).not.toHaveBeenCalledWith('resumed', expect.anything());
+    else expect(clearMock).toHaveBeenCalledWith('resumed', { intent: 'explicit' });
+    expect(clearMock).not.toHaveBeenCalledWith('waiting', expect.anything());
+  });
+
+  // 同一回归的启动时序：旧首拉结果迟于续跑回执返回，不得把已经恢复的任务重新打红点。
+  it('首拉尚未返回时收到续跑确认，也会复核并丢弃过期错误尾行', async () => {
+    let finishInitial!: (ids: string[]) => void;
+    interruptedPendingMock.mockResolvedValue(['resumed', 'waiting']);
+    errorTailPendingMock.mockReturnValueOnce(new Promise<string[]>((resolve) => {
+      finishInitial = resolve;
+    }));
+    renderHook(() => usePendingAlertAttention());
+    errorTailPendingMock.mockResolvedValue([]);
+
+    patchedListeners[0]!({ sessionId: 'resumed', patch: { lastTurnEndedAt: Date.now() } });
+    await vi.waitFor(() => expect(errorTailPendingMock).toHaveBeenCalledTimes(2));
+    await refreshPendingAlerts();
+    finishInitial(['resumed']);
+    await vi.waitFor(() => expect(addMock).toHaveBeenCalledWith('waiting', 'error'));
+    expect(addMock).not.toHaveBeenCalledWith('resumed', 'error');
+  });
+});

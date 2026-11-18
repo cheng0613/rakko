@@ -1,0 +1,2454 @@
+// @vitest-environment jsdom
+
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import type { SlackHookView } from '../../../../shared/hookControlIpc';
+
+const ipc = vi.hoisted(() => ({
+  get: vi.fn(),
+  onStatusChanged: vi.fn<(listener: (view: SlackHookView) => void) => () => void>(() => () => {}),
+  setEnabled: vi.fn(),
+  setLifecycleAnnouncement: vi.fn(),
+  setSlackCommunications: vi.fn(),
+  providerBindStart: vi.fn(),
+  providerBindCancel: vi.fn(),
+  providerBindRevoke: vi.fn(),
+  providerBindSelect: vi.fn(),
+  addBinding: vi.fn(),
+  rebindTeam: vi.fn(),
+  cancelPendingBind: vi.fn(),
+  revokeTeam: vi.fn(),
+  openProviderAction: vi.fn(),
+  openExternal: vi.fn(),
+  setProviderDefaultWorkspace: vi.fn(),
+  addProject: vi.fn(),
+  showOpenDirectoryDialog: vi.fn(),
+  setXCompanion: vi.fn(),
+  imDefaultSettingsGet: vi.fn(),
+  imDefaultSettingsReset: vi.fn(),
+}));
+const dialog = vi.hoisted(() => ({ confirm: vi.fn() }));
+const workspacePrefsEditor = vi.hoisted(() => ({ render: vi.fn() }));
+const toast = vi.hoisted(() => ({ error: vi.fn(), success: vi.fn() }));
+const authUser = vi.hoisted(() => ({
+  current: null as { membershipKind: 'personal' | 'org'; orgSlug?: string | null; orgName?: string | null } | null,
+}));
+vi.mock('@/contexts/AuthContext', () => ({ useOptionalAuthUser: () => authUser.current }));
+
+/** Keep translation keys observable; unwrap the transport label so its actual status is testable. */
+const tCalls: Array<{ key: string; vars?: Record<string, unknown> }> = [];
+vi.mock('react-i18next', () => ({
+  useTranslation: () => ({
+    t: (key: string, vars?: Record<string, unknown>) => {
+      tCalls.push({ key, vars });
+      return key === 'settings.remoteControl.hook.transportStatus' ? String(vars?.status) : key;
+    },
+  }),
+}));
+
+vi.mock('@/components/ui/confirm-dialog-provider', () => ({
+  useConfirmDialog: () => ({ confirm: dialog.confirm }),
+}));
+
+vi.mock('@/lib/toast', () => ({
+  toast,
+}));
+
+vi.mock('@/components/ui/switch', () => ({
+  Switch: ({
+    checked,
+    disabled,
+    onCheckedChange,
+    'aria-label': ariaLabel,
+    'data-setting-id': settingId,
+  }: {
+    checked: boolean;
+    disabled?: boolean;
+    onCheckedChange: (checked: boolean) => void;
+    'aria-label'?: string;
+    'data-setting-id'?: string;
+  }) => (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      aria-label={ariaLabel}
+      data-setting-id={settingId}
+      disabled={disabled}
+      onClick={() => onCheckedChange(!checked)}
+    />
+  ),
+}));
+
+const prefsReload = vi.fn(async () => {});
+vi.mock('../HookWorkspacePrefsEditor', () => ({
+  useHookWorkspacePrefs: () => ({
+    reloadImDefaults: prefsReload,
+    prefsFor: vi.fn(),
+    providerSourceFor: vi.fn(() => null),
+    applyProviderSource: vi.fn(),
+    editable: false,
+    pendingWs: null,
+    hint: null,
+    retry: null,
+    imDefaults: null,
+    applyPatch: vi.fn(),
+  }),
+  WorkspacePrefsEditor: (props: { alias: string; maxVisibleModelRows?: number }) => {
+    workspacePrefsEditor.render(props);
+    return null;
+  },
+}));
+
+vi.mock('../ImDefaultSettingsSection', () => ({
+  ImDefaultSettingsSection: ({ channel }: { channel?: string }) => (
+    <div data-testid={`im-defaults-${channel ?? 'global'}`} />
+  ),
+}));
+
+vi.mock('../TelegramBehaviorSettings', () => ({
+  TelegramBehaviorSettings: ({ bindingId }: { bindingId?: string }) => (
+    <div data-testid="telegram-behavior" data-binding-id={bindingId} />
+  ),
+  TelegramGroupActivationSettings: ({ bindingId }: { bindingId?: string }) => (
+    <div data-testid="telegram-groups" data-binding-id={bindingId} />
+  ),
+}));
+
+import { HookConnectionsSection } from '../HookConnectionsSection';
+import { SettingsSearchNavigationContext } from '../SettingsSearchNavigation';
+import { resolveSettingsSearchEntry } from '../settingsSearchCatalog';
+import { resetXUsageNoticeMemoryState } from '@/state/xUsageNotice';
+
+/** 渠道卡收起时内容卸载(Collapse), 交互前先点开对应卡的头部行。 */
+async function expandChannelCard(titleKey: RegExp) {
+  fireEvent.click(await screen.findByRole('button', { name: titleKey }));
+}
+const SLACK_CARD = /settings\.tina\.prefs\.providerSlack/;
+const TELEGRAM_CARD = /settings\.tina\.prefs\.providerTelegram/;
+const X_CARD = /settings\.tina\.prefs\.providerX/;
+const FEISHU_CARD = /settings\.tina\.prefs\.providerFeishu/;
+
+const BASE_HOOK: SlackHookView = {
+  enabled: false,
+  lifecycleAnnouncement: false,
+  url: 'wss://im.example.test',
+  workspaces: {},
+  status: 'disabled',
+  lastError: null,
+  binding: null,
+  bindings: [],
+  pendingBind: null,
+  serverMultiTeam: false,
+  telegram: {
+    enabled: true,
+    url: 'wss://telegram-hook.example.test',
+    status: 'connected',
+    lastError: null,
+    available: true,
+    capabilityPending: false,
+    defaultWorkspace: null,
+    binding: null,
+  },
+  x: {
+    enabled: false,
+    url: '',
+    status: 'disabled',
+    lastError: null,
+    available: false,
+    capabilityPending: false,
+    defaultWorkspace: null,
+    binding: null,
+  },
+  feishu: {
+    enabled: false,
+    url: '',
+    status: 'disabled',
+    lastError: null,
+    available: false,
+    capabilityPending: false,
+    defaultWorkspace: null,
+    binding: null,
+  },
+};
+
+// 原名 'HookConnectionsSection Telegram binding actions' —— 本 suite 现在同时覆盖
+// Telegram 绑定动作与 X 的用法告知/确认门, 名字得跟上, 否则失败用例的定位会误导人。
+describe('HookConnectionsSection binding actions (Telegram / X / Feishu)', () => {
+  // Unit regression: a live server socket is not a linked IM account. Exercise the
+  // real card through status pushes; existing action tests never revoked a live
+  // binding while leaving its transport connected.
+  it.each(['telegram', 'x', 'feishu'] as const)('shows the %s account lifecycle without a false connected badge', async (provider) => {
+    let pushStatus!: (view: SlackHookView) => void;
+    ipc.onStatusChanged.mockImplementation((listener) => { pushStatus = listener; return () => {}; });
+    const binding = { provider, state: 'confirmed' as const, attemptId: null, bindingId: 'binding-1',
+      principalId: 'user-1', principalName: 'Alice', scopeId: 'scope-1', scopeName: 'Cindy',
+      connectUrl: null, bindCode: null, expiresAt: null, reason: null, remediationUrl: null,
+      actions: ['revoke'] };
+    const view = { ...BASE_HOOK[provider], enabled: true, available: true, status: 'connected' as const,
+      url: 'wss://im.example.test', binding };
+    ipc.get.mockResolvedValue({ hook: { ...BASE_HOOK, [provider]: view } });
+    render(<HookConnectionsSection />);
+    await screen.findByRole('switch', { name: `settings.remoteControl.hook.${provider}.toggleAria` });
+    const card = within(document.getElementById(`cindy-im-${provider}`)!);
+    expect(card.getByRole('status').textContent).toBe('settings.remoteControl.hook.status.connected');
+    await act(async () => pushStatus({ ...BASE_HOOK, [provider]: { ...view,
+      binding: { ...binding, state: 'revoked', actions: ['retry'] } } }));
+    expect(card.getByRole('status').textContent).toBe(`settings.remoteControl.hook.${provider}.status.none`);
+    ipc.providerBindStart.mockResolvedValue({ hook: { ...BASE_HOOK, [provider]: { ...view,
+      binding: { ...binding, state: 'revoked', actions: ['retry'] } } } });
+    expect(card.queryByText(`settings.remoteControl.hook.${provider}.status.revoked`)).toBeNull();
+    fireEvent.click(card.getByRole('button', { name: new RegExp(`settings\\.tina\\.prefs\\.provider${provider === 'x' ? 'X' : provider === 'feishu' ? 'Feishu' : 'Telegram'}`) }));
+    fireEvent.click(await card.findByRole('button', { name: `settings.remoteControl.hook.${provider}.retry` }));
+    await waitFor(() => expect(ipc.providerBindStart).toHaveBeenCalledWith(provider));
+    await act(async () => pushStatus({ ...BASE_HOOK, [provider]: { ...view,
+      binding: { ...binding, state: 'pending', bindingId: null, attemptId: 'new-attempt', actions: ['cancel'] } } }));
+    expect(card.getByRole('status').textContent).toBe('settings.remoteControl.hook.authorizing');
+    await act(async () => pushStatus({ ...BASE_HOOK, [provider]: view }));
+    expect(card.getByRole('status').textContent).toBe('settings.remoteControl.hook.status.connected');
+    expect(ipc.setEnabled).not.toHaveBeenCalled();
+    await act(async () => pushStatus({ ...BASE_HOOK, [provider]: { ...view,
+      enabled: false, available: false, status: 'disabled',
+      binding: { ...binding, state: 'revoked', actions: ['retry'] } } }));
+    expect(card.getByRole('switch').getAttribute('aria-checked')).toBe('false');
+    expect(card.getByRole('status').textContent).toBe(`settings.remoteControl.hook.${provider}.status.disabled`);
+    expect(card.queryByText(`settings.remoteControl.hook.${provider}.status.revoked`)).toBeNull();
+  });
+
+  it.each([false, true])('does not claim a connected Slack account without a retained binding (communications: %s)', async (retained) => {
+    ipc.get.mockResolvedValue({ hook: { ...BASE_HOOK, enabled: true, status: 'connected', serverMultiTeam: true,
+      serverSlackCommunications: true, bindings: retained ? [{ teamId: 'T1', teamName: 'Workspace',
+        slackUserId: 'U1', slackUserName: 'Alice', displaced: true, communicationsEnabled: true }] : [] } });
+    render(<HookConnectionsSection />);
+    await screen.findByRole('switch', { name: 'settings.remoteControl.hook.toggleAria' });
+    expect(within(document.getElementById('cindy-im-slack')!).getByRole('status').textContent).toBe(
+      retained ? 'settings.remoteControl.hook.status.connected' : 'settings.remoteControl.hook.statusUnbound',
+    );
+  });
+
+  // Unit regression (#8481): resolve each rendered provider switch through the
+  // production catalog to its own card, rather than accepting the parent group.
+  it.each(['telegram', 'x', 'feishu'])('binds the %s switch to its provider search target', async (provider) => {
+    ipc.get.mockResolvedValue({ hook: { ...BASE_HOOK,
+      x: { ...BASE_HOOK.x, url: 'wss://x.example.test' },
+      feishu: { ...BASE_HOOK.feishu, url: 'wss://feishu.example.test' },
+    } });
+    render(<HookConnectionsSection />);
+    const toggle = await screen.findByRole('switch', { name: `settings.remoteControl.hook.${provider}.toggleAria` });
+    const entry = resolveSettingsSearchEntry('im-bot', toggle.getAttribute('data-setting-id'));
+    expect(entry?.id).toBe(`imBot.cindy.${provider}`);
+    expect(document.getElementById(entry!.targetId)?.contains(toggle)).toBe(true);
+  });
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // X 用法确认门按 principalId 记账在 localStorage 里, 而 jsdom 的 localStorage
+    // 跨用例保留 —— 不清就会被前一条用例的记账吃掉, 后面的用例白绿。
+    localStorage.clear();
+    prefsReload.mockClear();
+    tCalls.length = 0;
+    authUser.current = null;
+    resetXUsageNoticeMemoryState();
+    ipc.onStatusChanged.mockReturnValue(() => {});
+    ipc.setEnabled.mockResolvedValue({ hook: BASE_HOOK });
+    ipc.setLifecycleAnnouncement.mockResolvedValue({ hook: BASE_HOOK });
+    ipc.providerBindRevoke.mockResolvedValue({ hook: BASE_HOOK });
+    ipc.addBinding.mockResolvedValue({ hook: BASE_HOOK });
+    ipc.rebindTeam.mockResolvedValue({ hook: BASE_HOOK });
+    ipc.cancelPendingBind.mockResolvedValue({ hook: BASE_HOOK });
+    ipc.revokeTeam.mockResolvedValue({ hook: BASE_HOOK });
+    ipc.openProviderAction.mockResolvedValue(undefined);
+    // 默认: 没有存量 global override(绝大多数设备) —— 收尾入口一次都不该露出来
+    ipc.imDefaultSettingsGet.mockResolvedValue({ isCustomized: false, customizedKeys: [] });
+    ipc.imDefaultSettingsReset.mockResolvedValue({ isCustomized: false, customizedKeys: [] });
+    dialog.confirm.mockResolvedValue(true);
+    (window as unknown as { electronAPI: unknown }).electronAPI = {
+      hookControl: {
+        get: ipc.get,
+        onStatusChanged: ipc.onStatusChanged,
+        setEnabled: ipc.setEnabled,
+        setLifecycleAnnouncement: ipc.setLifecycleAnnouncement,
+        setSlackCommunications: ipc.setSlackCommunications,
+        providerBindStart: ipc.providerBindStart,
+        providerBindCancel: ipc.providerBindCancel,
+        providerBindRevoke: ipc.providerBindRevoke,
+        providerBindSelect: ipc.providerBindSelect,
+        addBinding: ipc.addBinding,
+        rebindTeam: ipc.rebindTeam,
+        cancelPendingBind: ipc.cancelPendingBind,
+        revokeTeam: ipc.revokeTeam,
+        openProviderAction: ipc.openProviderAction,
+        setProviderDefaultWorkspace: ipc.setProviderDefaultWorkspace,
+        addProject: ipc.addProject,
+        setXCompanion: ipc.setXCompanion,
+      },
+      maker: {
+        imDefaultSettingsGet: ipc.imDefaultSettingsGet,
+        imDefaultSettingsReset: ipc.imDefaultSettingsReset,
+      },
+      openExternal: ipc.openExternal,
+      showOpenDirectoryDialog: ipc.showOpenDirectoryDialog,
+    };
+  });
+
+  afterEach(() => cleanup());
+
+  // The real settings component must assign/revoke with the previously observed
+  // owner, and cancellation must not write (new companion entry, unit DOM).
+  it('assigns and removes X without disconnecting the account', async () => {
+    const unbound = { ...BASE_HOOK, x: { ...BASE_HOOK.x, url: 'wss://x.example.test' } };
+    const bound = { ...unbound, x: { ...unbound.x, companionBotId: 'bot-fixture' } };
+    ipc.get.mockResolvedValue({ hook: unbound });
+    ipc.setXCompanion.mockResolvedValueOnce({ hook: bound }).mockResolvedValueOnce({ hook: unbound });
+    render(<HookConnectionsSection companion={{ id: 'bot-fixture', name: 'Fixture' }} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'bots.channels.officialX.bind' }));
+    await waitFor(() => expect(ipc.setXCompanion).toHaveBeenCalledWith('bot-fixture', null));
+    expect(screen.queryByRole('button', { name: SLACK_CARD })).toBeNull();
+    fireEvent.click(await screen.findByRole('button', { name: 'bots.channels.officialX.remove' }));
+    await waitFor(() => expect(ipc.setXCompanion).toHaveBeenLastCalledWith(null, 'bot-fixture'));
+    expect(ipc.providerBindRevoke).not.toHaveBeenCalled();
+  });
+
+  it('can remove an orphaned assignment from the global X settings', async () => {
+    const unbound = { ...BASE_HOOK, x: { ...BASE_HOOK.x, url: 'wss://x.example.test' } };
+    ipc.get.mockResolvedValue({ hook: { ...unbound, x: { ...unbound.x, companionBotId: 'deleted-bot' } } });
+    ipc.setXCompanion.mockResolvedValue({ hook: unbound });
+    render(<HookConnectionsSection />);
+    await expandChannelCard(X_CARD);
+    fireEvent.click(await screen.findByRole('button', { name: 'bots.channels.officialX.remove' }));
+    await waitFor(() => expect(ipc.setXCompanion).toHaveBeenCalledWith(null, 'deleted-bot'));
+    expect(ipc.providerBindRevoke).not.toHaveBeenCalled();
+  });
+
+  it('keeps the X assignment unchanged when confirmation is cancelled', async () => {
+    ipc.get.mockResolvedValue({ hook: { ...BASE_HOOK, x: { ...BASE_HOOK.x, url: 'wss://x.example.test' } } });
+    dialog.confirm.mockResolvedValue(false);
+    render(<HookConnectionsSection companion={{ id: 'bot-fixture', name: 'Fixture' }} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'bots.channels.officialX.bind' }));
+    await waitFor(() => expect(dialog.confirm).toHaveBeenCalled());
+    expect(ipc.setXCompanion).not.toHaveBeenCalled();
+  });
+
+  // 规则: 所有官方机器人共用一套「项目与模型」, 不再每个机器人各配一遍。
+  // 生产入口: 设置页。可观察结果: 开了几个机器人, 项目区块都只出现一次(每个项目一个编辑行),
+  // 且不必展开任何一张渠道卡就能看到。最小失败输入: 同时开着两个渠道。tier: unit(jsdom)。
+  it('项目与模型区块整页只有一处, 不随开启的机器人数量重复', async () => {
+    ipc.get.mockResolvedValue({
+      hook: {
+        ...BASE_HOOK,
+        enabled: true,
+        status: 'connected',
+        workspaces: { cindy: '/code/cindy' },
+        telegram: { ...BASE_HOOK.telegram, enabled: true, status: 'connected' },
+      },
+    });
+
+    render(<HookConnectionsSection />);
+    await screen.findByText('settings.remoteControl.hook.form.workspacesCardTitle');
+    await expandChannelCard(SLACK_CARD);
+    await expandChannelCard(TELEGRAM_CARD);
+
+    expect(screen.getAllByText('settings.remoteControl.hook.form.workspacesCardTitle')).toHaveLength(1);
+    expect(screen.getAllByRole('radiogroup')).toHaveLength(1);
+    const aliases = new Set(
+      workspacePrefsEditor.render.mock.calls.map(([props]) => (props as { alias: string }).alias),
+    );
+    expect([...aliases].sort()).toEqual(['chat', 'cindy']);
+  });
+
+  it('expands an official channel selected by settings search', async () => {
+    ipc.get.mockResolvedValue({ hook: BASE_HOOK });
+
+    render(
+      <SettingsSearchNavigationContext.Provider
+        value={{
+          entry: {
+            id: 'imBot.cindy.telegram',
+            tab: 'im-bot',
+            targetId: 'cindy-im-telegram',
+            titleKey: 'settings.tina.prefs.providerTelegram',
+            sectionKey: 'settings.imBot.groups.cindy',
+          },
+          activation: 1,
+        }}
+      >
+        <HookConnectionsSection />
+      </SettingsSearchNavigationContext.Provider>,
+    );
+
+    expect((await screen.findByRole('button', { name: TELEGRAM_CARD })).getAttribute('aria-expanded')).toBe(
+      'true',
+    );
+  });
+
+  it.each([true, false])('displaced workspace communications toggle (%s) never invokes Bot rebind or revoke', async (enabled) => {
+    const row = { teamId: 'T1', teamName: 'Workspace', slackUserId: 'U1', slackUserName: 'tester', displaced: true, communicationsEnabled: enabled };
+    const view: SlackHookView = { ...BASE_HOOK, enabled: true, status: 'connected', serverMultiTeam: true, serverSlackCommunications: true, bindings: [row] };
+    ipc.get.mockResolvedValue({ hook: view });
+    // Unit regression (PR #8470 CI): an immediate IPC mock hid the interval
+    // between dispatch and completion. Exercise real controls while pending
+    // and after completion so the second action cannot race the first.
+    let finishCommunications!: (result: { hook: SlackHookView }) => void;
+    ipc.setSlackCommunications.mockReturnValue(new Promise<{ hook: SlackHookView }>((resolve) => {
+      finishCommunications = resolve;
+    }));
+    render(<HookConnectionsSection />);
+    await expandChannelCard(SLACK_CARD);
+    const toggle = await screen.findByRole('switch', { name: 'settings.remoteControl.hook.multi.localCommunications' });
+    // Unit regression (#8481): a bound Slack workspace is absent from the
+    // provider-switch fixture above; its search binding must resolve to Slack.
+    const entry = resolveSettingsSearchEntry('im-bot', toggle.getAttribute('data-setting-id'));
+    expect(entry?.id).toBe('imBot.cindy.slack');
+    expect(document.getElementById(entry!.targetId)?.contains(toggle)).toBe(true);
+    const masterToggle = screen.getByRole('switch', { name: 'settings.remoteControl.hook.toggleAria' });
+    expect(masterToggle.getAttribute('aria-checked')).toBe('true');
+    expect(toggle.getAttribute('aria-checked')).toBe(String(enabled));
+    fireEvent.click(toggle);
+    await waitFor(() => expect(ipc.setSlackCommunications).toHaveBeenCalledWith('T1', !enabled));
+    expect(masterToggle.getAttribute('aria-checked')).toBe('true');
+    expect((masterToggle as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(masterToggle);
+    expect(ipc.setEnabled).not.toHaveBeenCalled();
+    await act(async () => {
+      finishCommunications({ hook: { ...view, bindings: [{ ...row, communicationsEnabled: !enabled }] } });
+    });
+    await waitFor(() => expect((masterToggle as HTMLButtonElement).disabled).toBe(false));
+    expect(toggle.getAttribute('aria-checked')).toBe(String(!enabled));
+    fireEvent.click(masterToggle);
+    await waitFor(() => expect(ipc.setEnabled).toHaveBeenCalledWith(false));
+    expect(ipc.rebindTeam).not.toHaveBeenCalled();
+    expect(ipc.revokeTeam).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])('workspace removal confirmation reflects device communications support (%s)', async (supported) => {
+    const row = { teamId: 'T1', teamName: 'Workspace', slackUserId: 'U1', slackUserName: 'tester', displaced: true, communicationsEnabled: true };
+    ipc.get.mockResolvedValue({ hook: { ...BASE_HOOK, enabled: true, status: 'connected', serverMultiTeam: true, serverSlackCommunications: supported, bindings: [row] } });
+    dialog.confirm.mockResolvedValue(false);
+    render(<HookConnectionsSection />);
+    await expandChannelCard(SLACK_CARD);
+    fireEvent.click(await screen.findByRole('button', { name: 'settings.remoteControl.hook.multi.removeAria' }));
+    expect(dialog.confirm).toHaveBeenCalledWith(expect.objectContaining({
+      description: supported ? 'settings.remoteControl.hook.multi.removeCommunicationsConfirmDescription' : 'settings.remoteControl.hook.multi.removeDisplacedConfirmDescription',
+    }));
+    expect(ipc.revokeTeam).not.toHaveBeenCalled();
+  });
+
+  it('shows the lifecycle notification switch only after Slack is bound and persists changes', async () => {
+    const boundHook: SlackHookView = {
+      ...BASE_HOOK,
+      enabled: true,
+      status: 'connected',
+      binding: {
+        state: 'confirmed',
+        slackUserId: 'U1',
+        slackUserName: 'alice',
+        message: null,
+        authorizeUrl: null,
+        reason: null,
+        installUrl: null,
+        teamName: 'Acme',
+      },
+    };
+    ipc.get.mockResolvedValue({ hook: boundHook });
+    ipc.setLifecycleAnnouncement.mockResolvedValue({
+      hook: { ...boundHook, lifecycleAnnouncement: true },
+    });
+
+    render(<HookConnectionsSection />);
+    await expandChannelCard(SLACK_CARD);
+
+    fireEvent.click(
+      await screen.findByRole('switch', {
+        name: 'settings.remoteControl.hook.lifecycleAnnouncement.label',
+      }),
+    );
+
+    await waitFor(() => expect(ipc.setLifecycleAnnouncement).toHaveBeenCalledWith(true));
+  });
+
+  it('uses a localized fallback when persisting the lifecycle preference fails', async () => {
+    const boundHook: SlackHookView = {
+      ...BASE_HOOK,
+      enabled: true,
+      status: 'connected',
+      binding: {
+        state: 'confirmed',
+        slackUserId: 'U1',
+        slackUserName: 'alice',
+        message: null,
+        authorizeUrl: null,
+        reason: null,
+        installUrl: null,
+        teamName: 'Acme',
+      },
+    };
+    ipc.get.mockResolvedValue({ hook: boundHook });
+    ipc.setLifecycleAnnouncement.mockRejectedValue(
+      new Error('[INTERNAL] failed to persist Slack lifecycle notification preference'),
+    );
+
+    render(<HookConnectionsSection />);
+    await expandChannelCard(SLACK_CARD);
+    fireEvent.click(
+      await screen.findByRole('switch', {
+        name: 'settings.remoteControl.hook.lifecycleAnnouncement.label',
+      }),
+    );
+
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith('settings.remoteControl.hook.toast.actionFailed'),
+    );
+  });
+
+  it('offers an explicit link action when Telegram is enabled but unbound', async () => {
+    ipc.get.mockResolvedValue({ hook: BASE_HOOK });
+    ipc.providerBindStart.mockResolvedValue({ hook: BASE_HOOK });
+
+    render(<HookConnectionsSection />);
+    await expandChannelCard(TELEGRAM_CARD);
+
+    fireEvent.click(
+      await screen.findByRole('button', {
+        name: 'settings.remoteControl.hook.telegram.connect',
+      }),
+    );
+
+    await waitFor(() => expect(ipc.providerBindStart).toHaveBeenCalledOnce());
+  });
+
+  it('keeps the deep-link actions visible while Telegram binding is pending', async () => {
+    const hook: SlackHookView = {
+      ...BASE_HOOK,
+      telegram: {
+        ...BASE_HOOK.telegram,
+        binding: {
+          provider: 'telegram',
+          state: 'pending',
+          attemptId: 'attempt-1',
+          bindingId: null,
+          principalId: 'telegram-user-1',
+          principalName: 'Cindy User',
+          scopeId: 'bot-1',
+          scopeName: 'cindy_example_bot',
+          connectUrl: 'https://t.me/cindy_example_bot?start=one-time-token',
+          bindCode: null,
+          expiresAt: Date.now() + 60_000,
+          reason: null,
+          remediationUrl: null,
+          actions: ['open_connect_url', 'copy_connect_url', 'cancel'],
+        },
+      },
+    };
+    ipc.get.mockResolvedValue({ hook });
+
+    render(<HookConnectionsSection />);
+    await expandChannelCard(TELEGRAM_CARD);
+
+    const openButton = await screen.findByRole('button', {
+      name: 'settings.remoteControl.hook.telegram.openApp',
+    });
+    expect(
+      screen.getByRole('button', { name: 'settings.remoteControl.hook.binding.copyLink' }),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole('button', { name: 'settings.remoteControl.hook.telegram.cancel' }),
+    ).toBeTruthy();
+
+    fireEvent.click(openButton);
+    await waitFor(() => expect(ipc.openProviderAction).toHaveBeenCalledWith('telegram', 'connect'));
+  });
+
+  it('hides the X and Feishu cards entirely while the endpoint manifest leaves their URLs empty', async () => {
+    // BASE_HOOK 的 x.url / feishu.url 为空且未启用/不可用 —— 端点清单缺失即灰度关闭,
+    // 设置页不得出现入口(providerCardState.visible 语义)。
+    // 这一条必须用空 url 的 BASE_HOOK 本体, 不能换成 xUnboundHook()。
+    ipc.get.mockResolvedValue({ hook: BASE_HOOK });
+
+    render(<HookConnectionsSection />);
+    await screen.findByRole('button', { name: TELEGRAM_CARD });
+
+    expect(screen.queryByRole('button', { name: X_CARD })).toBeNull();
+    expect(screen.queryByRole('button', { name: FEISHU_CARD })).toBeNull();
+  });
+
+  // Store-app requirement: the ordinary link action stays available after binding;
+  // per-row actions carry that account's binding ID, including during another authorization.
+  it('links through the existing action and targets each store account independently', async () => {
+    const first: NonNullable<SlackHookView['feishu']['binding']> = {
+      provider: 'feishu', state: 'confirmed', attemptId: null, bindingId: 'alice-binding',
+      principalId: 'ou_alice', principalName: 'Alice', tenantKey: 'tenant-a', tenantName: 'Feishu Acme', scopeId: 'cli_store', scopeName: 'Cindy',
+      connectUrl: null, bindCode: null, expiresAt: null, reason: null, remediationUrl: null, actions: ['revoke', 'select_device'],
+    };
+    const second = { ...first, bindingId: 'bob-binding', principalId: 'ou_bob', principalName: 'Bob', tenantKey: 'tenant-b', tenantName: 'Feishu Beta' };
+    const hook: SlackHookView = { ...BASE_HOOK, feishu: { ...BASE_HOOK.feishu,
+      enabled: true, available: true, status: 'connected', url: 'wss://feishu.example.test',
+      multiBindAvailable: true, binding: first, bindings: [first, second],
+    } };
+    ipc.get.mockResolvedValue({ hook }); ipc.providerBindStart.mockResolvedValue({ hook });
+    let finishSelection!: (value: { hook: SlackHookView }) => void;
+    ipc.providerBindSelect.mockImplementation(() => new Promise((resolve) => { finishSelection = resolve; }));
+    ipc.providerBindRevoke.mockResolvedValue({ hook });
+    dialog.confirm.mockResolvedValue(true);
+    const entry = resolveSettingsSearchEntry('im-bot', 'imBot.cindy.feishu.workingDevice');
+    render(<SettingsSearchNavigationContext.Provider value={{ entry, activation: 1 }}>
+      <HookConnectionsSection />
+    </SettingsSearchNavigationContext.Provider>);
+    await screen.findByText('Alice'); expect(screen.getByText('Bob')).toBeTruthy();
+    expect(tCalls).toContainEqual({ key: 'settings.remoteControl.hook.feishu.connectionTenant', vars: { tenant: 'Feishu Acme' } });
+    expect(tCalls).toContainEqual({ key: 'settings.remoteControl.hook.feishu.connectionTenant', vars: { tenant: 'Feishu Beta' } });
+    expect(screen.queryByText(/tenant-[ab]/)).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'settings.remoteControl.hook.feishu.connect' }));
+    await waitFor(() => expect(ipc.providerBindStart).toHaveBeenCalledWith('feishu'));
+    fireEvent.click(screen.getAllByRole('button', { name: 'settings.remoteControl.hook.feishu.setWorkingDevice' })[1]!);
+    await waitFor(() => expect(ipc.providerBindSelect).toHaveBeenCalledWith('feishu', 'bob-binding'));
+    fireEvent.click(screen.getAllByRole('button', { name: 'settings.remoteControl.hook.feishu.unlink' })[0]!);
+    await waitFor(() => expect(ipc.providerBindRevoke).toHaveBeenCalledWith('feishu', 'alice-binding'));
+    await act(async () => finishSelection({ hook }));
+    expect(toast.success).toHaveBeenCalledWith('settings.remoteControl.hook.feishu.workingDeviceSet');
+    fireEvent.click(screen.getAllByRole('button', { name: 'settings.remoteControl.hook.feishu.unlink' })[1]!);
+    await waitFor(() => expect(ipc.providerBindRevoke).toHaveBeenCalledWith('feishu', 'bob-binding'));
+    const listener = ipc.onStatusChanged.mock.calls[0]![0];
+    await act(async () => listener({ ...hook, feishu: { ...hook.feishu, binding: { ...first,
+      state: 'pending', bindingId: null, principalId: null, principalName: null, attemptId: 'new-auth',
+      actions: ['cancel'], expiresAt: Date.now() + 60_000 }, bindings: [first] } }));
+    expect(screen.getByText('Alice')).toBeTruthy(); expect(screen.queryByText('Bob')).toBeNull();
+    expect(screen.getByRole('button', { name: 'settings.remoteControl.hook.feishu.cancel' })).toBeTruthy();
+    await act(async () => listener({ ...hook, feishu: { ...hook.feishu,
+      binding: { ...first, state: 'failed', bindingId: null, principalId: null, attemptId: 'new-auth', reason: 'denied', actions: ['retry'] },
+      bindings: [first] } }));
+    expect(screen.getByText('Alice')).toBeTruthy();
+    expect(screen.getAllByText('settings.remoteControl.hook.feishu.status.failed').length).toBeGreaterThan(0);
+  });
+
+  // Unit / owner request: known current computers hide the switch action, and
+  // server pushes update names/actions without a renderer-side fetch.
+  it('shows the working computer per account and hides selection on this computer', async () => {
+    const first: NonNullable<SlackHookView['feishu']['binding']> = {
+      provider: 'feishu', state: 'confirmed', attemptId: null, bindingId: 'first', principalId: 'alice', principalName: 'Alice',
+      scopeId: 'cli_app', scopeName: 'Cindy', connectUrl: null, bindCode: null, expiresAt: null, reason: null, remediationUrl: null,
+      actions: ['select_device', 'revoke'], workingDevice: { name: 'My Mac', isCurrent: true },
+    };
+    const second = { ...first, bindingId: 'second', principalId: 'bob', principalName: 'Bob', workingDevice: { name: 'Office PC', isCurrent: false } };
+    const hook: SlackHookView = { ...BASE_HOOK, feishu: { ...BASE_HOOK.feishu, enabled: true, available: true, status: 'connected', multiBindAvailable: true,
+      applications: [{ appId: 'cli_app', brand: 'feishu', appType: 'store', botName: 'Cindy', organization: null }], binding: first, bindings: [first, second] } };
+    ipc.get.mockResolvedValue({ hook }); ipc.providerBindSelect.mockResolvedValue({ hook });
+    const entry = resolveSettingsSearchEntry('im-bot', 'imBot.cindy.feishu.workingDevice');
+    render(<SettingsSearchNavigationContext.Provider value={{ entry, activation: 1 }}><HookConnectionsSection /></SettingsSearchNavigationContext.Provider>);
+    await screen.findByText('Alice');
+    const action = 'settings.remoteControl.hook.feishu.setWorkingDevice';
+    expect(screen.getAllByRole('button', { name: action })).toHaveLength(1);
+    expect(screen.getByText('· settings.remoteControl.hook.feishu.workingDeviceThisComputer')).toBeTruthy();
+    expect(tCalls).toContainEqual({ key: 'settings.remoteControl.hook.feishu.workingDeviceLabel', vars: { name: 'Office PC' } });
+    fireEvent.click(screen.getByRole('button', { name: action }));
+    await waitFor(() => expect(ipc.providerBindSelect).toHaveBeenCalledWith('feishu', 'second'));
+    const listener = ipc.onStatusChanged.mock.calls[0]![0];
+    await act(async () => listener({ ...hook, feishu: { ...hook.feishu, bindings: [first, { ...second, workingDevice: { name: 'My Mac', isCurrent: true } }] } }));
+    expect(screen.queryByRole('button', { name: action })).toBeNull();
+    await act(async () => listener({ ...hook, feishu: { ...hook.feishu, available: false, applications: [], bindings: [], binding: null } }));
+    expect(screen.queryByText('settings.remoteControl.hook.feishu.disabledHint')).toBeNull();
+    expect(screen.getByText('settings.remoteControl.hook.feishu.unavailableHint')).toBeTruthy();
+    expect(screen.queryByText('Alice')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'settings.remoteControl.hook.feishu.connect' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'settings.remoteControl.hook.feishu.connectBot' })).toBeNull();
+    expect(ipc.get).toHaveBeenCalledTimes(1);
+  });
+
+  // Two configured bots need distinct authorization/open targets, with one shared editor.
+  it('shows both bot names and sends link/open actions to the chosen application', async () => {
+    authUser.current = { membershipKind: 'org', orgSlug: 'org-acme', orgName: 'Cindy organization' };
+    const account: NonNullable<SlackHookView['feishu']['binding']> = {
+      provider: 'feishu', state: 'confirmed', attemptId: null, bindingId: 'org-binding',
+      principalId: 'org-user', principalName: 'Alice', scopeId: 'cli_org', scopeName: 'Acme bot',
+      connectUrl: null, bindCode: null, expiresAt: null, reason: null, remediationUrl: null, actions: ['revoke', 'select_device'],
+    };
+    const hook: SlackHookView = { ...BASE_HOOK, feishu: { ...BASE_HOOK.feishu,
+      enabled: true, available: true, status: 'connected', multiBindAvailable: true, binding: account, bindings: [account],
+      applications: [
+        { appId: 'cli_store', brand: 'feishu', appType: 'store', botName: 'Cindy Official', organization: 'org-acme' },
+        { appId: 'cli_org', brand: 'feishu', appType: 'self_built', botName: 'Acme bot', organization: 'org-acme', tenantName: 'Feishu Acme' },
+      ],
+    } };
+    ipc.get.mockResolvedValue({ hook }); ipc.providerBindStart.mockResolvedValue({ hook });
+    ipc.openProviderAction.mockResolvedValue(undefined);
+    const entry = resolveSettingsSearchEntry('im-bot', 'imBot.cindy.feishu.workingDevice');
+    render(<SettingsSearchNavigationContext.Provider value={{ entry, activation: 1 }}><HookConnectionsSection /></SettingsSearchNavigationContext.Provider>);
+    await screen.findByText('Cindy Official'); expect(screen.getByText('Acme bot')).toBeTruthy();
+    // Regression / unit: render the real card with the server's organization slug.
+    // Existing fixtures used display names here and missed the internal ID leak.
+    expect(screen.getByText('settings.remoteControl.hook.feishu.appType.self_built · Feishu Acme')).toBeTruthy();
+    expect(screen.queryByText(/org-acme/)).toBeNull();
+    expect(screen.queryByText(/Cindy organization/)).toBeNull();
+    expect(screen.queryByText('cli_store')).toBeNull();
+    expect(within(screen.getByRole('group', { name: 'Cindy Official' })).getByRole('status').textContent).toBe('settings.remoteControl.hook.feishu.status.none');
+    expect(tCalls).toContainEqual({ key: 'settings.remoteControl.hook.feishu.linkedBotsSummary', vars: { bots: 1, accounts: 1 } });
+    expect(screen.getAllByRole('button', { name: 'settings.remoteControl.hook.feishu.connectBot' })).toHaveLength(1);
+    fireEvent.click(screen.getByRole('button', { name: 'settings.remoteControl.hook.feishu.connectBot' }));
+    await waitFor(() => expect(ipc.providerBindStart).toHaveBeenCalledWith('feishu', 'cli_store'));
+    fireEvent.click(screen.getAllByRole('button', { name: 'settings.remoteControl.hook.feishu.openBot' })[1]!);
+    await waitFor(() => expect(ipc.openProviderAction).toHaveBeenCalledWith('feishu', 'provider', 'cli_org'));
+    const listener = ipc.onStatusChanged.mock.calls[0]![0];
+    await act(async () => listener({ ...hook, feishu: { ...hook.feishu, binding: {
+      ...account, scopeId: 'cli_store', state: 'pending', bindingId: null, attemptId: 'store-append',
+      actions: ['cancel'], bindCode: 'TEST-CODE', expiresAt: Date.now() + 60_000 } } }));
+    expect(screen.getAllByRole('button', { name: 'settings.remoteControl.hook.feishu.openBot' })).toHaveLength(2);
+    expect(within(screen.getByRole('group', { name: 'Cindy Official' })).getByRole('status').textContent).toBe('settings.remoteControl.hook.authorizing');
+    await act(async () => listener({ ...hook, feishu: { ...hook.feishu, binding: {
+      ...account, scopeId: 'cli_store', state: 'failed', bindingId: null, reason: 'denied', actions: ['retry'] } } }));
+    expect(within(screen.getByRole('group', { name: 'Cindy Official' })).getByRole('status').textContent).toBe('settings.remoteControl.hook.feishu.status.failed');
+    expect(screen.getByText('Alice')).toBeTruthy();
+    const storeAccount = { ...account, scopeId: 'cli_store', bindingId: 'store-account', principalId: 'store-user', principalName: 'Bob' };
+    const linked = { ...hook, feishu: { ...hook.feishu, binding: storeAccount, bindings: [account, storeAccount] } };
+    await act(async () => listener(linked));
+    const addAccount = within(screen.getByRole('group', { name: 'Cindy Official' })).getByRole('button', { name: 'settings.remoteControl.hook.feishu.linkAnotherAccount' });
+    fireEvent.click(addAccount);
+    expect(ipc.providerBindStart).toHaveBeenLastCalledWith('feishu', 'cli_store');
+    expect(tCalls).toContainEqual({ key: 'settings.remoteControl.hook.feishu.linkedBotsSummary', vars: { bots: 2, accounts: 2 } });
+    await act(async () => listener({ ...linked, feishu: { ...linked.feishu, multiBindAvailable: false } }));
+    expect(screen.queryByRole('button', { name: 'settings.remoteControl.hook.feishu.linkAnotherAccount' })).toBeNull();
+    await act(async () => listener({ ...hook, feishu: { ...hook.feishu, status: 'error', lastError: 'TLS connection failed' } }));
+    expect(screen.getByText('TLS connection failed')).toBeTruthy();
+    await act(async () => listener({ ...hook, feishu: { ...hook.feishu, applications: hook.feishu.applications!.map((app) => ({ ...app, tenantName: null })) } }));
+    expect(screen.getByText('settings.remoteControl.hook.feishu.appType.self_built')).toBeTruthy();
+    expect(screen.queryByText(/org-acme/)).toBeNull();
+    expect(screen.queryByText(/Cindy organization/)).toBeNull();
+  });
+
+  // Production UI / unit: the server allowlist is the only bot chooser source.
+  // Gap: old coverage had two bots with one already linked; this starts with two
+  // unlinked enterprise bots and no published store bot, then exposes the store.
+  it('offers only allowed bots and keeps every first-link action scoped to its bot', async () => {
+    const apps = [
+      { appId: 'cli_org_a', brand: 'feishu' as const, appType: 'self_built' as const, botName: 'Acme bot', organization: 'Acme' },
+      { appId: 'cli_org_b', brand: 'feishu' as const, appType: 'self_built' as const, botName: 'Beta bot', organization: 'Beta' },
+    ];
+    const hook: SlackHookView = { ...BASE_HOOK, feishu: { ...BASE_HOOK.feishu, enabled: true, available: true,
+      status: 'connected', applications: apps, binding: null, bindings: [], multiBindAvailable: true } };
+    ipc.get.mockResolvedValue({ hook }); ipc.providerBindStart.mockResolvedValue({ hook });
+    const entry = resolveSettingsSearchEntry('im-bot', 'imBot.cindy.feishu.workingDevice');
+    render(<SettingsSearchNavigationContext.Provider value={{ entry, activation: 1 }}><HookConnectionsSection /></SettingsSearchNavigationContext.Provider>);
+    await screen.findByText('settings.remoteControl.hook.feishu.chooseBot');
+    expect(screen.queryByText('Cindy Official')).toBeNull();
+    expect(screen.getAllByRole('button', { name: 'settings.remoteControl.hook.feishu.connectBot' })).toHaveLength(2);
+    expect(ipc.providerBindStart).not.toHaveBeenCalled();
+    fireEvent.click(within(screen.getByRole('group', { name: 'Beta bot' })).getByRole('button', { name: 'settings.remoteControl.hook.feishu.connectBot' }));
+    await waitFor(() => expect(ipc.providerBindStart).toHaveBeenCalledWith('feishu', 'cli_org_b'));
+    const listener = ipc.onStatusChanged.mock.calls[0]![0];
+    await act(async () => listener({ ...hook, feishu: { ...hook.feishu, applications: [
+      ...apps, { appId: 'cli_store', brand: 'feishu', appType: 'store', botName: 'Cindy Official', organization: null },
+    ] } }));
+    expect(screen.getByRole('group', { name: 'Cindy Official' })).toBeTruthy();
+    expect(screen.getAllByRole('button', { name: 'settings.remoteControl.hook.feishu.connectBot' })).toHaveLength(3);
+  });
+
+  it.each(['success', 'failure', 'old-server', 'unlink'] as const)('offers a concise working-computer action with a confirmed result: %s', async (outcome) => {
+    const hook: SlackHookView = { ...BASE_HOOK, feishu: { ...BASE_HOOK.feishu,
+      enabled: true, available: true, status: 'connected', url: 'wss://feishu.example.test',
+      binding: { provider: 'feishu', state: 'confirmed', attemptId: null, bindingId: 'local-feishu',
+        principalId: 'ou_user', principalName: 'Alice', scopeId: 'cli_app', scopeName: 'Cindy',
+        connectUrl: null, bindCode: null, expiresAt: null, reason: null, remediationUrl: null,
+        actions: outcome === 'old-server' ? ['revoke'] : ['revoke', 'select_device'] },
+    } };
+    ipc.get.mockResolvedValue({ hook });
+    let resolve!: (value: { hook: SlackHookView }) => void; let reject!: (error: Error) => void;
+    ipc.providerBindSelect.mockReturnValue(new Promise((yes, no) => { resolve = yes; reject = no; }));
+    const entry = resolveSettingsSearchEntry('im-bot', 'imBot.cindy.feishu.workingDevice');
+    render(<SettingsSearchNavigationContext.Provider value={{ entry, activation: 1 }}>
+      <HookConnectionsSection />
+    </SettingsSearchNavigationContext.Provider>);
+    await screen.findByRole('switch', { name: 'settings.remoteControl.hook.feishu.toggleAria' });
+    const name = 'settings.remoteControl.hook.feishu.setWorkingDevice';
+    if (outcome === 'old-server') { expect(screen.queryByRole('button', { name })).toBeNull(); return; }
+    const button = await screen.findByRole('button', { name });
+    expect(resolveSettingsSearchEntry('im-bot', button.getAttribute('data-setting-id'))?.targetId).toBe(button.id);
+    fireEvent.click(button);
+    expect(ipc.providerBindSelect).toHaveBeenCalledWith('feishu');
+    expect(button.hasAttribute('disabled')).toBe(true);
+    expect(toast.success).not.toHaveBeenCalled();
+    if (outcome === 'unlink') {
+      ipc.providerBindRevoke.mockResolvedValue({ hook });
+      fireEvent.click(screen.getByRole('button', { name: 'settings.remoteControl.hook.feishu.unlink' }));
+      await waitFor(() => expect(ipc.providerBindRevoke).toHaveBeenCalledWith('feishu'));
+      await act(async () => { resolve({ hook }); });
+      expect(button.hasAttribute('disabled')).toBe(false);
+      expect(toast.success).not.toHaveBeenCalled();
+      expect(toast.error).not.toHaveBeenCalled();
+    } else if (outcome === 'success') {
+      resolve({ hook });
+      await waitFor(() => expect(toast.success).toHaveBeenCalledWith('settings.remoteControl.hook.feishu.workingDeviceSet'));
+    } else {
+      reject(new Error('server unavailable'));
+      await waitFor(() => expect(toast.error).toHaveBeenCalledWith('settings.remoteControl.hook.toast.actionFailed'));
+      expect(toast.success).not.toHaveBeenCalled();
+    }
+  });
+
+  it('shows the Feishu bind code with a copy action next to the authorize-page actions while pending', async () => {
+    const writeText = vi.fn(async () => {});
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
+    const hook: SlackHookView = {
+      ...BASE_HOOK,
+      feishu: {
+        enabled: true,
+        url: 'ws://127.0.0.1:8794',
+        status: 'connected',
+        lastError: null,
+        available: true,
+        capabilityPending: false,
+        defaultWorkspace: null,
+        binding: {
+          provider: 'feishu',
+          state: 'pending',
+          attemptId: 'attempt-f1',
+          bindingId: null,
+          principalId: null,
+          principalName: null,
+          scopeId: 'cli_app',
+          scopeName: 'Cindy',
+          connectUrl:
+            'https://accounts.feishu.cn/open-apis/authen/v1/authorize?client_id=cli_app&redirect_uri=https%3A%2F%2Fexample.test%2Fcb&state=st',
+          bindCode: '7KQ4-M2XD',
+          expiresAt: Date.now() + 60_000,
+          reason: null,
+          remediationUrl: null,
+          actions: ['open_connect_url', 'copy_connect_url', 'copy_bind_code', 'cancel'],
+        },
+      },
+    };
+    ipc.get.mockResolvedValue({ hook });
+
+    render(<HookConnectionsSection />);
+    await expandChannelCard(FEISHU_CARD);
+
+    const openButton = await screen.findByRole('button', {
+      name: 'settings.remoteControl.hook.feishu.openApp',
+    });
+    expect(
+      screen.getByRole('button', { name: 'settings.remoteControl.hook.binding.copyLink' }),
+    ).toBeTruthy();
+    expect(screen.getByText('7KQ4-M2XD')).toBeTruthy();
+    expect(screen.getByText('settings.remoteControl.hook.feishu.bindCode.hint')).toBeTruthy();
+    fireEvent.click(
+      screen.getByRole('button', { name: 'settings.remoteControl.hook.feishu.bindCode.copy' }),
+    );
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith('7KQ4-M2XD'));
+    expect(toast.success).toHaveBeenCalledWith('settings.remoteControl.hook.feishu.bindCode.copied');
+
+    fireEvent.click(openButton);
+    await waitFor(() => expect(ipc.openProviderAction).toHaveBeenCalledWith('feishu', 'connect'));
+  });
+
+  it.each([
+    // 组织成员找管理员配置; 个人账号没有组织管理员可找(PR #8947 review)。
+    ['org', 'org' as const, 'unavailableHint', 'status.unavailable'],
+    ['personal', 'personal' as const, 'unavailableHintPersonal', 'status.unavailablePersonal'],
+  ])('explains why the Feishu bot is unavailable to a %s account when the server lacks provider:feishu', async (_label, membershipKind, hintKey, badgeKey) => {
+    authUser.current = { membershipKind };
+    const hook: SlackHookView = {
+      ...BASE_HOOK,
+      feishu: {
+        enabled: true,
+        url: 'ws://127.0.0.1:8794',
+        status: 'connected',
+        lastError: null,
+        available: false,
+        capabilityPending: false,
+        defaultWorkspace: null,
+        binding: null,
+      },
+    };
+    ipc.get.mockResolvedValue({ hook });
+
+    render(<HookConnectionsSection />);
+    await expandChannelCard(FEISHU_CARD);
+
+    expect(await screen.findByText(`settings.remoteControl.hook.feishu.${hintKey}`)).toBeTruthy();
+    expect(screen.getByText(`settings.remoteControl.hook.feishu.${badgeKey}`)).toBeTruthy();
+    expect(
+      screen.queryByRole('button', { name: 'settings.remoteControl.hook.feishu.connect' }),
+    ).toBeNull();
+  });
+
+  it('says the Feishu bot was changed, not that another device took over, when the binding ends with app_changed', async () => {
+    const hook: SlackHookView = {
+      ...BASE_HOOK,
+      feishu: {
+        enabled: true,
+        url: 'ws://127.0.0.1:8794',
+        status: 'connected',
+        lastError: null,
+        available: true,
+        capabilityPending: false,
+        defaultWorkspace: null,
+        binding: {
+          provider: 'feishu',
+          state: 'superseded',
+          attemptId: null,
+          bindingId: 'binding-feishu-1',
+          principalId: 'ou_user',
+          principalName: 'Cindy User',
+          scopeId: 'cli_new_app',
+          scopeName: 'Cindy',
+          connectUrl: null,
+          bindCode: null,
+          expiresAt: null,
+          reason: 'app_changed',
+          remediationUrl: null,
+          actions: ['retry'],
+        },
+      },
+    };
+    ipc.get.mockResolvedValue({ hook });
+
+    render(<HookConnectionsSection />);
+    await expandChannelCard(FEISHU_CARD);
+
+    expect(
+      await screen.findByRole('button', { name: 'settings.remoteControl.hook.feishu.retry' }),
+    ).toBeTruthy();
+    // 收起行摘要与展开区的结果行都说「机器人已更换」, 不出现「已关联到另一台设备」。
+    expect(screen.getAllByText('settings.remoteControl.hook.feishu.status.appChanged')).toHaveLength(2);
+    expect(screen.queryByText('settings.remoteControl.hook.feishu.status.superseded')).toBeNull();
+  });
+
+  it('keeps the OAuth deep-link actions visible while X binding is pending', async () => {
+    const hook: SlackHookView = {
+      ...BASE_HOOK,
+      x: {
+        enabled: true,
+        url: 'wss://x-hook.example.test',
+        status: 'connected',
+        lastError: null,
+        available: true,
+        capabilityPending: false,
+        defaultWorkspace: null,
+        binding: {
+          provider: 'x',
+          state: 'pending',
+          attemptId: 'attempt-x1',
+          bindingId: null,
+          principalId: null,
+          principalName: null,
+          scopeId: 'bot-x',
+          scopeName: 'CindyBot',
+          connectUrl:
+            'https://x.com/i/oauth2/authorize?response_type=code&client_id=c1&redirect_uri=r&scope=s&state=st&code_challenge=cc&code_challenge_method=S256',
+          bindCode: null,
+          expiresAt: Date.now() + 60_000,
+          reason: null,
+          remediationUrl: null,
+          actions: ['open_connect_url', 'copy_connect_url', 'cancel'],
+        },
+      },
+    };
+    ipc.get.mockResolvedValue({ hook });
+
+    render(<HookConnectionsSection />);
+    await expandChannelCard(X_CARD);
+
+    const openButton = await screen.findByRole('button', {
+      name: 'settings.remoteControl.hook.x.openApp',
+    });
+    expect(
+      screen.getByRole('button', { name: 'settings.remoteControl.hook.binding.copyLink' }),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole('button', { name: 'settings.remoteControl.hook.x.cancel' }),
+    ).toBeTruthy();
+
+    fireEvent.click(openButton);
+    await waitFor(() => expect(ipc.openProviderAction).toHaveBeenCalledWith('x', 'connect'));
+  });
+
+  it('renders confirmed X actions from the wire action list and never a group action', async () => {
+    const hook: SlackHookView = {
+      ...BASE_HOOK,
+      x: {
+        enabled: true,
+        url: 'wss://x-hook.example.test',
+        status: 'connected',
+        lastError: null,
+        available: true,
+        capabilityPending: false,
+        defaultWorkspace: null,
+        binding: {
+          provider: 'x',
+          state: 'confirmed',
+          attemptId: null,
+          bindingId: 'x-binding-1',
+          principalId: 'x-user-1',
+          principalName: '@dash',
+          scopeId: 'bot-x',
+          scopeName: 'CindyBot',
+          connectUrl: null,
+          bindCode: null,
+          expiresAt: null,
+          reason: null,
+          remediationUrl: 'https://x.com/CindyBot',
+          actions: ['open_provider', 'revoke'],
+        },
+      },
+    };
+    ipc.get.mockResolvedValue({ hook });
+
+    render(<HookConnectionsSection />);
+    await expandChannelCard(X_CARD);
+
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'settings.remoteControl.hook.x.openBot' }),
+    );
+    await waitFor(() => expect(ipc.openProviderAction).toHaveBeenCalledWith('x', 'provider'));
+
+    // X 无群概念: server 不会下发 add_to_group, 按钮为数据驱动, 不得凭空渲染。
+    expect(
+      screen.queryByRole('button', { name: 'settings.remoteControl.hook.x.addToGroup' }),
+    ).toBeNull();
+    expect(
+      screen.getByRole('button', { name: 'settings.remoteControl.hook.x.unlink' }),
+    ).toBeTruthy();
+  });
+
+  it('uses the latest Slack install URL after an async confirmation', async () => {
+    let pushStatus: ((view: SlackHookView) => void) | undefined;
+    let resolveConfirm: ((value: boolean) => void) | undefined;
+    dialog.confirm.mockReturnValue(
+      new Promise<boolean>((resolve) => {
+        resolveConfirm = resolve;
+      }),
+    );
+    ipc.onStatusChanged.mockImplementation((listener: (view: SlackHookView) => void) => {
+      pushStatus = listener;
+      return () => {};
+    });
+    const awaitingInstall = (installUrl: string): SlackHookView => ({
+      ...BASE_HOOK,
+      enabled: true,
+      status: 'connected',
+      binding: {
+        state: 'failed',
+        slackUserId: null,
+        slackUserName: null,
+        message: 'not installed',
+        authorizeUrl: null,
+        reason: 'not-installed',
+        installUrl,
+        teamName: null,
+      },
+    });
+    ipc.get.mockResolvedValue({
+      hook: awaitingInstall('https://hook.example.test/slack/install?team=OLD'),
+    });
+
+    render(<HookConnectionsSection />);
+    await waitFor(() => expect(dialog.confirm).toHaveBeenCalledOnce());
+    expect(within(document.getElementById('cindy-im-slack')!).getByRole('status').textContent).toBe(
+      'settings.remoteControl.hook.notInstalled.status',
+    );
+    await expandChannelCard(SLACK_CARD);
+    expect(
+      screen.queryByRole('button', {
+        name: 'settings.remoteControl.hook.binding.reauthorize',
+      }),
+    ).toBeNull();
+    act(() => {
+      pushStatus?.(awaitingInstall('https://hook.example.test/slack/install?team=NEW'));
+    });
+    await act(async () => {
+      resolveConfirm?.(true);
+      await Promise.resolve();
+    });
+
+    expect(ipc.openExternal).toHaveBeenCalledWith(
+      'https://hook.example.test/slack/install?team=NEW',
+    );
+  });
+
+  it('does not apply an old install confirmation to another Slack target', async () => {
+    let pushStatus: ((view: SlackHookView) => void) | undefined;
+    let resolveConfirm: ((value: boolean) => void) | undefined;
+    dialog.confirm.mockReturnValue(
+      new Promise<boolean>((resolve) => {
+        resolveConfirm = resolve;
+      }),
+    );
+    ipc.onStatusChanged.mockImplementation((listener: (view: SlackHookView) => void) => {
+      pushStatus = listener;
+      return () => {};
+    });
+    const awaitingInstall = (teamId: string): SlackHookView => ({
+      ...BASE_HOOK,
+      enabled: true,
+      status: 'connected',
+      serverMultiTeam: true,
+      pendingBind: {
+        state: 'failed',
+        message: 'not installed',
+        authorizeUrl: null,
+        reason: 'not-installed',
+        installUrl: `https://hook.example.test/slack/install?team=${teamId}`,
+        teamId,
+        intent: 'add',
+      },
+      binding: {
+        state: 'failed',
+        slackUserId: null,
+        slackUserName: null,
+        message: 'not installed',
+        authorizeUrl: null,
+        reason: 'not-installed',
+        installUrl: `https://hook.example.test/slack/install?team=${teamId}`,
+        teamName: null,
+      },
+    });
+    ipc.get.mockResolvedValue({ hook: awaitingInstall('TEAM_A') });
+
+    render(<HookConnectionsSection />);
+    await waitFor(() => expect(dialog.confirm).toHaveBeenCalledOnce());
+    act(() => {
+      pushStatus?.(awaitingInstall('TEAM_B'));
+    });
+    await act(async () => {
+      resolveConfirm?.(true);
+      await Promise.resolve();
+    });
+
+    expect(ipc.openExternal).not.toHaveBeenCalled();
+  });
+
+  it('invalidates an old install confirmation when the same Slack target is retried', async () => {
+    let pushStatus: ((view: SlackHookView) => void) | undefined;
+    const confirmResolvers: Array<(value: boolean) => void> = [];
+    dialog.confirm.mockImplementation(
+      () =>
+        new Promise<boolean>((resolve) => {
+          confirmResolvers.push(resolve);
+        }),
+    );
+    ipc.onStatusChanged.mockImplementation((listener: (view: SlackHookView) => void) => {
+      pushStatus = listener;
+      return () => {};
+    });
+    const awaitingInstall: SlackHookView = {
+      ...BASE_HOOK,
+      enabled: true,
+      status: 'connected',
+      serverMultiTeam: true,
+      pendingBind: {
+        state: 'failed',
+        message: 'not installed',
+        authorizeUrl: null,
+        reason: 'not-installed',
+        installUrl: 'https://hook.example.test/slack/install?team=TEAM_A',
+        teamId: 'TEAM_A',
+        intent: 'add',
+      },
+      binding: {
+        state: 'failed',
+        slackUserId: null,
+        slackUserName: null,
+        message: 'not installed',
+        authorizeUrl: null,
+        reason: 'not-installed',
+        installUrl: 'https://hook.example.test/slack/install?team=TEAM_A',
+        teamName: null,
+      },
+    };
+    ipc.get.mockResolvedValue({ hook: awaitingInstall });
+
+    render(<HookConnectionsSection />);
+    await waitFor(() => expect(dialog.confirm).toHaveBeenCalledOnce());
+    await act(async () => {
+      pushStatus?.({ ...BASE_HOOK, enabled: true, status: 'connected' });
+      await Promise.resolve();
+    });
+    act(() => {
+      pushStatus?.(awaitingInstall);
+    });
+    await waitFor(() => expect(dialog.confirm).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      confirmResolvers[0]?.(true);
+      await Promise.resolve();
+    });
+    expect(ipc.openExternal).not.toHaveBeenCalled();
+
+    await act(async () => {
+      confirmResolvers[1]?.(true);
+      await Promise.resolve();
+    });
+    expect(ipc.openExternal).toHaveBeenCalledOnce();
+  });
+
+  it('offers a direct Slack reauthorization action after single-workspace authorization is denied', async () => {
+    ipc.get.mockResolvedValue({
+      hook: {
+        ...BASE_HOOK,
+        status: 'connected',
+        binding: {
+          state: 'denied',
+          slackUserId: null,
+          slackUserName: null,
+          message: 'server-specific cancellation text',
+          authorizeUrl: null,
+          reason: null,
+          installUrl: null,
+          teamName: null,
+        },
+      },
+    });
+
+    render(<HookConnectionsSection />);
+    await expandChannelCard(SLACK_CARD);
+    expect(
+      await screen.findByText('settings.remoteControl.hook.binding.state.denied'),
+    ).toBeTruthy();
+    expect(screen.queryByText('server-specific cancellation text')).toBeNull();
+    expect(within(document.getElementById('cindy-im-slack')!).getByRole('status').textContent).toBe(
+      'settings.remoteControl.hook.status.disabled',
+    );
+    expect(tCalls).toContainEqual({
+      key: 'settings.remoteControl.hook.accountStatus',
+      vars: { status: 'settings.remoteControl.hook.statusUnbound' },
+    });
+    fireEvent.click(
+      await screen.findByRole('button', {
+        name: 'settings.remoteControl.hook.binding.reauthorize',
+      }),
+    );
+
+    await waitFor(() => expect(ipc.setEnabled).toHaveBeenCalledWith(true));
+    expect(ipc.addBinding).not.toHaveBeenCalled();
+  });
+
+  it('keeps the confirmed Slack account visible while the transport reconnects', async () => {
+    ipc.get.mockResolvedValue({
+      hook: {
+        ...BASE_HOOK,
+        enabled: true,
+        status: 'connecting',
+        binding: {
+          state: 'confirmed',
+          slackUserId: 'USER_BOUND',
+          slackUserName: 'bound-user',
+          message: null,
+          authorizeUrl: null,
+          reason: null,
+          installUrl: null,
+          teamName: 'Bound workspace',
+        },
+      },
+    });
+
+    render(<HookConnectionsSection />);
+    await waitFor(() =>
+      expect(tCalls).toContainEqual({
+        key: 'settings.remoteControl.hook.accountStatus',
+        vars: { status: 'settings.remoteControl.hook.statusBoundTeam' },
+      }),
+    );
+    expect(within(document.getElementById('cindy-im-slack')!).getByRole('status').textContent).toBe(
+      'settings.remoteControl.hook.status.connecting',
+    );
+  });
+
+  it('keeps active Slack workspaces visible while the multi-workspace transport is offline', async () => {
+    ipc.get.mockResolvedValue({
+      hook: {
+        ...BASE_HOOK,
+        enabled: true,
+        status: 'error',
+        lastError: 'network unavailable',
+        serverMultiTeam: true,
+        bindings: [
+          {
+            teamId: 'TEAM_BOUND',
+            teamName: 'Bound workspace',
+            slackUserId: 'USER_BOUND',
+            slackUserName: 'bound-user',
+            displaced: false,
+          },
+        ],
+      },
+    });
+
+    render(<HookConnectionsSection />);
+    await waitFor(() =>
+      expect(tCalls).toContainEqual({
+        key: 'settings.remoteControl.hook.accountStatus',
+        vars: { status: 'settings.remoteControl.hook.statusBoundTeam' },
+      }),
+    );
+    expect(within(document.getElementById('cindy-im-slack')!).getByRole('status').textContent).toBe(
+      'settings.remoteControl.hook.status.error',
+    );
+  });
+
+  it('allows only one Slack reauthorization request while the action is in flight', async () => {
+    let resolveEnable: ((value: { hook: SlackHookView }) => void) | undefined;
+    ipc.setEnabled.mockReturnValue(
+      new Promise<{ hook: SlackHookView }>((resolve) => {
+        resolveEnable = resolve;
+      }),
+    );
+    ipc.get.mockResolvedValue({
+      hook: {
+        ...BASE_HOOK,
+        status: 'connected',
+        binding: {
+          state: 'expired',
+          slackUserId: null,
+          slackUserName: null,
+          message: null,
+          authorizeUrl: null,
+          reason: null,
+          installUrl: null,
+          teamName: null,
+        },
+      },
+    });
+
+    render(<HookConnectionsSection />);
+    await expandChannelCard(SLACK_CARD);
+    const button = await screen.findByRole('button', {
+      name: 'settings.remoteControl.hook.binding.reauthorize',
+    });
+    fireEvent.click(button);
+    fireEvent.click(button);
+
+    expect(ipc.setEnabled).toHaveBeenCalledTimes(1);
+    expect(button).toHaveProperty('disabled', true);
+    expect(button.getAttribute('aria-busy')).toBe('true');
+    // The button is disabled while the action is in flight, so it must not be focusable.
+    button.focus();
+    expect(document.activeElement).not.toBe(button);
+    await act(async () => {
+      resolveEnable?.({ hook: BASE_HOOK });
+      await Promise.resolve();
+    });
+  });
+
+  it('does not let a stale reauthorization reply replace a newer Slack push', async () => {
+    let pushStatus: ((view: SlackHookView) => void) | undefined;
+    let resolveEnable: ((value: { hook: SlackHookView }) => void) | undefined;
+    const deniedHook: SlackHookView = {
+      ...BASE_HOOK,
+      status: 'connected',
+      binding: {
+        state: 'denied',
+        slackUserId: null,
+        slackUserName: null,
+        message: null,
+        authorizeUrl: null,
+        reason: null,
+        installUrl: null,
+        teamName: null,
+      },
+    };
+    ipc.get.mockResolvedValue({ hook: deniedHook });
+    ipc.setEnabled.mockReturnValue(
+      new Promise<{ hook: SlackHookView }>((resolve) => {
+        resolveEnable = resolve;
+      }),
+    );
+    ipc.onStatusChanged.mockImplementation((listener: (view: SlackHookView) => void) => {
+      pushStatus = listener;
+      return () => {};
+    });
+
+    render(<HookConnectionsSection />);
+    await expandChannelCard(SLACK_CARD);
+    fireEvent.click(
+      await screen.findByRole('button', {
+        name: 'settings.remoteControl.hook.binding.reauthorize',
+      }),
+    );
+    act(() => {
+      pushStatus?.({
+        ...BASE_HOOK,
+        enabled: true,
+        status: 'connected',
+        binding: {
+          state: 'confirmed',
+          slackUserId: 'USER_NEW',
+          slackUserName: 'new-user',
+          message: null,
+          authorizeUrl: null,
+          reason: null,
+          installUrl: null,
+          teamName: 'New workspace',
+        },
+      });
+    });
+    await act(async () => {
+      resolveEnable?.({ hook: deniedHook });
+      await Promise.resolve();
+    });
+
+    expect(
+      screen.queryByRole('button', {
+        name: 'settings.remoteControl.hook.binding.reauthorize',
+      }),
+    ).toBeNull();
+  });
+
+  it('restarts the initial multi-workspace authorization through the existing enable flow', async () => {
+    const denied = {
+      state: 'denied' as const,
+      message: null,
+      authorizeUrl: null,
+      reason: null,
+      installUrl: null,
+      teamId: null,
+      intent: 'add',
+    };
+    ipc.get.mockResolvedValue({
+      hook: {
+        ...BASE_HOOK,
+        status: 'connected',
+        serverMultiTeam: true,
+        pendingBind: denied,
+        binding: {
+          ...denied,
+          slackUserId: null,
+          slackUserName: null,
+          teamName: null,
+        },
+      },
+    });
+
+    render(<HookConnectionsSection />);
+    await expandChannelCard(SLACK_CARD);
+    fireEvent.click(
+      await screen.findByRole('button', {
+        name: 'settings.remoteControl.hook.binding.reauthorize',
+      }),
+    );
+
+    await waitFor(() => expect(ipc.setEnabled).toHaveBeenCalledWith(true));
+    expect(ipc.addBinding).not.toHaveBeenCalled();
+  });
+
+  it('retries a failed additional Slack workspace without disturbing active bindings', async () => {
+    const denied = {
+      state: 'denied' as const,
+      message: null,
+      authorizeUrl: null,
+      reason: null,
+      installUrl: null,
+      teamId: null,
+      intent: 'add',
+    };
+    ipc.get.mockResolvedValue({
+      hook: {
+        ...BASE_HOOK,
+        enabled: true,
+        status: 'connected',
+        serverMultiTeam: true,
+        bindings: [
+          {
+            teamId: 'TEAM_ACTIVE',
+            teamName: 'Active workspace',
+            slackUserId: 'USER_ACTIVE',
+            slackUserName: 'active-user',
+            displaced: false,
+          },
+        ],
+        pendingBind: denied,
+        binding: {
+          ...denied,
+          slackUserId: null,
+          slackUserName: null,
+          teamName: null,
+        },
+      },
+    });
+
+    render(<HookConnectionsSection />);
+    await expandChannelCard(SLACK_CARD);
+    fireEvent.click(
+      await screen.findByRole('button', {
+        name: 'settings.remoteControl.hook.binding.reauthorize',
+      }),
+    );
+
+    await waitFor(() => expect(ipc.addBinding).toHaveBeenCalledOnce());
+    expect(ipc.setEnabled).not.toHaveBeenCalled();
+  });
+
+  it('retries a pinned Slack workspace authorization with rebindTeam', async () => {
+    const denied = {
+      state: 'denied' as const,
+      message: null,
+      authorizeUrl: null,
+      reason: null,
+      installUrl: null,
+      teamId: 'TEAM_PINNED',
+      intent: 'rebind',
+    };
+    ipc.get.mockResolvedValue({
+      hook: {
+        ...BASE_HOOK,
+        enabled: true,
+        status: 'connected',
+        serverMultiTeam: true,
+        bindings: [
+          {
+            teamId: 'TEAM_ACTIVE',
+            teamName: 'Active workspace',
+            slackUserId: 'USER_ACTIVE',
+            slackUserName: 'active-user',
+            displaced: false,
+          },
+        ],
+        pendingBind: denied,
+        binding: {
+          ...denied,
+          slackUserId: null,
+          slackUserName: null,
+          teamName: null,
+        },
+      },
+    });
+
+    render(<HookConnectionsSection />);
+    await expandChannelCard(SLACK_CARD);
+    fireEvent.click(
+      await screen.findByRole('button', {
+        name: 'settings.remoteControl.hook.binding.reauthorize',
+      }),
+    );
+
+    await waitFor(() => expect(ipc.rebindTeam).toHaveBeenCalledWith('TEAM_PINNED'));
+    expect(ipc.addBinding).not.toHaveBeenCalled();
+    expect(ipc.setEnabled).not.toHaveBeenCalled();
+  });
+
+  // The server may include the collided teamId in an add failure; that identity
+  // describes the conflict, not a request to pin the next OAuth flow to that team.
+  it('re-runs the add flow instead of rebinding when an add attempt fails as already-bound', async () => {
+    const alreadyBound = {
+      state: 'failed' as const,
+      message: null,
+      authorizeUrl: null,
+      reason: 'already-bound',
+      installUrl: null,
+      teamId: 'TEAM_ACTIVE',
+      intent: 'add',
+    };
+    ipc.get.mockResolvedValue({
+      hook: {
+        ...BASE_HOOK,
+        enabled: true,
+        status: 'connected',
+        serverMultiTeam: true,
+        bindings: [
+          {
+            teamId: 'TEAM_ACTIVE',
+            teamName: 'Active workspace',
+            slackUserId: 'USER_ACTIVE',
+            slackUserName: 'active-user',
+            displaced: false,
+          },
+        ],
+        pendingBind: alreadyBound,
+        binding: {
+          ...alreadyBound,
+          slackUserId: null,
+          slackUserName: null,
+          teamName: null,
+        },
+      },
+    });
+
+    render(<HookConnectionsSection />);
+    await expandChannelCard(SLACK_CARD);
+    fireEvent.click(
+      await screen.findByRole('button', {
+        name: 'settings.remoteControl.hook.binding.reauthorize',
+      }),
+    );
+
+    await waitFor(() => expect(ipc.addBinding).toHaveBeenCalledOnce());
+    expect(ipc.rebindTeam).not.toHaveBeenCalled();
+    expect(ipc.setEnabled).not.toHaveBeenCalled();
+  });
+
+  // An add attempt that ends denied/expired/failed also carries the collided
+  // teamId from the server reply; the retry must stay in the add flow so the
+  // user can pick a different workspace, not pin the OAuth page to that team.
+  it('keeps the retry in the add flow when a terminal add state echoes a teamId', async () => {
+    const deniedWithTeam = {
+      state: 'denied' as const,
+      message: null,
+      authorizeUrl: null,
+      reason: null,
+      installUrl: null,
+      teamId: 'TEAM_ECHOED',
+      intent: 'add' as const,
+    };
+    ipc.get.mockResolvedValue({
+      hook: {
+        ...BASE_HOOK,
+        enabled: true,
+        status: 'connected',
+        serverMultiTeam: true,
+        bindings: [
+          {
+            teamId: 'TEAM_ACTIVE',
+            teamName: 'Active workspace',
+            slackUserId: 'USER_ACTIVE',
+            slackUserName: 'active-user',
+            displaced: false,
+          },
+        ],
+        pendingBind: deniedWithTeam,
+        binding: {
+          ...deniedWithTeam,
+          slackUserId: null,
+          slackUserName: null,
+          teamName: null,
+        },
+      },
+    });
+
+    render(<HookConnectionsSection />);
+    await expandChannelCard(SLACK_CARD);
+    fireEvent.click(
+      await screen.findByRole('button', {
+        name: 'settings.remoteControl.hook.binding.reauthorize',
+      }),
+    );
+
+    await waitFor(() => expect(ipc.addBinding).toHaveBeenCalledOnce());
+    expect(ipc.rebindTeam).not.toHaveBeenCalled();
+    expect(ipc.setEnabled).not.toHaveBeenCalled();
+  });
+
+  it('blocks conflicting Slack authorization controls while reauthorization is in flight', async () => {
+    let resolveAdd: ((value: { hook: SlackHookView }) => void) | undefined;
+    ipc.addBinding.mockReturnValue(
+      new Promise<{ hook: SlackHookView }>((resolve) => {
+        resolveAdd = resolve;
+      }),
+    );
+    const denied = {
+      state: 'denied' as const,
+      message: null,
+      authorizeUrl: null,
+      reason: null,
+      installUrl: null,
+      teamId: null,
+      intent: 'add',
+    };
+    ipc.get.mockResolvedValue({
+      hook: {
+        ...BASE_HOOK,
+        enabled: true,
+        status: 'connected',
+        serverMultiTeam: true,
+        bindings: [
+          {
+            teamId: 'TEAM_ACTIVE',
+            teamName: 'Active workspace',
+            slackUserId: 'USER_ACTIVE',
+            slackUserName: 'active-user',
+            displaced: false,
+          },
+        ],
+        pendingBind: denied,
+        binding: {
+          ...denied,
+          slackUserId: null,
+          slackUserName: null,
+          teamName: null,
+        },
+      },
+    });
+
+    render(<HookConnectionsSection />);
+    await expandChannelCard(SLACK_CARD);
+    fireEvent.click(
+      await screen.findByRole('button', {
+        name: 'settings.remoteControl.hook.binding.reauthorize',
+      }),
+    );
+    const toggle = screen.getByRole('switch', {
+      name: 'settings.remoteControl.hook.toggleAria',
+    });
+    const addWorkspace = screen.getByRole('button', {
+      name: 'settings.remoteControl.hook.multi.addWorkspace',
+    });
+    const dismiss = screen.getByRole('button', {
+      name: 'settings.remoteControl.hook.multi.dismiss',
+    });
+    expect(toggle).toHaveProperty('disabled', true);
+    expect(addWorkspace).toHaveProperty('disabled', true);
+    expect(dismiss).toHaveProperty('disabled', true);
+    fireEvent.click(toggle);
+    fireEvent.click(addWorkspace);
+    fireEvent.click(dismiss);
+
+    expect(ipc.addBinding).toHaveBeenCalledTimes(1);
+    expect(ipc.setEnabled).not.toHaveBeenCalled();
+    expect(ipc.cancelPendingBind).not.toHaveBeenCalled();
+    await act(async () => {
+      resolveAdd?.({ hook: BASE_HOOK });
+      await Promise.resolve();
+    });
+  });
+
+  it('unlocks Slack reauthorization after an IPC failure', async () => {
+    ipc.setEnabled
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockResolvedValueOnce({ hook: BASE_HOOK });
+    ipc.get.mockResolvedValue({
+      hook: {
+        ...BASE_HOOK,
+        status: 'connected',
+        binding: {
+          state: 'expired',
+          slackUserId: null,
+          slackUserName: null,
+          message: null,
+          authorizeUrl: null,
+          reason: null,
+          installUrl: null,
+          teamName: null,
+        },
+      },
+    });
+
+    render(<HookConnectionsSection />);
+    await expandChannelCard(SLACK_CARD);
+    fireEvent.click(
+      await screen.findByRole('button', {
+        name: 'settings.remoteControl.hook.binding.reauthorize',
+      }),
+    );
+    await waitFor(() => expect(toast.error).toHaveBeenCalledOnce());
+    fireEvent.click(
+      await screen.findByRole('button', {
+        name: 'settings.remoteControl.hook.binding.reauthorize',
+      }),
+    );
+
+    await waitFor(() => expect(ipc.setEnabled).toHaveBeenCalledTimes(2));
+  });
+
+  it('shows the actionable Telegram transport error instead of only a generic failure', async () => {
+    ipc.get.mockResolvedValue({
+      hook: {
+        ...BASE_HOOK,
+        telegram: {
+          ...BASE_HOOK.telegram,
+          status: 'error',
+          lastError: 'Unexpected server response: 503',
+        },
+      },
+    });
+
+    render(<HookConnectionsSection />);
+    await expandChannelCard(TELEGRAM_CARD);
+
+    expect(await screen.findByText('Unexpected server response: 503')).toBeTruthy();
+  });
+
+  it('does not let a delayed initial snapshot overwrite a newer pushed binding state', async () => {
+    let resolveGet: ((value: { hook: SlackHookView }) => void) | undefined;
+    let pushStatus: ((view: SlackHookView) => void) | undefined;
+    ipc.get.mockReturnValue(
+      new Promise<{ hook: SlackHookView }>((resolve) => {
+        resolveGet = resolve;
+      }),
+    );
+    ipc.onStatusChanged.mockImplementation((listener: (view: SlackHookView) => void) => {
+      pushStatus = listener;
+      return () => {};
+    });
+
+    render(<HookConnectionsSection />);
+    await waitFor(() => expect(pushStatus).toBeTypeOf('function'));
+    act(() => {
+      pushStatus?.({
+        ...BASE_HOOK,
+        telegram: {
+          ...BASE_HOOK.telegram,
+          binding: {
+            provider: 'telegram',
+            state: 'awaiting_confirmation',
+            attemptId: 'attempt-new',
+            bindingId: null,
+            principalId: 'telegram-user-1',
+            principalName: 'Cindy User',
+            scopeId: 'bot-1',
+            scopeName: 'cindy_example_bot',
+            connectUrl: 'https://t.me/cindy_example_bot?start=one-time-token',
+            bindCode: null,
+            expiresAt: Date.now() + 60_000,
+            reason: null,
+            remediationUrl: null,
+            actions: ['open_connect_url', 'copy_connect_url', 'cancel'],
+          },
+        },
+      });
+    });
+    await expandChannelCard(TELEGRAM_CARD);
+    expect(
+      await screen.findByRole('button', {
+        name: 'settings.remoteControl.hook.telegram.cancel',
+      }),
+    ).toBeTruthy();
+
+    await act(async () => {
+      resolveGet?.({ hook: BASE_HOOK });
+      await Promise.resolve();
+    });
+    expect(
+      screen.queryByRole('button', {
+        name: 'settings.remoteControl.hook.telegram.connect',
+      }),
+    ).toBeNull();
+    expect(
+      screen.getByRole('button', {
+        name: 'settings.remoteControl.hook.telegram.cancel',
+      }),
+    ).toBeTruthy();
+  });
+
+  it('does not let an older action reply overwrite a newer local action reply', async () => {
+    let resolveFirst: ((value: { hook: SlackHookView }) => void) | undefined;
+    let resolveSecond: ((value: { hook: SlackHookView }) => void) | undefined;
+    ipc.get.mockResolvedValue({ hook: BASE_HOOK });
+    ipc.providerBindStart
+      .mockReturnValueOnce(
+        new Promise<{ hook: SlackHookView }>((resolve) => {
+          resolveFirst = resolve;
+        }),
+      )
+      .mockReturnValueOnce(
+        new Promise<{ hook: SlackHookView }>((resolve) => {
+          resolveSecond = resolve;
+        }),
+      );
+
+    render(<HookConnectionsSection />);
+    await expandChannelCard(TELEGRAM_CARD);
+    const connect = await screen.findByRole('button', {
+      name: 'settings.remoteControl.hook.telegram.connect',
+    });
+    fireEvent.click(connect);
+    fireEvent.click(connect);
+    expect(ipc.providerBindStart).toHaveBeenCalledTimes(2);
+
+    const pendingHook: SlackHookView = {
+      ...BASE_HOOK,
+      telegram: {
+        ...BASE_HOOK.telegram,
+        binding: {
+          provider: 'telegram',
+          state: 'pending',
+          attemptId: 'attempt-new',
+          bindingId: null,
+          principalId: null,
+          principalName: null,
+          scopeId: 'bot-1',
+          scopeName: 'cindy_example_bot',
+          connectUrl: 'https://t.me/cindy_example_bot?start=one-time-token',
+          bindCode: null,
+          expiresAt: Date.now() + 60_000,
+          reason: null,
+          remediationUrl: null,
+          actions: ['open_connect_url', 'copy_connect_url', 'cancel'],
+        },
+      },
+    };
+    await act(async () => {
+      resolveSecond?.({ hook: pendingHook });
+      await Promise.resolve();
+    });
+    expect(
+      await screen.findByRole('button', {
+        name: 'settings.remoteControl.hook.telegram.cancel',
+      }),
+    ).toBeTruthy();
+
+    await act(async () => {
+      resolveFirst?.({ hook: BASE_HOOK });
+      await Promise.resolve();
+    });
+    expect(
+      screen.queryByRole('button', {
+        name: 'settings.remoteControl.hook.telegram.connect',
+      }),
+    ).toBeNull();
+    expect(
+      screen.getByRole('button', {
+        name: 'settings.remoteControl.hook.telegram.cancel',
+      }),
+    ).toBeTruthy();
+  });
+
+  it('does not unlink a replacement Telegram binding from a stale confirmation', async () => {
+    let pushStatus: ((view: SlackHookView) => void) | undefined;
+    let resolveConfirm: ((value: boolean) => void) | undefined;
+    dialog.confirm.mockReturnValue(
+      new Promise<boolean>((resolve) => {
+        resolveConfirm = resolve;
+      }),
+    );
+    ipc.onStatusChanged.mockImplementation((listener: (view: SlackHookView) => void) => {
+      pushStatus = listener;
+      return () => {};
+    });
+    const confirmed = (bindingId: string): SlackHookView => ({
+      ...BASE_HOOK,
+      telegram: {
+        ...BASE_HOOK.telegram,
+        binding: {
+          provider: 'telegram',
+          state: 'confirmed',
+          attemptId: null,
+          bindingId,
+          principalId: `user-${bindingId}`,
+          principalName: 'Cindy User',
+          scopeId: 'bot-1',
+          scopeName: 'cindy_example_bot',
+          connectUrl: null,
+          bindCode: null,
+          expiresAt: null,
+          reason: null,
+          remediationUrl: 'https://t.me/cindy_example_bot',
+          actions: ['revoke'],
+        },
+      },
+    });
+    ipc.get.mockResolvedValue({ hook: confirmed('binding-1') });
+
+    render(<HookConnectionsSection />);
+    await expandChannelCard(TELEGRAM_CARD);
+    fireEvent.click(
+      await screen.findByRole('button', {
+        name: 'settings.remoteControl.hook.telegram.unlink',
+      }),
+    );
+    await waitFor(() => expect(dialog.confirm).toHaveBeenCalledOnce());
+
+    act(() => {
+      pushStatus?.(confirmed('binding-2'));
+    });
+    await act(async () => {
+      resolveConfirm?.(true);
+      await Promise.resolve();
+    });
+
+    expect(ipc.providerBindRevoke).not.toHaveBeenCalled();
+  });
+
+  it('官方 Telegram 卡不再有「新对话配置」, 行为与群设置在绑定后出现', async () => {
+    ipc.get.mockResolvedValue({
+      hook: {
+        ...BASE_HOOK,
+        telegram: {
+          ...BASE_HOOK.telegram,
+          behaviorAvailable: true,
+          binding: {
+            provider: 'telegram',
+            state: 'confirmed',
+            attemptId: null,
+            bindingId: 'binding-settings',
+            principalId: '12345',
+            principalName: 'Cindy User',
+            scopeId: 'bot-1',
+            scopeName: 'cindy_example_bot',
+            connectUrl: null,
+            bindCode: null,
+            expiresAt: null,
+            reason: null,
+            remediationUrl: 'https://t.me/cindy_example_bot',
+            actions: ['revoke'],
+          },
+        },
+      },
+    });
+
+    render(<HookConnectionsSection />);
+    await expandChannelCard(TELEGRAM_CARD);
+    expect(screen.getByTestId('telegram-behavior').getAttribute('data-binding-id')).toBe(
+      'binding-settings',
+    );
+    // 它与目录行的 agent/model/effort 是同一份配置的两个入口, 画成平级两套只会
+    // 让人以为可以分别设 —— global scope 仍是目录行的兜底, 只是不再有 UI 入口。
+    expect(screen.queryByTestId('im-defaults-global')).toBeNull();
+    expect(screen.getByTestId('telegram-groups').getAttribute('data-binding-id')).toBe(
+      'binding-settings',
+    );
+  });
+
+  it('老服务端(无 behavior 能力)时不渲染行为/群设置, 也不回退出「新对话配置」', async () => {
+    ipc.get.mockResolvedValue({
+      hook: {
+        ...BASE_HOOK,
+        telegram: {
+          ...BASE_HOOK.telegram,
+          behaviorAvailable: false,
+          binding: {
+            provider: 'telegram',
+            state: 'confirmed',
+            attemptId: null,
+            bindingId: 'legacy-binding',
+            principalId: '12345',
+            principalName: 'Cindy User',
+            scopeId: 'bot-1',
+            scopeName: 'cindy_example_bot',
+            connectUrl: null,
+            bindCode: null,
+            expiresAt: null,
+            reason: null,
+            remediationUrl: 'https://t.me/cindy_example_bot',
+            actions: ['revoke'],
+          },
+        },
+      },
+    });
+
+    render(<HookConnectionsSection />);
+    await expandChannelCard(TELEGRAM_CARD);
+    // 卡确实展开了(目录区渲染出来了), 只是没有行为/群设置那两块
+    expect(await screen.findAllByRole('radio')).not.toHaveLength(0);
+    expect(screen.queryByTestId('telegram-behavior')).toBeNull();
+    expect(screen.queryByTestId('telegram-groups')).toBeNull();
+    expect(screen.queryByTestId('im-defaults-global')).toBeNull();
+  });
+
+  it('does not remove a changed Slack binding from a stale confirmation', async () => {
+    let pushStatus: ((view: SlackHookView) => void) | undefined;
+    let resolveConfirm: ((value: boolean) => void) | undefined;
+    dialog.confirm.mockReturnValue(
+      new Promise<boolean>((resolve) => {
+        resolveConfirm = resolve;
+      }),
+    );
+    ipc.onStatusChanged.mockImplementation((listener: (view: SlackHookView) => void) => {
+      pushStatus = listener;
+      return () => {};
+    });
+    const withBinding = (displaced: boolean): SlackHookView => ({
+      ...BASE_HOOK,
+      enabled: true,
+      status: 'connected',
+      serverMultiTeam: true,
+      bindings: [
+        {
+          teamId: 'team-1',
+          teamName: 'Cindy Team',
+          slackUserId: 'user-1',
+          slackUserName: 'Cindy User',
+          displaced,
+        },
+      ],
+    });
+    ipc.get.mockResolvedValue({ hook: withBinding(false) });
+
+    render(<HookConnectionsSection />);
+    await expandChannelCard(SLACK_CARD);
+    fireEvent.click(
+      await screen.findByRole('button', {
+        name: 'settings.remoteControl.hook.multi.removeAria',
+      }),
+    );
+    await waitFor(() => expect(dialog.confirm).toHaveBeenCalledOnce());
+
+    act(() => {
+      pushStatus?.(withBinding(true));
+    });
+    await act(async () => {
+      resolveConfirm?.(true);
+      await Promise.resolve();
+    });
+
+    expect(ipc.revokeTeam).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { name: 'server capability lost', supported: false, enabled: true, removes: false },
+    { name: 'communication disabled', supported: true, enabled: false, removes: false },
+    { name: 'communication grant removed', supported: true, enabled: undefined, removes: false },
+    { name: 'unchanged grant', supported: true, enabled: true, removes: true },
+  ])('rechecks Slack removal confirmation: $name', async ({ supported, enabled, removes }) => {
+    let pushStatus: ((view: SlackHookView) => void) | undefined;
+    let resolveConfirm: ((value: boolean) => void) | undefined;
+    dialog.confirm.mockReturnValue(new Promise<boolean>((resolve) => { resolveConfirm = resolve; }));
+    ipc.onStatusChanged.mockImplementation((listener: (view: SlackHookView) => void) => {
+      pushStatus = listener;
+      return () => {};
+    });
+    const initial: SlackHookView = {
+      ...BASE_HOOK,
+      enabled: true,
+      status: 'connected',
+      serverMultiTeam: true,
+      serverSlackCommunications: true,
+      bindings: [{
+        teamId: 'team-1', teamName: 'Cindy Team', slackUserId: 'user-1',
+        slackUserName: 'Cindy User', displaced: true, communicationsEnabled: true,
+      }],
+    };
+    ipc.get.mockResolvedValue({ hook: initial });
+    render(<HookConnectionsSection />);
+    await expandChannelCard(SLACK_CARD);
+    fireEvent.click(await screen.findByRole('button', {
+      name: 'settings.remoteControl.hook.multi.removeAria',
+    }));
+    await waitFor(() => expect(dialog.confirm).toHaveBeenCalledOnce());
+    expect(dialog.confirm).toHaveBeenCalledWith(expect.objectContaining({
+      description: 'settings.remoteControl.hook.multi.removeCommunicationsConfirmDescription',
+    }));
+    act(() => {
+      pushStatus?.({
+        ...initial,
+        serverSlackCommunications: supported,
+        bindings: [{ ...initial.bindings[0], communicationsEnabled: enabled }],
+      });
+    });
+    await act(async () => { resolveConfirm?.(true); });
+    if (removes) {
+      expect(ipc.revokeTeam).toHaveBeenCalledExactlyOnceWith('team-1');
+    } else {
+      expect(ipc.revokeTeam).not.toHaveBeenCalled();
+    }
+  });
+
+  // 规则: 默认项目所有官方机器人共用一个(Telegram / 飞书 / X 都按它落任务)。
+  // 生产入口: 设置页的项目区块。可观察结果: 只有一组单选, 选中项就是共用的默认项目,
+  // 点另一行只发一次写入。tier: unit(jsdom)。
+  it('默认项目是项目区块里唯一的一组单选, 各渠道卡里不再各有一个', async () => {
+    const lane = {
+      enabled: true,
+      url: 'wss://x-hook.example.test',
+      status: 'connected' as const,
+      lastError: null,
+      available: true,
+      capabilityPending: false,
+      defaultWorkspace: null,
+      binding: null,
+    };
+    const hook: SlackHookView = {
+      ...BASE_HOOK,
+      workspaces: { cindy: '/code/cindy' },
+      x: lane,
+      telegram: { ...lane, url: 'wss://tg-hook.example.test' },
+    };
+    ipc.get.mockResolvedValue({ hook });
+
+    render(<HookConnectionsSection />);
+    // 「对话」+ 一个真实项目
+    const radios = await screen.findAllByRole('radio');
+    expect(radios).toHaveLength(2);
+    expect(radios[0].getAttribute('aria-checked')).toBe('true');
+    expect(radios[1].getAttribute('aria-checked')).toBe('false');
+    await expandChannelCard(X_CARD);
+    await expandChannelCard(TELEGRAM_CARD);
+    expect(screen.getAllByRole('radio')).toHaveLength(2);
+
+    fireEvent.click(radios[1]);
+    await waitFor(() => expect(ipc.setProviderDefaultWorkspace).toHaveBeenCalledTimes(1));
+    expect(ipc.setProviderDefaultWorkspace.mock.calls[0][1]).toBe('cindy');
+  });
+
+  /** 目录清单 + 两条 provider lane 的 hook 视图(默认目录相关用例共用)。 */
+  function hookWithWorkdirs(
+    telegramDefault: string | null,
+    opts: { telegramEnabled?: boolean } = {},
+  ): SlackHookView {
+    const lane = {
+      enabled: true,
+      url: 'wss://tg-hook.example.test',
+      status: 'connected' as const,
+      lastError: null,
+      available: true,
+      capabilityPending: false,
+      defaultWorkspace: telegramDefault,
+      binding: null,
+    };
+    return {
+      ...BASE_HOOK,
+      workspaces: { cindy: '/Users/dash/Code/cindy', blog: '/Users/dash/Code/blog' },
+      telegram: { ...lane, enabled: opts.telegramEnabled ?? true },
+      x: { ...lane, url: 'wss://x-hook.example.test', defaultWorkspace: null },
+    };
+  }
+
+  it('方向键能在目录之间切换默认工作目录(roving tabIndex 之外还要能换项)', async () => {
+    // 只给 roving tabIndex 的话, 键盘用户 Tab 进组后其余项都是 tabIndex=-1,
+    // 没有方向键处理就再也切不动 —— 这一条锁住 WAI-ARIA radio group 的换项行为。
+    ipc.get.mockResolvedValue({ hook: hookWithWorkdirs(null) });
+    render(<HookConnectionsSection />);
+    await expandChannelCard(TELEGRAM_CARD);
+
+    const radios = await screen.findAllByRole('radio');
+    expect(radios).toHaveLength(3); // 对话 + cindy + blog
+    radios[0].focus();
+    // 从 radio 自身派发(真实路径: 焦点在 radio 上按键), 事件冒泡到组容器。
+    fireEvent.keyDown(radios[0], { key: 'ArrowDown' });
+    await waitFor(() => expect(ipc.setProviderDefaultWorkspace).toHaveBeenCalledTimes(1));
+    expect(ipc.setProviderDefaultWorkspace.mock.calls[0][1]).toBe('cindy');
+    // 焦点也要跟过去, 否则连按方向键只会在原处反复触发同一项
+    expect(document.activeElement).toBe(radios[1]);
+  });
+
+  // 规则(2026-11-13): 机器人可选的项目就是侧栏的本机项目, 设置页不再有单独的目录映射。
+  // 生产入口: 渠道卡里的项目区块。可观察结果: 列出的是项目名与目录(不可在此改名 / 删除),
+  // 「添加项目」把选中的文件夹交给 main 登记, 并用返回的清单刷新页面。
+  it('项目区块列出侧栏项目且不可在此改名; 添加项目走 addProject 并刷新清单', async () => {
+    ipc.get.mockResolvedValue({ hook: hookWithWorkdirs('cindy') });
+    ipc.showOpenDirectoryDialog.mockResolvedValue({ canceled: false, path: '/code/new-project' });
+    ipc.addProject.mockResolvedValue({
+      hook: { ...hookWithWorkdirs('cindy'), workspaces: { 'new-project': '/code/new-project' } },
+    });
+    render(<HookConnectionsSection />);
+    await expandChannelCard(TELEGRAM_CARD);
+    await screen.findAllByRole('radio');
+
+    expect(screen.getByText('cindy')).toBeTruthy();
+    expect(screen.queryByDisplayValue('cindy')).toBeNull();
+
+    fireEvent.click(
+      screen.getByRole('button', { name: 'settings.remoteControl.hook.form.addProject' }),
+    );
+    await waitFor(() => expect(ipc.addProject).toHaveBeenCalledWith('/code/new-project'));
+    expect(await screen.findByText('new-project')).toBeTruthy();
+    expect(screen.queryByText('blog')).toBeNull();
+  });
+
+  // 规则(2026-11-13): 旧版「新对话配置」留下的全局默认在升级时由 main 直接清掉, 设置页不再有
+  // 让用户自己「恢复默认」的提示。可观察结果: 即使读到的全局默认仍是改过的, 页面也不出现那条
+  // 提示与恢复按钮, 更不会代用户发起重置。最小失败输入: 读到一份改过的全局默认。tier: unit(jsdom)。
+  it('设置页不再提示旧版全局默认, 也不从界面发起重置', async () => {
+    ipc.get.mockResolvedValue({ hook: hookWithWorkdirs(null) });
+    ipc.imDefaultSettingsGet.mockResolvedValue({
+      isCustomized: true,
+      customizedKeys: ['agentKind'],
+      agentKind: 'codex',
+      agents: {},
+    });
+    render(<HookConnectionsSection />);
+    await expandChannelCard(TELEGRAM_CARD);
+    await screen.findAllByRole('radio');
+    expect(screen.queryByTestId('hook-legacy-global-defaults')).toBeNull();
+    expect(ipc.imDefaultSettingsReset).not.toHaveBeenCalled();
+  });
+
+  /**
+   * 「服务端已开放端点、但用户还没打开开关」的 X 卡 —— 评估阶段的真实形态。
+   *
+   * 不能直接用 BASE_HOOK: 它的 x.url 是空串, 而空端点会让整张卡不渲染
+   * (见上面「hides the X card entirely while the endpoint manifest leaves
+   * xHookWsUrl empty」那条), 于是用法与风险小节根本没有宿主。
+   */
+  function xUnboundHook(): SlackHookView {
+    return {
+      ...BASE_HOOK,
+      x: { ...BASE_HOOK.x, url: 'wss://x-hook.example.test' },
+    };
+  }
+
+  /** confirmed 态的 X binding, 只有 principalId 不同(确认门按它记账)。 */
+  function xConfirmedHook(principalId: string): SlackHookView {
+    return {
+      ...BASE_HOOK,
+      x: {
+        enabled: true,
+        url: 'wss://x-hook.example.test',
+        status: 'connected',
+        lastError: null,
+        available: true,
+        capabilityPending: false,
+        defaultWorkspace: null,
+        binding: {
+          provider: 'x',
+          state: 'confirmed',
+          attemptId: null,
+          bindingId: `x-binding-${principalId}`,
+          principalId,
+          principalName: '@dash',
+          scopeId: 'bot-x',
+          scopeName: 'CindyBot',
+          connectUrl: null,
+          bindCode: null,
+          expiresAt: null,
+          reason: null,
+          remediationUrl: 'https://x.com/CindyBot',
+          actions: ['open_provider', 'revoke'],
+        },
+      },
+    };
+  }
+
+  it('用法与风险小节只出现在 X 卡: Telegram 是私密通道, 没有这条性质差异', async () => {
+    // X 的回复是一条**公开推文**, Slack / Telegram 不是 —— 这一节的存在理由就是
+    // 这个差异, 所以它不该跟着渲染进别的渠道卡。
+    ipc.get.mockResolvedValue({ hook: xUnboundHook() });
+    render(<HookConnectionsSection />);
+    await expandChannelCard(X_CARD);
+    expect(
+      await screen.findByText('settings.remoteControl.hook.x.guide.riskPublicBody'),
+    ).toBeTruthy();
+
+    cleanup();
+    ipc.get.mockResolvedValue({ hook: xUnboundHook() });
+    render(<HookConnectionsSection />);
+    await expandChannelCard(TELEGRAM_CARD);
+    expect(screen.queryByText('settings.remoteControl.hook.x.guide.riskPublicBody')).toBeNull();
+  });
+
+  it('说明区可选可复制: 弹窗根节点带 select-none, 不覆盖就复制不了 @askmycindy', async () => {
+    // 本组件也渲染进 ConfirmDialog, 而它的 Content 根节点带 select-none
+    // (confirm-dialog.tsx)。DESIGN.md §14.1 的判据是「用户会不会想复制它」——
+    // `@askmycindy` 与 `/delete` 是用户要**打进 X** 的字符串, 当然会
+    // (#1347 review 由 codex 指出 P2)。
+    ipc.get.mockResolvedValue({ hook: xUnboundHook() });
+    render(<HookConnectionsSection />);
+    await expandChannelCard(X_CARD);
+    const body = await screen.findByText('settings.remoteControl.hook.x.guide.usageBody');
+    // 三组共同的祖先就是 XUsageGuide 的根
+    const root = body.closest('.select-text');
+    expect(root, 'XUsageGuide 根节点必须带 select-text 覆盖弹窗的 select-none').not.toBeNull();
+    expect(root?.textContent?.includes('settings.remoteControl.hook.x.guide.withdrawBody')).toBe(
+      true,
+    );
+  });
+
+  it('说明区没有任何小于 12px 的字号: 这是逐句阅读的正文, 不是辅助标签', async () => {
+    // DESIGN.md §3 把 Small(12px)定为 sans 的最小字号, 并对 Micro Label(10–13px)写明
+    // 「Auxiliary / non-reading labels only … Never used for body text or anything the
+    // user reads sentence-by-sentence」。这一节的正文既要逐句读、还要照着往 X 里打字
+    // (@askmycindy / delete 命令), 是正文而非标签(#1347 review 由 codex 指出 P2)。
+    //
+    // 刻意钉整个子树而不是单个 className: 初版只有 GuideBody 一处踩线, 但下一处新增的
+    // 说明同样会想「顺手用 text-11」—— 钉子树才拦得住第二次。
+    ipc.get.mockResolvedValue({ hook: xUnboundHook() });
+    render(<HookConnectionsSection />);
+    await expandChannelCard(X_CARD);
+    const root = (await screen.findByText('settings.remoteControl.hook.x.guide.usageBody')).closest(
+      '.select-text',
+    );
+    expect(root).not.toBeNull();
+
+    const tooSmall: string[] = [];
+    for (const el of [root!, ...Array.from(root!.querySelectorAll('*'))]) {
+      for (const cls of Array.from(el.classList)) {
+        // 本仓的字号既有 `text-11` 这种自定义档, 也有 `text-[11px]` 这种字面量
+        const px = /^text-(\d+)$/.exec(cls)?.[1] ?? /^text-\[(\d+)px\]$/.exec(cls)?.[1];
+        if (px !== undefined && Number(px) < 12) tooSmall.push(cls);
+      }
+    }
+    expect(tooSmall, `说明区出现了小于 12px 的字号: ${tooSmall.join(', ')}`).toEqual([]);
+  });
+
+  it('三组都在场, 且「默认工作目录」那条风险必须写出来', async () => {
+    // 「X 任务都落在默认工作目录、agent 能读写其中文件、结论会公开回帖」是
+    // 「回帖公开」的直接后果, 也是用户判断该不该把默认目录指到工作仓库的唯一依据
+    // (Dash 2026-08-02 明确要求写出来) —— 少了它这一节就等于没说清风险。
+    ipc.get.mockResolvedValue({ hook: xUnboundHook() });
+    render(<HookConnectionsSection />);
+    await expandChannelCard(X_CARD);
+    for (const key of [
+      'usageLabel',
+      'usageBody',
+      'riskLabel',
+      'riskPublicBody',
+      'riskWorkdirBody',
+      'withdrawLabel',
+      'withdrawBody',
+    ]) {
+      expect(await screen.findByText(`settings.remoteControl.hook.x.guide.${key}`)).toBeTruthy();
+    }
+  });
+
+  it('X 未启用、未绑定时小节照样显示: 评估阶段最需要看到风险', async () => {
+    // BASE_HOOK 的 x 是 enabled:false / available:false / binding:null。这一节刻意不跟
+    // 开关门控 —— 决定要不要打开的人才最需要读它。
+    ipc.get.mockResolvedValue({ hook: xUnboundHook() });
+    render(<HookConnectionsSection />);
+    await expandChannelCard(X_CARD);
+    expect(
+      await screen.findByText('settings.remoteControl.hook.x.guide.riskWorkdirBody'),
+    ).toBeTruthy();
+  });
+
+  it('首次绑定成功弹一次确认门: 单按钮、不可用取消绕过', async () => {
+    ipc.get.mockResolvedValue({ hook: xConfirmedHook('x-user-1') });
+    render(<HookConnectionsSection />);
+
+    await waitFor(() => expect(dialog.confirm).toHaveBeenCalledTimes(1));
+    expect(dialog.confirm.mock.calls[0][0]).toMatchObject({
+      title: 'settings.remoteControl.hook.x.guide.ackTitle',
+      confirmText: 'settings.remoteControl.hook.x.guide.ackConfirm',
+      // 告知不该有「取消」这个出口 —— 它不是一个可选操作
+      showCancel: false,
+    });
+  });
+
+  it('点过「我明白」之后不再弹: 一次性告知, 不是每次开设置都拦', async () => {
+    ipc.get.mockResolvedValue({ hook: xConfirmedHook('x-user-1') });
+    render(<HookConnectionsSection />);
+    await waitFor(() => expect(dialog.confirm).toHaveBeenCalledTimes(1));
+
+    cleanup();
+    dialog.confirm.mockClear();
+    ipc.get.mockResolvedValue({ hook: xConfirmedHook('x-user-1') });
+    render(<HookConnectionsSection />);
+    await expandChannelCard(X_CARD);
+    // 给 effect 一个真实的机会跑完再断言"没弹"
+    await waitFor(() =>
+      expect(screen.queryByText('settings.remoteControl.hook.x.guide.usageBody')).toBeTruthy(),
+    );
+    expect(dialog.confirm).not.toHaveBeenCalled();
+  });
+
+  it('换绑到另一个 X 账号会再确认一次: 新账号 = 新的公开面', async () => {
+    ipc.get.mockResolvedValue({ hook: xConfirmedHook('x-user-1') });
+    render(<HookConnectionsSection />);
+    await waitFor(() => expect(dialog.confirm).toHaveBeenCalledTimes(1));
+
+    cleanup();
+    dialog.confirm.mockClear();
+    ipc.get.mockResolvedValue({ hook: xConfirmedHook('x-user-2') });
+    render(<HookConnectionsSection />);
+    await waitFor(() => expect(dialog.confirm).toHaveBeenCalledTimes(1));
+  });
+
+  it('Esc / 点遮罩关掉不算已知晓: 下次仍然弹', async () => {
+    // confirm-dialog 在 Esc / 遮罩点击时 resolve 成 cancel(ok=false)。那种情况下
+    // 用户并没有读到告知, 记账就等于把风险悄悄咽掉了。
+    dialog.confirm.mockResolvedValue(false);
+    ipc.get.mockResolvedValue({ hook: xConfirmedHook('x-user-1') });
+    render(<HookConnectionsSection />);
+    await waitFor(() => expect(dialog.confirm).toHaveBeenCalledTimes(1));
+
+    cleanup();
+    dialog.confirm.mockClear();
+    dialog.confirm.mockResolvedValue(true);
+    ipc.get.mockResolvedValue({ hook: xConfirmedHook('x-user-1') });
+    render(<HookConnectionsSection />);
+    await waitFor(() => expect(dialog.confirm).toHaveBeenCalledTimes(1));
+  });
+
+  it('未绑定 / 绑定中不弹确认门: 只在转入 confirmed 那一沿', async () => {
+    const pending = xConfirmedHook('x-user-1');
+    ipc.get.mockResolvedValue({
+      hook: {
+        ...pending,
+        x: {
+          ...pending.x,
+          binding: { ...pending.x.binding!, state: 'pending' as const },
+        },
+      },
+    });
+    render(<HookConnectionsSection />);
+    await expandChannelCard(X_CARD);
+    await waitFor(() =>
+      expect(screen.queryByText('settings.remoteControl.hook.x.guide.usageBody')).toBeTruthy(),
+    );
+    expect(dialog.confirm).not.toHaveBeenCalled();
+  });
+});

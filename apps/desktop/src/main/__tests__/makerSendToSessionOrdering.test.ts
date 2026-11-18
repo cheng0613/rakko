@@ -1,0 +1,1274 @@
+/**
+ * makerSendToSessionOrdering.test.ts
+ * ---------------------------------------------------------------------------
+ * send_to_session 是 Orca / MCP 接管路径，不走 renderer 的乐观消息队列。
+ * 这里用源码契约守住这些长期约束：
+ * 1. user row 必须在 Session.send 的 accepted 边界写入，vendor handle 启动前
+ *    DB 已经是单一真相源。
+ * 2. Session.send 的 SESSION_RUNNING 必须映射成业务 BUSY，而不是 INTERNAL。
+ * 3. create 分支的 session created 广播必须跟 accepted 持久化边界一致。
+ * 4. WindowControls 的 any-session-in-turn 判定必须覆盖 Session.send reservation 窗口。
+ */
+
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { describe, expect, it } from 'vitest';
+
+const repoRoot = resolve(__dirname, '..', '..', '..', '..', '..');
+const sourcePath = resolve(__dirname, '..', 'maker-ipc', 'register.ts');
+const source = readFileSync(sourcePath, 'utf8').replace(/\r\n?/g, '\n');
+const userMessageDurableWriteSource = readFileSync(
+  resolve(__dirname, '..', 'maker-ipc', 'userMessageDurableWrite.ts'),
+  'utf8',
+).replace(/\r\n?/g, '\n');
+const dispatchBoundarySource = readFileSync(
+  resolve(__dirname, '..', 'turn-change-set', 'dispatchBoundary.ts'),
+  'utf8',
+).replace(/\r\n?/g, '\n');
+const acceptedCallbackSourcePath = resolve(__dirname, '..', 'maker-ipc', 'acceptedCallbackRunner.ts');
+const acceptedCallbackSource = readFileSync(acceptedCallbackSourcePath, 'utf8').replace(/\r\n?/g, '\n');
+const orcaInterAgentDispatcherSourcePath = resolve(__dirname, '..', 'maker-ipc', 'orcaInterAgentDispatcher.ts');
+const orcaInterAgentDispatcherSource = readFileSync(orcaInterAgentDispatcherSourcePath, 'utf8').replace(/\r\n?/g, '\n');
+const schedulerRunnerSourcePath = resolve(__dirname, '..', 'scheduler-host', 'runner.ts');
+const schedulerRunnerSource = readFileSync(schedulerRunnerSourcePath, 'utf8').replace(/\r\n?/g, '\n');
+const goalControllerSourcePath = resolve(__dirname, '..', 'goal-host', 'controller.ts');
+const goalControllerSource = readFileSync(goalControllerSourcePath, 'utf8').replace(/\r\n?/g, '\n');
+const imTurnRunnerSourcePath = resolve(__dirname, '..', 'im', 'shared', 'turnRunner.ts');
+const imTurnRunnerSource = readFileSync(imTurnRunnerSourcePath, 'utf8').replace(/\r\n?/g, '\n');
+const orcaWorkflowSourcePath = resolve(repoRoot, 'packages', 'orca-workflow', 'src', 'orca-bridge-mcp.ts');
+const orcaWorkflowSource = readFileSync(orcaWorkflowSourcePath, 'utf8').replace(/\r\n?/g, '\n');
+const orcaTeamServiceSourcePath = resolve(__dirname, '..', 'maker-ipc', 'orcaTeamService.ts');
+const orcaTeamServiceSource = readFileSync(orcaTeamServiceSourcePath, 'utf8').replace(/\r\n?/g, '\n');
+const orcaWorkerCreationServiceSourcePath = resolve(__dirname, '..', 'maker-ipc', 'orcaWorkerCreationService.ts');
+const orcaWorkerCreationServiceSource = readFileSync(orcaWorkerCreationServiceSourcePath, 'utf8').replace(/\r\n?/g, '\n');
+const orcaLifecycleServiceSourcePath = resolve(__dirname, '..', 'maker-ipc', 'orcaLifecycleService.ts');
+const orcaLifecycleServiceSource = readFileSync(orcaLifecycleServiceSourcePath, 'utf8').replace(/\r\n?/g, '\n');
+const useWorkersSourcePath = resolve(__dirname, '..', '..', 'renderer', 'features', 'cc-agent', 'hooks', 'useWorkers.ts');
+const useWorkersSource = readFileSync(useWorkersSourcePath, 'utf8').replace(/\r\n?/g, '\n');
+const workerProjectionStoreSourcePath = resolve(__dirname, '..', '..', 'renderer', 'features', 'cc-agent', 'hooks', 'workerProjectionStore.ts');
+const workerProjectionStoreSource = readFileSync(workerProjectionStoreSourcePath, 'utf8').replace(/\r\n?/g, '\n');
+const preloadSourcePath = resolve(__dirname, '..', '..', 'preload', 'preload.ts');
+const preloadSource = readFileSync(preloadSourcePath, 'utf8').replace(/\r\n?/g, '\n');
+const useOrcaWorkerSelectionSourcePath = resolve(__dirname, '..', '..', 'renderer', 'features', 'cc-agent', 'hooks', 'useOrcaWorkerSelection.ts');
+const useOrcaWorkerSelectionSource = readFileSync(useOrcaWorkerSelectionSourcePath, 'utf8').replace(/\r\n?/g, '\n');
+
+describe('sendToSession ordering', () => {
+  it('guards Cindy Make direct sends without reentering the session send lock', () => {
+    const block = extractBetween(source, 'async function sendUserMessageWithAwaitedGitBaseline', 'async function sendToSessionInternal');
+    expect(block).toContain('cindyMakeManager.isTaskPreparing(session.id)');
+    expectOrder(block, 'await assertCindyMakeTaskReady(session.id)', 'const dispatch = async');
+    expect(block).toContain("withCindyMakeProjectUse(app.getPath('userData'), session.workDir, dispatch)");
+    expect(block).not.toContain('sendToAgentAccepted(');
+    expect(block).not.toContain('sendToSessionLocks');
+    const observer = extractBetween(source, 'const sessionTurnObserverDependencies =', 'export function wireSessionToIpc');
+    expect(observer).toContain('beforeLocalProviderStart:');
+    expect(observer).toContain("withCindyMakeProjectUse(app.getPath('userData'), session.workDir,");
+  });
+
+  it('routes pending harness selections through the canonical queued send before using a live handle', () => {
+    const block = extractSendToSessionSource();
+    const routing = block.indexOf('|| agentSwitchPending.get(targetSessionId)');
+    expect(routing).toBeGreaterThan(0);
+    const enqueue = block.indexOf('await enqueueSendToSessionMessage({', routing);
+    const queuedReply = block.indexOf("wakeKind: 'queued'", enqueue);
+    const liveRead = block.indexOf('let live = maker.getSession(targetSessionId)');
+    expect(enqueue).toBeGreaterThan(routing);
+    expect(queuedReply).toBeGreaterThan(enqueue);
+    expect(queuedReply).toBeLessThan(liveRead);
+  });
+
+  it('routes even idle private Bot and group-lane deliveries through the durable input coordinator', () => {
+    const block = extractSendToSessionSource();
+    const routing = block.indexOf("explicitClientId?.startsWith('bot-dm:') || explicitClientId?.startsWith(BOT_GROUP_CLIENT_ID_PREFIX) || explicitClientId?.startsWith('bot-authorization-resume:') || inputCoordinator.shouldQueueNewTurn(targetSessionId)");
+    expect(routing).toBeGreaterThan(0);
+    expect(block.indexOf('await enqueueSendToSessionMessage({', routing)).toBeLessThan(block.indexOf('let live = maker.getSession(targetSessionId)'));
+  });
+
+  it('uses the full queue inspection count for workspace worker summaries', () => {
+    const diagnosticsBlock = extractBetween(
+      source,
+      'function createOrcaDiagnosticsDeps()',
+      '/**\n   * 注入成功后回写 sessions.used_project_context',
+    );
+
+    expect(diagnosticsBlock).toContain(
+      'const inspection = inputCoordinator.getQueueInspection(sessionId);',
+    );
+    expect(diagnosticsBlock).toContain('queuedCount: inspection.length,');
+    expect(diagnosticsBlock).not.toContain('pendingQueue.length');
+  });
+
+  it('routes Orca worker task dispatch through the service primitive and Orca lead/worker queue dispatcher', () => {
+    const helperBlock = extractBetween(
+      orcaInterAgentDispatcherSource,
+      'async function sendPersistedUserMessageToSession',
+      'function makeQueuedDispatchOutcome',
+    );
+    const serviceDispatchBlock = extractOrcaTeamServiceDispatchResolvedWorkerSource();
+    const serviceDepsBlock = extractBetween(
+      source,
+      'const orcaTeamService = createOrcaTeamService(orcaRemoteWorkers.wrapTeamDeps({',
+      '  }));\n  orcaTeamServiceForEvents = orcaTeamService;',
+    );
+    const lifecycleDispatchBlock = extractBetween(
+      orcaLifecycleServiceSource,
+      'async function dispatchInitialTask',
+      'async function createWorker',
+    );
+
+    expect(helperBlock).toContain('const result = await resolveCollabDispatchResult(');
+    expect(helperBlock).toMatch(
+      /async \(\) => \{\s+params\.onSendAttempt\(\);\s+const sendResult = await session\.send\((?:agentMessage|outgoingMessage), \{/,
+    );
+    expect(helperBlock).toContain('planMode: false,');
+    expect(helperBlock).toContain('throwOnStartFailure: true,');
+    expect(helperBlock).toContain('onAccepted: async () => {');
+    expect(helperBlock).toContain('await deps.createDbMessage(session.id, {');
+    expect(helperBlock).toContain('await deps.beginDirectTurnChangeSet(session.id, clientId);');
+    expect(helperBlock).toContain('deps.abortDirectTurnChangeSet(session.id);');
+    expect(helperBlock).toContain('{ source, context },');
+    expectOrder(helperBlock, 'onAccepted: async () => {', 'await deps.createDbMessage(session.id, {');
+    // 顺序硬约束: 先落库再跑 accepted 副作用。createDbMessage 失败时 Session.send 按
+    // 派发前失败处理不启动 turn, 副作用若先跑会留下没有 terminal event 清理的幽灵
+    // running/autoBridgePending 状态(Codex review P2)。
+    expectOrder(helperBlock, 'await deps.createDbMessage(session.id, {', 'await deps.beginDirectTurnChangeSet(session.id, clientId);');
+    expectOrder(helperBlock, 'await deps.beginDirectTurnChangeSet(session.id, clientId);', 'await runAcceptedCallback(onAccepted, session.id, clientId, deps.log ?? defaultLog);');
+
+    expect(source).not.toContain('async function dispatchInitialTaskToOrcaWorker');
+    expect(serviceDispatchBlock).toContain('result = await deps.dispatchWorkerMessage({');
+    expect(serviceDispatchBlock).toContain('workerId: link.workerId,');
+    expect(serviceDispatchBlock).toContain('dispatchMeta: params.dispatchMeta,');
+    expect(serviceDispatchBlock).not.toContain('await createDbMessage(');
+    expect(serviceDispatchBlock).not.toContain('await workerSession.send({');
+    expect(serviceDepsBlock).toContain('dispatchWorkerMessage: async ({');
+    expectOrder(serviceDepsBlock, 'targetSessionId,', 'message,');
+    expectOrder(serviceDepsBlock, 'message,', 'workerId,');
+    expectOrder(serviceDepsBlock, 'workerId,', 'dispatchMeta,');
+    expectOrder(serviceDepsBlock, 'dispatchMeta,', 'onAccepted,');
+    expectOrder(serviceDepsBlock, 'onAccepted,', 'onAcceptedRollback,');
+    expect(serviceDepsBlock).toContain('const result = await dispatchOrEnqueueOrcaInterAgentMessage({');
+    expect(serviceDepsBlock).toContain('workerId,');
+    expect(serviceDepsBlock).toContain("senderLabel: 'Lead'");
+    expect(serviceDepsBlock).toContain("source: 'lead'");
+    expect(serviceDepsBlock).toContain('meta: dispatchMeta,');
+
+    expect(lifecycleDispatchBlock).toContain('const result = await deps.dispatchWorkerTask({');
+    expect(lifecycleDispatchBlock).toContain('}, assertAccepted);');
+    expect(lifecycleDispatchBlock).toContain('if (!result.queued && rejected) throw rejected.error;');
+    expect(lifecycleDispatchBlock).toContain('createHostSendFailure(');
+    expect(lifecycleDispatchBlock).toContain('Collab delegate send failed before vendor dispatch: $' + '{params.context}');
+    expect(lifecycleDispatchBlock).not.toContain('sendPersistedUserMessageToSession({');
+    expect(lifecycleDispatchBlock).not.toContain('await createDbMessage(');
+    expect(lifecycleDispatchBlock).not.toContain('.send({');
+  });
+
+  it('uses the persisted current project path and live workspace kind for the collaboration gate', () => {
+    const policyGuardBlock = extractBetween(
+      source,
+      'async function assertLeadCollabProjectEnabled',
+      'async function sendUserMessageWithAwaitedGitBaseline',
+    );
+
+    expect(policyGuardBlock).toContain(
+      'const liveWorkspaceKind = (lead as { workspaceKind?: unknown } | undefined)?.workspaceKind;',
+    );
+    expect(policyGuardBlock).toContain(
+      "typeof leadRow?.workingDir === 'string' ? leadRow.workingDir : lead?.workDir;",
+    );
+    expect(policyGuardBlock).toContain(
+      "liveWorkspaceKind === 'project' || liveWorkspaceKind === 'dialogue'",
+    );
+    expectOrder(policyGuardBlock, 'leadRow?.workingDir', 'lead?.workDir');
+    expect(policyGuardBlock).toContain(' : leadRow?.workspaceKind;');
+    expectOrder(policyGuardBlock, 'const liveWorkspaceKind =', 'assertCollabProjectEnabled(');
+    expect(policyGuardBlock).toContain(
+      'isManagedDialogueWorkspace',
+    );
+  });
+
+  it('uses the same trusted collab scope helper and acknowledges the accepted workspace kind', () => {
+    const pluginStateBlock = extractBetween(
+      source,
+      'ipcMain.handle(\n    MAKER_INVOKE.PLUGINS_GET_STATE',
+      'ipcMain.handle(MAKER_INVOKE.PLUGINS_SET_ENABLED',
+    );
+
+    expect(pluginStateBlock).toContain('resolveLocalCollabPolicyWorkingDir(');
+    expect(pluginStateBlock).toContain("typeof workspaceKind === 'string' ? workspaceKind : null");
+    expect(pluginStateBlock).toContain(
+      'isManagedDialogueWorkspace(candidate)',
+    );
+    expect(pluginStateBlock).toContain('getEnableState(id, policyWorkingDir)');
+    expect(pluginStateBlock).toContain(
+      "workspaceKind === 'project' || workspaceKind === 'dialogue'",
+    );
+    expect(pluginStateBlock).toContain('collabWorkspaceKind: acceptedWorkspaceKind');
+  });
+
+  it('keeps non-composer direct sends from inheriting armed plan mode', () => {
+    const createWorkerReadyBlock = extractBetween(
+      source,
+      'sendWorkerReadyMessage: (session) => {',
+      '    broadcastSessionCreated,',
+    );
+    const workerReadyPlaceholderBlock = extractBetween(
+      source,
+      'sendWorkerReadyPlaceholder: async',
+      '    rollbackCreatedWorker:',
+    );
+    const sendToSessionBlock = extractSendToSessionSource();
+    const queuedCreateOptsBlock = extractBetween(
+      source,
+      'async function buildCreateOptsForQueuedSession',
+      'async function enqueueSendToSessionMessage',
+    );
+
+    expect(createWorkerReadyBlock).toContain(
+      "session.send({ type: 'user', content: ORCA_WORKER_READY_MESSAGE }, { planMode: false })",
+    );
+    expect(workerReadyPlaceholderBlock).toMatch(/planMode: false,\s+throwOnStartFailure: true,/);
+    expect(workerReadyPlaceholderBlock).toContain('await assertCurrent?.();');
+    expect(sendToSessionBlock).toContain('planMode: false,');
+    expect(queuedCreateOptsBlock).toContain('inheritTargetPlanMode = false,');
+    expect(queuedCreateOptsBlock).toContain('planMode: inheritTargetPlanMode ? !!row.planModeEnabled : false,');
+    expect(orcaInterAgentDispatcherSource).toContain('planMode: false,');
+    expect(schedulerRunnerSource).toContain(
+      'planMode: routinePermissions?.planMode ?? heartbeatPermissions?.planMode ?? false,',
+    );
+    expect(goalControllerSource).toContain("origin: { kind: 'goal', goalSessionId: sessionId },");
+    expect(goalControllerSource).toContain('planMode: false,');
+    expect(imTurnRunnerSource).toContain('planMode: false,');
+    expect(orcaWorkflowSource).toContain('planMode: false,');
+  });
+
+  it('rolls back Orca accepted side effects when dispatch is cancelled after accepted', () => {
+    const dispatchBlock = extractDispatchOrEnqueueOrcaInterAgentMessageSource();
+    const serviceDispatchBlock = extractOrcaTeamServiceDispatchResolvedWorkerSource();
+    const workerCreateBlock = extractBetween(
+      source,
+      'ipcMain.handle(MAKER_INVOKE.WORKER_CREATE',
+      'ipcMain.handle(MAKER_INVOKE.WORKER_LIST',
+    );
+
+    expect(acceptedCallbackSource).toContain('export async function runAcceptedRollback');
+    expect(orcaInterAgentDispatcherSource).toContain('onAcceptedRollback?: () => void | Promise<void>;');
+    expect(dispatchBlock).toContain('let acceptedDidRun = false;');
+    expect(dispatchBlock).toContain('const runAccepted = async (): Promise<void> => {');
+    expect(dispatchBlock).toContain('acceptedDidRun = true;');
+    expect(dispatchBlock).toMatch(
+      /const failureResult = async \(\s*dispatchOutcome: CollabDispatchFailureOutcome, reportRejected = false\): Promise<DispatchOrcaInterAgentMessageResult> => \{/,
+    );
+    expect(dispatchBlock).toContain('await runAcceptedRollback(params.onAcceptedRollback, params.targetSessionId, clientId, log);');
+    expect(dispatchBlock).toContain('onAccepted: runAccepted,');
+    expect(dispatchBlock).toContain('return failureResult(result.dispatchOutcome, result.reportRejected);');
+    expectOrder(dispatchBlock, 'const runAccepted = async (): Promise<void> => {', 'sendPersistedUserMessageToSession(deps, {');
+    expect(dispatchBlock).toContain('onAccepted: runAccepted,');
+    expect(dispatchBlock).toContain('return failureResult(result.dispatchOutcome, result.reportRejected);');
+    expectOrder(
+      dispatchBlock,
+      'await deps.prepareUnhealthySession?.(params.targetSessionId);',
+      'const live = deps.getLiveSession(params.targetSessionId);',
+    );
+    expectOrder(
+      dispatchBlock,
+      'const liveResult = deps.withSendToSessionLock',
+      'return await sendToInternal();',
+    );
+    expect(source).toContain('prepareUnhealthySession: (sessionId) =>');
+    expect(source).toContain('withSendToSessionLock,');
+    const dispatcherWiring = extractBetween(
+      source,
+      'const orcaInterAgentDispatcher: OrcaInterAgentDispatcher = createOrcaInterAgentDispatcher({',
+      'dispatchOrEnqueueOrcaInterAgentMessage: OrcaInterAgentDispatcher',
+    );
+    expectOrder(dispatcherWiring, 'hasSendToSessionLock: (sessionId) => sendToSessionLocks.has(sessionId),', 'withSendToSessionLock,');
+    expectOrder(dispatcherWiring, 'withSendToSessionLock,', 'prepareUnhealthySession: (sessionId) =>');
+
+    expect(serviceDispatchBlock).toMatch(/let acceptedSnapshot:\s+\| \{/);
+    expect(serviceDispatchBlock).toContain('if (!acceptedSnapshot) return;');
+    expect(serviceDispatchBlock).toContain('const rollbackAccepted = async (): Promise<void> => {');
+    expect(serviceDispatchBlock).toContain('previousStatus: snapshot.previousStatus,');
+    expect(serviceDispatchBlock).toContain('previousPending: snapshot.previousPending,');
+    expect(serviceDispatchBlock).toContain('previousManualInterrupt: snapshot.previousManualInterrupt,');
+    expect(serviceDispatchBlock).toContain('onAcceptedCommit: commitAccepted,');
+    expect(serviceDispatchBlock).toContain('const currentWorkers = await deps.listWorkersByLead(link.leadSessionId);');
+    expect(serviceDispatchBlock).toContain('const currentWorker = currentWorkers.find((worker) => worker.id === target.id);');
+    // A worker missing from the active-team list at acceptance is a revocation, not a stale turn;
+    // the snapshot then always carries the live row status.
+    expect(serviceDispatchBlock).toContain("if (!currentWorker) throw new Error('worker no longer belongs to an active team');");
+    expect(serviceDispatchBlock).toContain('previousStatus: currentWorker.status,');
+    expect(serviceDispatchBlock).toContain('onAcceptedRollback: rollbackAccepted,');
+    expectOrder(serviceDispatchBlock, 'const currentWorkers = await deps.listWorkersByLead(link.leadSessionId);', "await deps.updateWorkerStatus(target.id, 'running');");
+    expectOrder(serviceDispatchBlock, 'acceptedSnapshot = {', "await deps.updateWorkerStatus(target.id, 'running');");
+    expect(orcaTeamServiceSource).toContain('await deps.updateWorkerStatus(params.worker.id, params.previousStatus);');
+    expect(workerCreateBlock).toContain('orcaLifecycleService.createWorker({');
+    expect(orcaLifecycleServiceSource).toContain('dispatchWorkerTask({');
+    expect(workerCreateBlock).not.toContain('onAcceptedRollback: async () => {');
+    expect(workerCreateBlock).not.toContain('workerAutoBridgePending.delete(workerSession.id);');
+  });
+
+  it('tracks queued Orca accepted callbacks until dispatch settles or the item is discarded', () => {
+    const dispatchBlock = extractDispatchOrEnqueueOrcaInterAgentMessageSource();
+    const coordinatorBlock = extractBetween(
+      source,
+      'const inputCoordinator: AgentInputCoordinator = new AgentInputCoordinator({',
+      'agentInputCoordinatorHolder = inputCoordinator;',
+    );
+
+    // Callback lifetime is exercised by acceptedCallbackRunner.test.ts; this
+    // guard only verifies that Orca and the coordinator use that shared service.
+    expect(orcaInterAgentDispatcherSource).toContain('const queuedAccepted = createQueuedAcceptedCallbacks(log);');
+    for (const [name, method] of [
+      ['register', 'register'], ['rollback', 'rollback'], ['settle', 'settle'],
+      ['discard', 'discard'],
+    ]) {
+      expect(orcaInterAgentDispatcherSource).toContain(
+        `const ${name}QueuedOrcaInterAgentAcceptedCallback = queuedAccepted.${method};`,
+      );
+    }
+    const runQueuedCallback = extractBetween(
+      orcaInterAgentDispatcherSource,
+      'const runQueuedOrcaInterAgentAcceptedCallback = (',
+      'const dispatchOrEnqueueOrcaInterAgentMessage = async (',
+    );
+    expect(runQueuedCallback).toContain('return queuedAccepted.run(sessionId, item);');
+    expect(dispatchBlock).toMatch(
+      /registerQueuedOrcaInterAgentAcceptedCallback\(\s*clientId,\s*params\.onAccepted,\s*params\.onAcceptedRollback,\s*params\.onAcceptedCommit,?\s*\);/,
+    );
+    expect(coordinatorBlock).toContain('await orcaInterAgentDispatcher.settleQueuedOrcaInterAgentAcceptedCallback(');
+    expectOrder(coordinatorBlock, 'sessionId,', 'sendOpts,');
+    expectOrder(coordinatorBlock, 'sendOpts,', 'result.outcome');
+    expect(coordinatorBlock).toContain('await orcaInterAgentDispatcher.rollbackQueuedOrcaInterAgentAcceptedCallback(');
+    expect(coordinatorBlock).toContain('orcaInterAgentDispatcher.discardQueuedOrcaInterAgentAcceptedCallback(item.clientId);');
+  });
+
+  it('keeps queued Orca lead/worker items structured-cloneable', () => {
+    // 排队项进 pendingQueue projection 要过 Electron IPC 结构化克隆。
+    // buildCreateOptsWithStderr 注入的 onStderrLine 函数 / orca rehydrate 的
+    // 运行时对象进了队列项会让整条 projection 广播抛
+    // "object could not be cloned"(e2e 实测回归), 这里守住剥离逻辑。
+    const block = extractBetween(
+      source,
+      'function sanitizeVendorOptionsForQueuedItem',
+      'async function enqueueSendToSessionMessage',
+    );
+    const queuedBlock = extractBetween(
+      orcaInterAgentDispatcherSource,
+      'function buildQueuedOrcaInterAgentMessage',
+      '*** End',
+      { allowMissingEnd: true },
+    );
+    expect(block).toContain("if (value === null || t === 'string' || t === 'number' || t === 'boolean') out[key] = value;");
+    expect(block).toContain('vendorOptions: sanitizeVendorOptionsForQueuedItem(createOpts.vendorOptions),');
+    expect(queuedBlock).toContain('vendorOptions: params.createOpts.vendorOptions,');
+  });
+
+  it('does not let persisted sends ignore typed dispatch outcomes', () => {
+    // #6895: the final demotion fence now wraps the same dispatch notification.
+    // Keep the existing accepted/dispatch contract, including the callback body.
+    const dispatchCallback = extractBetween(source, 'const onInternalDispatching = () => {', '\n    if (targetSessionId) {');
+    expect(dispatchCallback).toContain('dispatchAgentIslandUserPrompt(targetSessionId!);');
+    const helperBlock = extractBetween(
+      orcaInterAgentDispatcherSource,
+      'async function sendPersistedUserMessageToSession',
+      'function makeQueuedDispatchOutcome',
+    );
+    const block = extractSendToSessionSource();
+    const createBranch = extractBetween(
+      block,
+      'if (!targetSessionId) {',
+      'const prev = sendToSessionLocks.get(targetSessionId);',
+    );
+    expectOrder(
+      block,
+      'prepareUnhealthySessionForSend(targetSessionId)',
+      'live = maker.getSession(targetSessionId);',
+    );
+    const liveBranch = extractBetween(
+      block,
+      'live = maker.getSession(targetSessionId);',
+      'try {\n        const createOpts = buildCreateOptsWithStderr({',
+    );
+    const resumedBranch = extractBetween(
+      block,
+      'const createOpts = buildCreateOptsWithStderr({\n          id: targetSessionId,',
+      'return trackSendToSessionLockRun(',
+    );
+
+    expect(source).toContain('assertDesktopSendDispatched');
+    expect(orcaInterAgentDispatcherSource).toContain('resolveCollabDispatchResult');
+    expect(helperBlock).toContain('Promise<(CollabDirectDispatchResult & { reportRejected?: true }) | null>');
+    expect(helperBlock).toContain('const result = await resolveCollabDispatchResult(');
+    expect(helperBlock).toMatch(
+      /async \(\) => \{\s+params\.onSendAttempt\(\);\s+const sendResult = await session\.send\((?:agentMessage|outgoingMessage), \{/,
+    );
+    expect(helperBlock).toContain('planMode: false,');
+    expect(helperBlock).toContain('throwOnStartFailure: true,');
+    expect(helperBlock).not.toContain('await session.send(agentMessage, {');
+    expect(helperBlock).not.toContain('assertDesktopSendDispatched(sendResult');
+    expect(createBranch).toContain('const sendResult = await sendUserMessageWithAwaitedGitBaseline(session, message, clientId, {');
+    expect(createBranch).toContain('planMode: false,');
+    expect(createBranch).toContain("assertDesktopSendDispatched(sendResult, 'send_to_session create');");
+    expect(liveBranch).toContain('const sendResult = await sendUserMessageWithAwaitedGitBaseline(');
+    expect(liveBranch).toContain('live,');
+    expectOrder(liveBranch, 'message,', 'clientId,');
+    expect(liveBranch).toContain('onAccepted: persistUserMessage,');
+    expect(liveBranch).toContain('onDispatching: onInternalDispatching,');
+    expect(liveBranch).toContain("assertDesktopSendDispatched(sendResult, 'send_to_session live');");
+    expect(resumedBranch).toContain('const sendResult = await sendUserMessageWithAwaitedGitBaseline(');
+    expect(resumedBranch).toContain('session,');
+    expectOrder(resumedBranch, 'message,', 'clientId,');
+    expect(resumedBranch).toContain('onAccepted: persistUserMessage,');
+    expect(resumedBranch).toContain('onDispatching: onInternalDispatching,');
+    expect(resumedBranch).toContain("assertDesktopSendDispatched(sendResult, 'send_to_session resumed');");
+  });
+
+  it('routes a retained Pi error handle through bounded close retry before sending', () => {
+    const block = extractSendToSessionSource();
+    const loadLive = block.indexOf('let live = maker.getSession(targetSessionId);');
+    const retainedErrorGuard = block.indexOf(
+      "if (live?.agentKind === 'pi' && live.getStatus() === 'error') {",
+    );
+    const liveDispatch = block.indexOf('if (live) {', retainedErrorGuard);
+    const lazyResume = block.indexOf(
+      'const { session } = await bootstrapSession(createOpts);',
+      liveDispatch,
+    );
+
+    expect(loadLive).toBeGreaterThan(-1);
+    expect(retainedErrorGuard).toBeGreaterThan(loadLive);
+    expect(liveDispatch).toBeGreaterThan(retainedErrorGuard);
+    expect(lazyResume).toBeGreaterThan(liveDispatch);
+    expect(block.slice(retainedErrorGuard, liveDispatch)).toContain('live = undefined;');
+    expect(source).toContain(
+      'whose Maker.createSession call performs the existing bounded close retry',
+    );
+  });
+
+  it('awaits Git baseline capture after send_to_session user row persistence and before dispatch', () => {
+    // The dispatch boundary moved verbatim to a leaf shared with the Node Host.
+    const changeSetStart = dispatchBoundarySource.indexOf('async function beginTurnChangeSetAtDispatch');
+    expect(changeSetStart).toBeGreaterThanOrEqual(0);
+    const changeSetBlock = dispatchBoundarySource.slice(changeSetStart);
+    expect(source).toContain("import { beginTurnChangeSetAtDispatch } from '../turn-change-set/dispatchBoundary.js';");
+    const helperBlock = extractBetween(
+      source,
+      'async function sendUserMessageWithAwaitedGitBaseline',
+      'async function sendToSessionInternal',
+    );
+    const block = extractSendToSessionSource();
+
+    expect(helperBlock).toContain('onAccepted: async (signal) => {');
+    expect(helperBlock).toContain('await opts.onAccepted?.(signal);');
+    expect(helperBlock).toContain('await beginTurnChangeSetAtDispatch(session, anchorClientId);');
+    expect(helperBlock).toContain('await gitSnapshotCoordinator.onTurnStart(session.id, signal);');
+    expect(helperBlock).toContain('const pendingHandoff = await agentHandoffPending.peek(session.id);');
+    expect(helperBlock).toContain('prependHandoffToUserMessage(');
+    expect(helperBlock).toContain("{ type: 'user', content: message },");
+    expect(helperBlock).toContain('const sendResult = await session.send(outgoingMessage, {');
+    expect(helperBlock).toContain('agentHandoffPending.consume(session.id);');
+    expect(helperBlock).toContain('if (turnChangeSetStarted && !sendResult.accepted) {');
+    expect(helperBlock).toContain('clearPendingTurnChangeSets(session.id);');
+    expect(helperBlock).toContain('if (baselineStarted && !sendResult.accepted) {');
+    expect(helperBlock).toContain('gitSnapshotCoordinator?.onTurnAbort(session.id);');
+    expect(changeSetBlock).toContain('await waitForTurnChangeSetSeal(session.id);');
+    expect(changeSetBlock).toContain("await finalizeTurnChangeSet(session.id, null, 'partial');");
+    expect(changeSetBlock).toContain('anchorClientId,');
+    expect(changeSetBlock).toContain('provider: session.agentKind,');
+    expect(changeSetBlock).toContain('cwd: session.workDir,');
+    expect(changeSetBlock).toContain('remote: session.remoteHostId !== null,');
+    const firstSeal = changeSetBlock.indexOf('await waitForTurnChangeSetSeal(session.id);');
+    const finalize = changeSetBlock.indexOf("await finalizeTurnChangeSet(session.id, null, 'partial');");
+    const secondSeal = changeSetBlock.indexOf('await waitForTurnChangeSetSeal(session.id);', firstSeal + 1);
+    const begin = changeSetBlock.indexOf('await beginTurnChangeSet({');
+    expect(firstSeal).toBeGreaterThanOrEqual(0);
+    expect(finalize).toBeGreaterThan(firstSeal);
+    expect(secondSeal).toBeGreaterThan(finalize);
+    expect(begin).toBeGreaterThan(secondSeal);
+    expectOrder(
+      helperBlock,
+      'await opts.onAccepted?.(signal);',
+      'await beginTurnChangeSetAtDispatch(session, anchorClientId);',
+    );
+    expectOrder(
+      helperBlock,
+      'await beginTurnChangeSetAtDispatch(session, anchorClientId);',
+      'await gitSnapshotCoordinator.onTurnStart(session.id, signal);',
+    );
+    expect(countOccurrences(block, 'sendUserMessageWithAwaitedGitBaseline(')).toBe(3);
+    expect(block).not.toContain(
+      "const sendResult = await session.send({ type: 'user', content: message }, {",
+    );
+    expect(block).not.toContain('const sendResult = await live.send(');
+  });
+
+  it('persists newly created user messages through the accepted hook', () => {
+    const block = extractSendToSessionSource();
+    const createBranch = extractBetween(
+      block,
+      'if (!targetSessionId) {',
+      'const prev = sendToSessionLocks.get(targetSessionId);',
+    );
+
+    expect(createBranch).toContain('onAccepted: async () => {');
+    expect(createBranch).toContain('const sendResult = await sendUserMessageWithAwaitedGitBaseline(session, message, clientId, {');
+    expect(createBranch).toContain('planMode: false,');
+    expectOrder(createBranch, 'onAccepted: async () => {', 'notifyAgentIslandUserPrompt(session, persistedContent ?? message, {');
+    expectOrder(createBranch, 'notifyAgentIslandUserPrompt(session, persistedContent ?? message, {', 'await persistUserTurnMessage(session.id, {');
+    expect(createBranch).toContain('content: persistedContent ?? message,');
+    expect(createBranch).not.toContain('persist user message failed (non-fatal)');
+    expect(createBranch).toContain('if (isSessionRunningError(err))');
+    expect(createBranch).toContain("errorCode: 'BUSY'");
+  });
+
+  it('broadcasts newly created sessions through the accepted hook', () => {
+    const block = extractSendToSessionSource();
+    const createBranch = extractBetween(
+      block,
+      'if (!targetSessionId) {',
+      'const prev = sendToSessionLocks.get(targetSessionId);',
+    );
+    // Verified relays use the durable queue (behavior-covered by
+    // sendToSessionLazyResumePermission); inspect the remaining direct-send
+    // contract without depending on its nesting indentation.
+    const sendCall = extractBetween(
+      createBranch,
+      'const sendResult = await sendUserMessageWithAwaitedGitBaseline(',
+      '}, directSource);',
+    );
+    const acceptedBlock = extractBetween(
+      sendCall,
+      'onAccepted: async () => {',
+      'onDispatching:',
+    );
+    const sendCallEndNeedle = '}, directSource);';
+    const afterSendResolves = createBranch.slice(
+      createBranch.indexOf(sendCallEndNeedle) + sendCallEndNeedle.length,
+    );
+
+    expect(acceptedBlock).toContain('await persistUserTurnMessage(session.id, {');
+    expect(acceptedBlock).toContain('notifyAgentIslandUserPrompt(session, persistedContent ?? message, {');
+    expect(acceptedBlock).toContain('broadcastSessionCreated(session.id);');
+    expectOrder(acceptedBlock, 'notifyAgentIslandUserPrompt(session, persistedContent ?? message, {', 'await persistUserTurnMessage(session.id, {');
+    expectOrder(acceptedBlock, 'await persistUserTurnMessage(session.id, {', 'broadcastSessionCreated(session.id);');
+    expect(afterSendResolves).not.toContain('broadcastSessionCreated(session.id);');
+    expect(countOccurrences(sendCall, 'broadcastSessionCreated(session.id);')).toBe(1);
+  });
+
+  it('routes ANY_SESSION_IN_TURN through maker active session state', () => {
+    expect(source).toContain('hasAnySessionInTurn(');
+    const anySessionInTurnBlock = extractBetween(
+      source,
+      'export function anySessionInTurn',
+      'let goalClearObserver:',
+    );
+    const handlerBlock = extractBetween(
+      source,
+      'ipcMain.handle(MAKER_INVOKE.ANY_SESSION_IN_TURN',
+      'ipcMain.handle(MAKER_INVOKE.SESSION_IN_TURN',
+    );
+
+    expect(anySessionInTurnBlock).toContain('maker?.listActiveSessions()');
+    expect(anySessionInTurnBlock).toContain('hasAnySessionInTurn(');
+    expect(handlerBlock).toContain('return anySessionInTurn(maker);');
+  });
+
+  it('serializes SET_MODEL behind the send-time agent switch for the same session', () => {
+    const setModelBlock = setModelSource();
+    const directSendSwitchBlock = extractBetween(
+      source,
+      'pendingAgentSwitchApplyHolder = async (',
+      'ipcMain.handle(MAKER_INVOKE.MARK_ORCA_ROLE',
+    );
+
+    expect(setModelBlock).toContain(
+      'return internalOptions.sessionLockHeld ? applyLocked() : withSendToSessionLock(sessionId, applyLocked);',
+    );
+    expect(setModelBlock).toContain(
+      'agentSwitchPending.revision?.(sessionId) !== expectedAgentSwitchRevision',
+    );
+    expect(setModelBlock).toContain('return { deferred: false, superseded: true };');
+    expectOrder(
+      setModelBlock,
+      'const applyLocked = async () => {',
+      'agentSwitchPending.revision?.(sessionId) !== expectedAgentSwitchRevision',
+    );
+    expectOrder(
+      setModelBlock,
+      'agentSwitchPending.revision?.(sessionId) !== expectedAgentSwitchRevision',
+      'applyRuntimeSetModelChange({',
+    );
+    expect(setModelBlock).toContain('if (isDeviceLinkInvoke()) {');
+    expect(setModelBlock).toContain('if (atomicSelection) {');
+    expect(setModelBlock).toContain('effort: atomicSelection.effort as');
+    expect(setModelBlock).toContain('setSessionEffort(sessionId, selectionToCommit.effort);');
+    expect(setModelBlock).toContain('setSessionFastMode(sessionId, selectionToCommit.fastMode);');
+    expect(setModelBlock).toContain('applyRuntimeSelectionAxesWithRecovery({');
+    expect(setModelBlock).toContain('restoreControlStores,');
+    expect(setModelBlock).toContain('withRehydrateCloseSuppressed(sessionId');
+    expect(setModelBlock).toMatch(
+      /internalOptions\.source === 'user'\s*&&\s*\(isDeviceLinkInvoke\(\) \|\| atomicSelection\)/,
+    );
+    expect(setModelBlock).toContain('patch.effort = atomicSelection.effort;');
+    expect(setModelBlock).toContain('patch.fastMode = atomicSelection.fastMode;');
+    expect(setModelBlock).toContain('await persistSessionFields(sessionId, patch);');
+    expect(setModelBlock).toContain('markRemoteSettingPersistedInsideHandler(response);');
+    expect(setModelBlock).toContain('return Object.assign(response, {');
+    expect(setModelBlock).not.toContain('return {\n          ...response,');
+    expectOrder(
+      setModelBlock,
+      'applyRuntimeSetModelChange({',
+      'const commitControlStores',
+    );
+    expectOrder(
+      setModelBlock,
+      'applyRuntimeSelectionAxesWithRecovery({',
+      'await persistSessionFields',
+    );
+    expectOrder(
+      setModelBlock,
+      'setSessionFastMode(sessionId, selectionToCommit.fastMode);',
+      'await persistSessionFields(sessionId, patch);',
+    );
+    expect(setModelBlock.lastIndexOf('agentSwitchPending.clear(sessionId);')).toBeGreaterThan(
+      setModelBlock.indexOf('await persistSessionFields(sessionId, patch);'),
+    );
+    expectOrder(
+      setModelBlock,
+      'agentSwitchPending.clear(sessionId);',
+      '...response,',
+    );
+    expect(setModelBlock).toContain('pendingCredentialSwitchHolder?.clear(sessionId);');
+    expect(setModelBlock).toContain('restoreControlStores();');
+    expect(setModelBlock).toContain('previousRuntime.pendingCredentialSwitch');
+    expect(setModelBlock).toContain('withRehydrateCloseSuppressed(sessionId');
+    expect(setModelBlock).toContain('recordRecoveredSessionRuntimeMutation(sessionId');
+    expect(setModelBlock).toContain(
+      'sessionRuntimeControlOwnerEpochMatches(runtimeOwnerEpoch)',
+    );
+    expect(setModelBlock).toContain('recovered runtime projection broadcast failed');
+    expectOrder(
+      setModelBlock,
+      'restoreControlStores();',
+      'throw persistenceError;',
+    );
+    // Protect the SET_MODEL wire argument order. Other preload APIs (including
+    // voice preferences) also accept `selection` and are outside this contract.
+    const preloadSetModel = extractBetween(preloadSource, '    setModel: (', '    switchSessionAgent: (');
+    // #5044 在 selection 上加了可选 thinking 载体；上游已把 fastMode 扩成 ultrafast。
+    expect(preloadSetModel).toContain(
+      "selection?: { effort: string | null; fastMode: boolean | 'ultrafast'; thinking?: boolean },",
+    );
+    expectOrder(
+      preloadSetModel,
+      'expectedAgentSwitchRevision,',
+      'selection,',
+    );
+    expect(source).toContain('withSessionLock: withSendToSessionLock,');
+    expect(directSendSwitchBlock).toContain('const release = await acquireSendToSessionLock(sessionId, undefined, () => stage);');
+    expectOrder(
+      directSendSwitchBlock,
+      'const release = await acquireSendToSessionLock(sessionId, undefined, () => stage);',
+      'applyPendingAgentSwitchIfIdle(',
+    );
+    for (const [operation, call] of [
+      ['reconcileBotModelRoute', 'reconcileBotModelRoute'],
+      ['applyPendingAgentSwitchIfIdle', 'applyPendingAgentSwitchIfIdle'],
+      ['applyScheduledModelSelection', 'applyScheduledProfile'],
+      ['prepareUnhealthySession', 'prepareUnhealthySessionForSend'],
+    ]) {
+      expectOrder(directSendSwitchBlock, `stage = 'direct-send:${operation}'`, `${call}(`);
+    }
+    expectOrder(directSendSwitchBlock, 'prepareUnhealthySession', "stage = 'direct-send:caller-dispatch'");
+    expectOrder(directSendSwitchBlock, 'applyPendingAgentSwitchIfIdle(', 'prepareUnhealthySession');
+    expectOrder(directSendSwitchBlock, 'prepareUnhealthySession', 'return { release, selection: resolvedSelection');
+  });
+
+  it('仅 Device Link 归一化 SET_MODEL 的 JSON null 可选占位,本地仍走严格校验', () => {
+    const setModelBlock = setModelSource();
+    expect(setModelBlock).toContain('normalizeDeviceLinkSetModelWireArgs(');
+    expect(setModelBlock).toContain('isDeviceLinkInvoke(),');
+    expect(setModelBlock).toContain(
+      'expectedAgentSwitchRevision = normalizedWireArgs.expectedAgentSwitchRevision;',
+    );
+    expect(setModelBlock).toContain('selection = normalizedWireArgs.selection;');
+    expect(setModelBlock).toContain('expectedAgentSwitchRevision must be a non-negative integer');
+    expect(setModelBlock).toContain('selection must contain effort + fastMode');
+  });
+
+  it('publishes Agent Island prompt preview from send intent and wires commit rollback', () => {
+    const makerSendCreateDbMessageBlock = extractBetween(
+      source,
+      'const createUserMessageDurably:',
+      '    sendToAgentAccepted: sendToAgentAcceptedUnlocked,',
+    );
+    const makerSendPreviewHookBlock = extractBetween(
+      source,
+      'previewUserPrompt: (session, content, options) => {',
+      '    isSessionRunningError,',
+    );
+
+    // The user-row write is assembled here and written in userMessageDurableWrite.ts.
+    expect(makerSendCreateDbMessageBlock).toContain('createUserMessageDurableWrite({');
+    expect(makerSendCreateDbMessageBlock).not.toContain('notifyAgentIslandUserPrompt(');
+    expect(userMessageDurableWriteSource).toContain('return await enqueueDurableWrite');
+    expect(userMessageDurableWriteSource).not.toContain('notifyAgentIslandUserPrompt(');
+    expect(source).toContain('createDbMessage: createUserMessageDurably,');
+    expect(makerSendPreviewHookBlock).toContain('previewUserPrompt: (session, content, options) => {');
+    expect(makerSendPreviewHookBlock).toContain(
+      'const previewed = notifyAgentIslandUserPrompt(session, content, {',
+    );
+    expect(makerSendPreviewHookBlock).toContain(
+      'dispatchUserPromptPreview: (sessionId, clientId) => {',
+    );
+    expect(makerSendPreviewHookBlock).toContain('dispatchAgentIslandUserPrompt(sessionId);');
+    expect(makerSendPreviewHookBlock).toContain('commitUserPromptPreview: (sessionId, clientId) => {');
+    expect(makerSendPreviewHookBlock).toContain('rollbackUserPromptPreview: (sessionId, clientId, source) => {');
+  });
+
+  it('keeps Agent Island prompt preview failures out of send delivery', () => {
+    const promptPreviewBlock = extractBetween(
+      source,
+      'function notifyAgentIslandUserPrompt',
+      'function dispatchAgentIslandUserPrompt',
+    );
+
+    expect(promptPreviewBlock).toContain('try {');
+    expect(promptPreviewBlock).toContain('getAgentIslandService()');
+    expect(promptPreviewBlock).toContain('service.handleUserPrompt');
+    expect(promptPreviewBlock).toContain(
+      "log.warn('Agent Island prompt preview update failed after user message persistence'",
+    );
+    expect(promptPreviewBlock).toContain('clientId: options.clientId');
+    expect(promptPreviewBlock).toContain('error: error instanceof Error ? error.message : String(error)');
+  });
+
+  it('persists takeover user messages through the live session accepted hook', () => {
+    const block = extractSendToSessionSource();
+    // 同 sendPersistedUserMessageToSession 的顺序硬约束(Codex review P2):
+    // prompt preview 可先发,但 accepted 副作用仍必须等落库成功后才执行。
+    expectOrder(block, 'notifyAgentIslandUserPrompt(previewSessionMeta', 'await persistUserTurnMessage(targetSessionId, {');
+    expectOrder(block, 'await persistUserTurnMessage(targetSessionId, {', 'await runAcceptedCallback(onAccepted, targetSessionId, clientId);');
+    const liveBranch = extractBetween(
+      block,
+      'live = maker.getSession(targetSessionId);',
+      'try {\n        const createOpts = buildCreateOptsWithStderr({',
+    );
+
+    expect(liveBranch).toContain('const sendResult = await sendUserMessageWithAwaitedGitBaseline(');
+    expect(liveBranch).toContain('live,');
+    expect(liveBranch).toContain('onAccepted: persistUserMessage,');
+    expect(liveBranch).toContain('onDispatching: onInternalDispatching,');
+    expect(liveBranch).not.toContain('await persistUserMessage();');
+    expect(liveBranch).toContain('if (isSessionRunningError(err))');
+    expect(liveBranch).toContain('await enqueueSendToSessionMessage({');
+    expect(liveBranch).toContain("wakeKind: 'queued' as const");
+  });
+
+  it('persists takeover user messages through the resumed session accepted hook', () => {
+    const block = extractSendToSessionSource();
+    const resumedBranch = extractBetween(
+      block,
+      'const createOpts = buildCreateOptsWithStderr({\n          id: targetSessionId,',
+      'return trackSendToSessionLockRun(',
+    );
+
+    expect(resumedBranch).toContain('const sendResult = await sendUserMessageWithAwaitedGitBaseline(');
+    expect(resumedBranch).toContain('session,');
+    expect(resumedBranch).toContain('onAccepted: persistUserMessage,');
+    expect(resumedBranch).toContain('onDispatching: onInternalDispatching,');
+    expect(resumedBranch).not.toContain('await persistUserMessage();');
+    expect(resumedBranch).toContain('if (isSessionRunningError(err))');
+    expect(resumedBranch).toContain('await enqueueSendToSessionMessage({');
+    expect(resumedBranch).toContain("wakeKind: 'queued' as const");
+  });
+
+  it('preserves stored permission and extraDirs when sendToWorker resumes a worker', () => {
+    const resumeBranch = extractBetween(
+      source,
+      'async function resumeOrcaWorkerSessionIfMissing',
+      'async function ensureRemoteReadyForSessionStart',
+    );
+    const serviceDepsBlock = extractBetween(
+      source,
+      'const orcaTeamService = createOrcaTeamService(orcaRemoteWorkers.wrapTeamDeps({',
+      '  }));\n  orcaTeamServiceForEvents = orcaTeamService;',
+    );
+    const switchFocusIpcBlock = extractBetween(
+      source,
+      'ipcMain.handle(MAKER_INVOKE.WORKER_SWITCH_FOCUS',
+      'registerOrcaWorkerControlHandlers(',
+    );
+    const switchFocusMcpBlock = extractBetween(
+      source,
+      'switchFocus: async ({ leadSessionId, workerIdOrLabel }) => {',
+      'idleWorker: async ({ callerLeadSessionId, workerId, expectedStatus }) => {',
+    );
+
+    expect(resumeBranch).toContain(
+      'const storedExtraDirs = await readSessionExtraDirsFromDb(target.sessionId);',
+    );
+    expect(resumeBranch).toContain('permissionMode: permissionModeOrAsk(row.permissionMode),');
+    expect(resumeBranch).toContain('...directoryGrantsForRuntime(storedExtraDirs),');
+    expectOrder(
+      resumeBranch,
+      'const storedExtraDirs = await readSessionExtraDirsFromDb(target.sessionId);',
+      'const opts = buildCreateOptsWithStderr({',
+    );
+    expectOrder(resumeBranch, '...directoryGrantsForRuntime(storedExtraDirs),', 'await bootstrapSession(opts);');
+    // 任务级窗口预算：worker 唤醒自己拼 opts，不经 createSession 的 prepareStartOptions 钩子。
+    // 缺这一步，预算会在引擎进程重启时丢失（2026-09-30 实测：档位卡仍显示 50%，而 Pi 的
+    // compaction.reserveTokens 被写成无预算值 → 阈值退回满窗，跑到预算窗口 100% 以上也不压缩）。
+    expectOrder(
+      resumeBranch,
+      '...directoryGrantsForRuntime(storedExtraDirs),',
+      'await applySessionContextWindowBudgetToCreateOpts(target.sessionId, opts, getActiveCatalog());',
+    );
+    expectOrder(
+      resumeBranch,
+      'await applySessionContextWindowBudgetToCreateOpts(target.sessionId, opts, getActiveCatalog());',
+      'await bootstrapSession(opts);',
+    );
+    expect(serviceDepsBlock).toContain('resumeWorkerSession: async (target) => {');
+expect(serviceDepsBlock).toContain('await orcaWorkerResumeScheduler.request(target);');
+    // focus 切换是纯 UI 操作：resume 只能后台调度，不能在 IPC / MCP handler 里同步 await
+    // 冷启动（首次切 dormant worker 的 ~5s 卡顿回归点）。MCP 路径仍透传 assertCurrent，
+    // 权威校验在后台预热内部继续生效。
+    expect(switchFocusIpcBlock).toContain('orcaWorkerResumeScheduler.requestInBackground(target,');
+    expect(switchFocusIpcBlock).not.toContain('await resumeOrcaWorkerSessionIfMissing(target)');
+    expect(switchFocusMcpBlock).toContain('orcaWorkerResumeScheduler.requestInBackground(');
+    expect(switchFocusMcpBlock).toContain('{ assertCurrent },');
+    expect(switchFocusMcpBlock).not.toContain('await resumeOrcaWorkerSessionIfMissing(target');
+    // 关闭协同 / 归档 / 显式 idle 与冷启动交错时，唤醒必须可取消，并在 bootstrap
+    // 返回后关掉刚拉起的 session（review P1：不得把已归档 worker 留在运行态）。
+    expect(resumeBranch).toContain('if (isCancelled?.()) return false;');
+    expect(resumeBranch).toContain('await maker.closeSession(resumedSession.id).catch((err) => {');
+    // bootstrap 之后 runtime 已存在，授权复核失败也必须先清理再抛（Security review）。
+    expect(resumeBranch).toContain("await closeResumedSession('assert-current-after-bootstrap');");
+    expect(resumeBranch).toContain('throw err;');
+    expectOrder(
+      resumeBranch,
+      'const { session: resumedSession } = await bootstrapSession(opts);',
+      "await closeResumedSession('assert-current-after-bootstrap');",
+    );
+    expectOrder(
+      resumeBranch,
+      "await closeResumedSession('assert-current-after-bootstrap');",
+      'await markOrcaRoleIfNeeded(resumedSession.id,',
+    );
+    expect(serviceDepsBlock).toContain(
+      'cancelWorkerResume: (sessionId) => orcaWorkerResumeScheduler.cancel(sessionId),',
+    );
+  });
+
+  it('cancels pending worker resumes before releasing runtimes', () => {
+    const disableOrcaBlock = extractBetween(
+      source,
+      'async function disableOrcaInternal',
+      'ipcMain.handle(MAKER_INVOKE.SESSION_DISABLE_ORCA',
+    );
+    expect(disableOrcaBlock).toContain('orcaWorkerResumeScheduler.cancel(w.sessionId);');
+    expect(orcaTeamServiceSource).toContain('deps.cancelWorkerResume?.(worker.sessionId);');
+  });
+
+  it('keeps IPC and MCP createWorker delegated to the shared lifecycle service', () => {
+    const ipcCreateBlock = extractBetween(
+      source,
+      'ipcMain.handle(MAKER_INVOKE.WORKER_CREATE',
+      'ipcMain.handle(MAKER_INVOKE.WORKER_LIST',
+    );
+    const mcpCreateBlock = extractBetween(
+      source,
+      'createWorker: async (params) => {',
+      'listWorkers: async ({ leadSessionId }) => {',
+    );
+
+    expect(ipcCreateBlock).toContain('orcaLifecycleService.createWorker({');
+    expect(ipcCreateBlock).toContain('await assertLeadCollabProjectEnabled(b.leadSessionId);');
+    expectOrder(ipcCreateBlock, 'await assertLeadCollabProjectEnabled(b.leadSessionId);', 'const result = await orcaLifecycleService.createWorker({');
+    expect(mcpCreateBlock).toContain('return await orcaLifecycleService.createWorker(params);');
+    expect(ipcCreateBlock).not.toContain('readCodexAuthMode()');
+    expect(mcpCreateBlock).not.toContain('readCodexAuthMode()');
+    expect(source).toContain('normalizeOrcaWorkerLabel');
+    expect(ipcCreateBlock).toContain('const label = normalizeOrcaWorkerLabel(b.label);');
+    expect(ipcCreateBlock).toContain("if (!label.ok) throwIpcError('INVALID_PARAMS', label.message);");
+    expect(ipcCreateBlock).toContain('label: label.value,');
+    expect(orcaWorkerCreationServiceSource).toContain('budgetModelRequiresApiKey(params.agent, resolved.model, deps.readClaudeApiKey() != null)');
+    expect(orcaWorkerCreationServiceSource).toContain(
+      'agentConsumesExplicitFast(input.agent) && input.fast !== undefined',
+    );
+    expect(orcaWorkerCreationServiceSource).toContain(
+      "return agent === 'codex' || agent === 'pi';",
+    );
+    expect(orcaLifecycleServiceSource).toMatch(
+      /createWorkerInTeam\(\{\s*\n\s*\.\.\.params,\s*\n\s*teamId: team\.id,/,
+    );
+  });
+
+  it('delegates worker terminal runtime to OrcaTeamService', () => {
+    const terminalBlock = extractWorkerTerminalHandlerSource();
+
+    expect(source).not.toContain('workerAutoBridgePending');
+    expect(source).not.toContain('workerCapturedText');
+    expect(source).not.toContain('clearWorkerPendingCaptureState');
+    expect(terminalBlock).toContain('await orcaTeamServiceForEvents?.handleWorkerTerminalTurn({');
+    expect(terminalBlock).toContain('sessionId: session.id,');
+    expect(terminalBlock).toContain("status: isTerminalTurnErrorEvent(event) ? 'error' : 'done',");
+    expect(terminalBlock).toContain('finalText: workerTerminalFinalText,');
+    expect(terminalBlock).not.toContain('getWorkerLink');
+    expect(terminalBlock).not.toContain('listWorkersByLead');
+    expect(terminalBlock).not.toContain('dispatchInterAgentMessage');
+  });
+  // serializes worker terminal handling behind in-flight turn-start status updates: covered by the executable sessionEventPipeline tests.
+
+  it('keeps terminal skip and manual interrupt behavior inside OrcaTeamService', () => {
+    const serviceTerminalBlock = extractOrcaTeamServiceHandleWorkerTerminalTurnSource();
+
+    expect(serviceTerminalBlock).toContain(
+      'const link = await deps.getWorkerLinkBySessionId(params.sessionId);',
+    );
+    expect(serviceTerminalBlock).toContain('if (!link) return;');
+    expect(serviceTerminalBlock).toContain('if (!worker) {');
+    expect(serviceTerminalBlock).toContain('clearRuntimeState(params.sessionId);');
+    expect(serviceTerminalBlock).toContain(
+      "worker.status === 'done' || worker.status === 'error' || worker.status === 'idle'",
+    );
+    expect(serviceTerminalBlock).toContain(
+      'let manualInterruptOwnership = capture.manualInterrupt;',
+    );
+    expect(serviceTerminalBlock).toContain('const autoBridgeAtEntry = capture.autoBridgeIdentity;');
+    expect(serviceTerminalBlock).toContain('if (manualInterruptOwnership) {');
+    expect(serviceTerminalBlock).toContain(
+      'currentAutoBridge !== autoBridgeAtEntry',
+    );
+    expect(serviceTerminalBlock).toContain(
+      'currentManualInterrupt !== manualInterruptOwnership',
+    );
+    expect(serviceTerminalBlock).toContain(
+      'const settlement = await provisionalWait.settlement;',
+    );
+    expect(serviceTerminalBlock).toContain(
+      'manualInterruptOwnership = settlement.manualInterrupt;',
+    );
+    expect(serviceTerminalBlock).toContain('await withWorkerTransition(link.workerId, async () => {');
+    expect(serviceTerminalBlock).toContain('await deps.markWorkerIdle(link.workerId);');
+    expect(serviceTerminalBlock).toContain(
+      "log.info('worker manual interrupt: suppressed auto-bridge'",
+    );
+    expectOrder(
+      serviceTerminalBlock,
+      'let manualInterruptOwnership = capture.manualInterrupt;',
+      "worker.status === 'done' || worker.status === 'error' || worker.status === 'idle'",
+    );
+    expectOrder(
+      serviceTerminalBlock,
+      "worker.status === 'done' || worker.status === 'error' || worker.status === 'idle'",
+      'if (manualInterruptOwnership) {',
+    );
+    expectOrder(
+      serviceTerminalBlock,
+      'if (manualInterruptOwnership) {',
+      'await deps.markWorkerIdle(link.workerId);',
+    );
+    expectOrder(
+      serviceTerminalBlock,
+      'await deps.markWorkerIdle(link.workerId);',
+      'await deps.updateWorkerStatus(link.workerId, params.status);',
+    );
+    expectOrder(
+      serviceTerminalBlock,
+      "worker.status === 'done' || worker.status === 'error' || worker.status === 'idle'",
+      'await bridgeWorkerCompletion(',
+    );
+    const manualBlock = extractBetween(
+      serviceTerminalBlock,
+      'if (manualInterruptOwnership) {',
+      'await deps.updateWorkerStatus(link.workerId, params.status);',
+    );
+    expect(manualBlock).not.toContain('sendToSession');
+  });
+
+  it('marks worker idle and clears auto-bridge state before aborting worker sessions', () => {
+    const serviceIdleBlock = extractBetween(
+      orcaTeamServiceSource,
+      'async function idleWorker(',
+      'async function archiveWorker',
+    );
+    const serviceDepsBlock = extractBetween(
+      source,
+      'const orcaTeamService = createOrcaTeamService(orcaRemoteWorkers.wrapTeamDeps({',
+      '  }));\n  orcaTeamServiceForEvents = orcaTeamService;',
+    );
+
+    expect(source).toContain('registerOrcaWorkerControlHandlers(createElectronIpcHandlerRegistry(), {');
+    expect(source).toContain('idleWorker: (params) => orcaTeamService.idleWorker(params),');
+    expect(serviceIdleBlock).toContain('clearRuntimeState(worker.sessionId);');
+    expect(serviceIdleBlock).toContain('await deps.markWorkerIdleIfStatus(worker.id, params.expectedStatus)');
+    expect(serviceIdleBlock).toContain('await deps.markWorkerIdle(worker.id)');
+    expect(serviceIdleBlock).toContain('await deps.hasPendingWorkerInput(worker.sessionId)');
+    expect(serviceIdleBlock).toContain('deps.hasSendToSessionLock(worker.sessionId)');
+    expect(serviceIdleBlock).toContain("await closeWorkerSessionBestEffort(worker.sessionId, 'idleWorker', opts?.assertCurrent);");
+    expectOrder(serviceIdleBlock, 'await deps.markWorkerIdleIfStatus(worker.id, params.expectedStatus)', 'clearRuntimeState(worker.sessionId);');
+    expectOrder(serviceIdleBlock, 'clearRuntimeState(worker.sessionId);', "await closeWorkerSessionBestEffort(worker.sessionId, 'idleWorker', opts?.assertCurrent);");
+
+    expect(serviceDepsBlock).toContain('if (!sendLockHeld && sendToSessionLocks.has(sessionId)) return false;');
+    expect(serviceDepsBlock).toContain('await inputCoordinator.ensureQueueRestored(sessionId).catch(() => undefined);');
+    expect(serviceDepsBlock).toContain('if (!inputCoordinator.isQueueRestored(sessionId)) return true;');
+  });
+
+  it('clears pending auto-bridge state before archive and end-team abort paths', () => {
+    const disableBlock = extractBetween(
+      source,
+      'async function disableOrcaInternal',
+      'ipcMain.handle(MAKER_INVOKE.SESSION_DISABLE_ORCA',
+    );
+    const serviceArchiveBlock = extractBetween(
+      orcaTeamServiceSource,
+      'async function archiveWorker(params: {',
+      'function queuedMessageSource(',
+    );
+
+    expect(disableBlock).toContain('orcaTeamService.clearAutoBridgeState(w.sessionId);');
+    expect(disableBlock).not.toContain('clearWorkerAutoBridgeState(w.sessionId);');
+    expectOrder(disableBlock, 'orcaTeamService.clearAutoBridgeState(w.sessionId);', 'await sess.abort();');
+    expect(source).toContain('archiveWorker: (params) => orcaTeamService.archiveWorker(params),');
+    expect(serviceArchiveBlock).toContain('clearRuntimeState(worker.sessionId);');
+    expect(serviceArchiveBlock).toContain("await closeWorkerSessionBestEffort(worker.sessionId, 'archiveWorker', params.beforeArchive);");
+    expect(serviceArchiveBlock).toContain('await deps.archiveWorkerSession(worker.sessionId, params.beforeArchive);');
+    expect(serviceArchiveBlock).toContain("await deps.updateWorkerStatus(worker.id, 'done');");
+    expectOrder(serviceArchiveBlock, 'clearRuntimeState(worker.sessionId);', "await closeWorkerSessionBestEffort(worker.sessionId, 'archiveWorker', params.beforeArchive);");
+    expectOrder(serviceArchiveBlock, "await closeWorkerSessionBestEffort(worker.sessionId, 'archiveWorker', params.beforeArchive);", 'await deps.archiveWorkerSession(worker.sessionId, params.beforeArchive);');
+    expectOrder(serviceArchiveBlock, 'await deps.archiveWorkerSession(worker.sessionId, params.beforeArchive);', "await deps.updateWorkerStatus(worker.id, 'done');");
+  });
+
+  it('keeps worker idle/archive adapters passing the caller lead session id', () => {
+    const workerAdapterBlock = extractBetween(preloadSource, 'idleWorker: (', 'endTeam:');
+    expect(workerAdapterBlock).toContain('leadSessionId: string,');
+    expect(workerAdapterBlock).toContain('workerId: string,');
+    expect(workerAdapterBlock).toContain("expectedStatus?: 'done',");
+    expect(workerAdapterBlock).toContain("ipcRenderer.invoke('maker:worker:idle', {");
+    expect(workerAdapterBlock).toContain("ipcRenderer.invoke('maker:worker:acknowledge-done', {");
+    expect(workerAdapterBlock).toContain('archiveWorker: (leadSessionId: string, workerId: string)');
+    expect(workerAdapterBlock).toContain("ipcRenderer.invoke('maker:worker:archive', { leadSessionId, workerId })");
+    // device-link:归档入口(现居 useOrcaWorkerSelection)经 orcaWorkflowsFor 按 lead 来源路由
+    // (本机直连 / 远程隧道),但仍把 (leadSessionId, workerId) 传给 archiveWorker ——
+    // 本不变式守的是「带上 caller lead id」;正则容忍链式调用换行。
+    expect(useOrcaWorkerSelectionSource).toMatch(
+      /orcaWorkflowsFor\(leadSessionId\)\s*\.archiveWorker\(leadSessionId, workerId\)/,
+    );
+  });
+
+  it('sets sendToWorker running state only after Orca lead/worker dispatch is accepted', () => {
+    const serviceSendBlock = extractOrcaTeamServiceSendToWorkerSource();
+    const serviceDispatchBoundaryBlock = extractOrcaTeamServiceDispatchToWorkerSource();
+    const serviceDispatchBlock = extractOrcaTeamServiceDispatchResolvedWorkerSource();
+    const depsBlock = extractBetween(
+      source,
+      'const orcaTeamService = createOrcaTeamService(orcaRemoteWorkers.wrapTeamDeps({',
+      '  }));\n  orcaTeamServiceForEvents = orcaTeamService;',
+    );
+
+    expect(serviceSendBlock).toContain("return dispatchToWorker({ ...params, mode: 'normal' }, assertCurrent)");
+    expect(serviceDispatchBoundaryBlock).toContain(
+      'const execution = await dispatchResolvedWorker({',
+    );
+    expect(serviceDispatchBlock).toContain('result = await deps.dispatchWorkerMessage({');
+    expect(serviceDispatchBlock).toContain('const onAccepted = async (): Promise<void> => {');
+    expect(serviceDispatchBlock).toContain("await deps.updateWorkerStatus(target.id, 'running');");
+    expect(serviceDispatchBlock).toContain('deps.broadcastOrcaWorkerChanged(link.leadSessionId);');
+    expect(serviceDispatchBlock).toContain('currentPending = setPending(target.sessionId, {');
+    expect(serviceDispatchBlock).toContain(
+      'await markPendingReady(target.sessionId, currentPending);',
+    );
+    expect(serviceDispatchBlock).toContain('onAcceptedRollback: rollbackAccepted,');
+    expect(serviceDispatchBlock).toContain('onAcceptedCommit: commitAccepted,');
+    expect(depsBlock).toContain('const result = await dispatchOrEnqueueOrcaInterAgentMessage({');
+    expect(depsBlock).toContain('targetSessionId,');
+    expect(depsBlock).toContain('rawContent: message,');
+    expect(depsBlock).toContain('workerId,');
+    expect(depsBlock).toContain("senderLabel: 'Lead'");
+    expect(depsBlock).toContain('onAccepted,');
+    expect(depsBlock).toContain('onAcceptedRollback,');
+    expect(depsBlock).toContain('onAcceptedCommit,');
+    expect(serviceDispatchBlock).toContain('deps.clearManualInterrupt(target.sessionId);');
+    expect(depsBlock).toContain(
+      'getWorkerQueuePaused: (sessionId) => inputCoordinator.isQueuePaused(sessionId),',
+    );
+  });
+
+  it('rolls back only the pending entry written after sendToWorker dispatch is accepted', () => {
+    const serviceDispatchBlock = extractOrcaTeamServiceDispatchResolvedWorkerSource();
+
+    expect(serviceDispatchBlock).not.toContain('hadPendingBefore');
+    expect(orcaTeamServiceSource).toContain('if (autoBridge.get(sessionId) !== current) return false;');
+    expect(orcaTeamServiceSource).toContain('autoBridge.set(sessionId, previous);');
+    expect(orcaTeamServiceSource).toContain('autoBridge.delete(sessionId);');
+    expect(serviceDispatchBlock).toContain('previousPending: autoBridge.get(target.sessionId),');
+    expect(serviceDispatchBlock).toContain('let currentPending: AutoBridgeState | undefined;');
+    expect(serviceDispatchBlock).toContain('await rollbackAcceptedDispatchState({');
+    expect(orcaTeamServiceSource).toContain('const workers = await deps.listWorkersByLead(params.worker.leadSessionId);');
+    expect(orcaTeamServiceSource).toContain("if (currentWorker?.status !== 'running') return true;");
+    expect(serviceDispatchBlock).toContain('result = await deps.dispatchWorkerMessage({');
+    expectOrder(serviceDispatchBlock, 'currentPending = setPending(target.sessionId, {', 'await markPendingReady(target.sessionId, currentPending);');
+    expectOrder(orcaTeamServiceSource, 'if (autoBridge.get(sessionId) !== current) return false;', "if (currentWorker?.status !== 'running') return true;");
+    expectOrder(orcaTeamServiceSource, "if (currentWorker?.status !== 'running') return true;", 'await deps.updateWorkerStatus(params.worker.id, params.previousStatus);');
+    expect(serviceDispatchBlock).toContain('dispatchOutcome: dispatchFailureFromThrown(err, params.dispatchMeta),');
+    expect(orcaTeamServiceSource).toContain("createHostSendFailure('SEND_FAILED'");
+  });
+
+  it('returns sendToWorker wake metadata from the dispatch boundary', () => {
+    const serviceDispatchBoundaryBlock = extractOrcaTeamServiceDispatchToWorkerSource();
+    const serviceDispatchBlock = extractOrcaTeamServiceDispatchResolvedWorkerSource();
+
+    expect(serviceDispatchBlock).toContain(
+      'const wasLiveBeforeDispatch = deps.getLiveSession(target.sessionId) !== null;',
+    );
+    expectOrder(
+      serviceDispatchBlock,
+      'const wasLiveBeforeDispatch = deps.getLiveSession(target.sessionId) !== null;',
+      'if (!wasLiveBeforeDispatch) await deps.resumeWorkerSession(target, link);',
+    );
+    expect(serviceDispatchBlock).not.toContain(
+      "target.status === 'idle' || target.status === 'done'",
+    );
+    expect(serviceDispatchBoundaryBlock).toContain('wakeKind: dispatchResult.wakeKind,');
+    expect(serviceDispatchBoundaryBlock).toContain('targetTitle: dispatchResult.targetTitle,');
+    expect(serviceDispatchBoundaryBlock).toContain(
+      'targetLastUserSendAt: dispatchResult.targetLastUserSendAt,',
+    );
+  });
+
+  it('exposes Orca lead/worker dispatch receipt fields from the shared DB snapshot', () => {
+    const block = extractDispatchOrEnqueueOrcaInterAgentMessageSource();
+    const liveBlock = extractBetween(
+      block,
+      'const dispatchLive = async (): Promise<DispatchOrcaInterAgentMessageResult | null> => {',
+      'const liveResult = deps.withSendToSessionLock',
+    );
+    const fallbackBlock = extractBetween(
+      block,
+      'const sendToInternal = async (): Promise<DispatchOrcaInterAgentMessageResult> => {',
+      'const dispatchLive = async (): Promise<DispatchOrcaInterAgentMessageResult | null> => {',
+    );
+
+    expect(block).toContain('const dispatchReceipt = {');
+    expect(block).toContain('targetTitle: dbRow.title,');
+    expect(block).toMatch(/targetLastUserSendAt:\s+dbRow\.userSendAt !== null/);
+    expect(block).toContain('...dispatchReceipt,');
+    expect(liveBlock).toContain("mode: 'dispatched',");
+    expect(liveBlock).toContain('dispatchOutcome: result.dispatchOutcome,');
+    expect(liveBlock).toMatch(/\.\.\.dispatchReceipt\s*[,}]/);
+    expectOrder(liveBlock, "mode: 'dispatched',", '...dispatchReceipt');
+    expect(liveBlock).not.toContain('isQueuedCollabDispatchResult(result)');
+    expect(fallbackBlock).toContain('targetTitle: result.targetTitle,');
+    expect(fallbackBlock).toContain('targetLastUserSendAt: result.targetLastUserSendAt,');
+  });
+
+  it('uses active slot occupancy for renderer worker-limit gating', () => {
+    expect(workerProjectionStoreSource).toContain('isActiveWorkerStatus');
+    expect(useWorkersSource).not.toContain('isRunningWorkerStatus');
+    expect(useWorkersSource).toContain('const activeWorkerCount = getActiveWorkerCount(workers);');
+    expect(workerProjectionStoreSource).toContain('return workers.filter((w) => isActiveWorkerStatus(w.status)).length;');
+  });
+});
+
+function extractSendToSessionSource(): string {
+  const block = source.match(
+    /async function sendToSessionInternal\([\s\S]*?return trackSendToSessionLockRun\(/,
+  )?.[0];
+  expect(block).toBeTruthy();
+  if (!block) throw new Error('sendToSessionInternal source block not found');
+  return block;
+}
+
+function extractOrcaTeamServiceSendToWorkerSource(): string {
+  const block = orcaTeamServiceSource.match(
+    /async function sendToWorker\([\s\S]*?\): Promise<SendToWorkerResult> \{[\s\S]*?async function interruptWorker/,
+  )?.[0];
+  expect(block).toBeTruthy();
+  if (!block) throw new Error('OrcaTeamService sendToWorker source block not found');
+  return block;
+}
+
+function extractOrcaTeamServiceDispatchToWorkerSource(): string {
+  const block = orcaTeamServiceSource.match(
+    /async function dispatchToWorker\([\s\S]*?async function idleWorker/,
+  )?.[0];
+  expect(block).toBeTruthy();
+  if (!block) throw new Error('OrcaTeamService dispatchToWorker source block not found');
+  return block;
+}
+
+function extractOrcaTeamServiceDispatchResolvedWorkerSource(): string {
+  const block = orcaTeamServiceSource.match(
+    /async function dispatchResolvedWorker\([\s\S]*?async function sendToWorker/,
+  )?.[0];
+  expect(block).toBeTruthy();
+  if (!block) throw new Error('OrcaTeamService dispatchResolvedWorker source block not found');
+  return block;
+}
+
+function extractOrcaTeamServiceHandleWorkerTerminalTurnSource(): string {
+  const block = orcaTeamServiceSource.match(
+    /async handleWorkerTerminalTurn\(params\) \{[\s\S]*?\n {4}\},\n {2}\};/,
+  )?.[0];
+  expect(block).toBeTruthy();
+  if (!block) throw new Error('OrcaTeamService handleWorkerTerminalTurn source block not found');
+  return block;
+}
+
+function extractDispatchOrEnqueueOrcaInterAgentMessageSource(): string {
+  const block = orcaInterAgentDispatcherSource.match(
+    /const dispatchOrEnqueueOrcaInterAgentMessage = async \([\s\S]*?return \{\n {4}dispatchOrEnqueueOrcaInterAgentMessage: async \(params\) => \{/,
+  )?.[0];
+  expect(block).toBeTruthy();
+  if (!block) throw new Error('dispatchOrEnqueueOrcaInterAgentMessage source block not found');
+  return block;
+}
+
+function extractWorkerTerminalHandlerSource(): string {
+  return readFileSync(
+    resolve(__dirname, '..', 'maker-ipc', 'sessionEventTerminal.ts'),
+    'utf8',
+  ).replaceAll('deps.', '');
+}
+
+// handleSetModel moved verbatim into sessionRuntimeSelectionApply.ts; register.ts keeps the binding
+// (createHandleSetModel) and what follows it. These blocks read the moved function followed by that
+// register.ts tail, in their former order.
+const runtimeSelectionApplySource = readFileSync(
+  resolve(__dirname, '..', 'maker-ipc', 'sessionRuntimeSelectionApply.ts'),
+  'utf8',
+).replace(/\r\n?/g, '\n');
+function setModelSource(): string {
+  return extractBetween(runtimeSelectionApplySource, 'const handleSetModel = async (', '  return handleSetModel;')
+    + extractBetween(source, 'const handleSetModel = createHandleSetModel(', 'ipcMain.handle(MAKER_INVOKE.SET_EFFORT');
+}
+
+function extractBetween(
+  sourceBlock: string,
+  startNeedle: string,
+  endNeedle: string,
+  opts?: { allowMissingEnd?: boolean },
+): string {
+  const start = sourceBlock.indexOf(startNeedle);
+  const end = sourceBlock.indexOf(endNeedle, start);
+  expect(start).toBeGreaterThanOrEqual(0);
+  if (opts?.allowMissingEnd && end < 0) {
+    return sourceBlock.slice(start);
+  }
+  expect(end).toBeGreaterThan(start);
+  return sourceBlock.slice(start, end);
+}
+
+function expectOrder(sourceBlock: string, firstNeedle: string, secondNeedle: string): void {
+  const first = sourceBlock.indexOf(firstNeedle);
+  const second = sourceBlock.indexOf(secondNeedle);
+  expect(first).toBeGreaterThanOrEqual(0);
+  expect(second).toBeGreaterThanOrEqual(0);
+  expect(first).toBeLessThan(second);
+}
+
+function countOccurrences(sourceBlock: string, needle: string): number {
+  return sourceBlock.split(needle).length - 1;
+}
